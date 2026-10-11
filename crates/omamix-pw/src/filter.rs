@@ -283,12 +283,21 @@ impl MixFilter {
             &format!("in-{peer}-FL"),
             "FL",
         )?;
-        let fr = self.add_port(
+        self.shared.inputs_fl[slot].store(fl, Ordering::Release);
+        let fr = match self.add_port(
             pw::spa::utils::Direction::Input,
             &format!("in-{peer}-FR"),
             "FR",
-        )?;
-        self.shared.inputs_fl[slot].store(fl, Ordering::Release);
+        ) {
+            Ok(fr) => fr,
+            Err(()) => {
+                // FL is already on the filter. Clear it on the data loop, then
+                // free it. A failed clear leaves the pointer in the slot until
+                // destroy, and that slot stays occupied.
+                self.remove_tap_ports(slot);
+                return Err(());
+            }
+        };
         self.shared.inputs_fr[slot].store(fr, Ordering::Release);
         let count = self.shared.input_count.load(Ordering::Acquire);
         if slot >= count {
@@ -754,6 +763,35 @@ mod tests {
         // The rise at t=0 is the starting sample, and the 440th rise is the
         // first sample of the next second, outside this loop.
         assert_eq!(rises, 439);
+    }
+
+    #[test]
+    fn a_failed_fr_add_clears_fl_before_the_port_is_freed() {
+        let shared = ProcessShared::new();
+        let fl = std::ptr::without_provenance_mut::<c_void>(0x1111);
+        shared.inputs_fl[0].store(fl, Ordering::Release);
+        shared.input_count.store(1, Ordering::Release);
+        let mut job = ClearJob {
+            shared: &shared,
+            slot: 0,
+            fl: ptr::null_mut(),
+            fr: ptr::null_mut(),
+        };
+        let rc = unsafe {
+            clear_tap_slot(
+                ptr::null_mut(),
+                false,
+                0,
+                ptr::null(),
+                0,
+                &mut job as *mut ClearJob as *mut c_void,
+            )
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(job.fl, fl);
+        assert!(job.fr.is_null());
+        assert!(shared.inputs_fl[0].load(Ordering::Acquire).is_null());
+        assert_eq!(shared.input_count.load(Ordering::Acquire), 0);
     }
 
     #[test]

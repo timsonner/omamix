@@ -272,6 +272,36 @@ mod tests {
             111, 110, 102, 105, 103, 41, 10,
         ]);
         assert!(scan_text("build.rs", &build_ok).is_empty());
+
+        let angled = word(&[
+            60, 67, 111, 109, 109, 97, 110, 100, 62, 58, 58, 110, 101, 119, 40, 34, 112, 119, 45,
+            108, 105, 110, 107, 34, 41, 10,
+        ]);
+        assert!(scan_text("evil.rs", &angled).contains(&"spawn"));
+
+        let glued = word(&[
+            99, 111, 110, 99, 97, 116, 33, 40, 34, 112, 119, 45, 34, 44, 32, 34, 108, 105, 110,
+            107, 34, 41, 10,
+        ]);
+        assert!(scan_text("evil.rs", &glued).contains(&"link-tool"));
+
+        let slice = word(&[
+            91, 34, 115, 101, 116, 34, 44, 32, 34, 112, 97, 114, 97, 109, 34, 93, 46, 106, 111,
+            105, 110, 40, 34, 95, 34, 41, 10,
+        ]);
+        assert!(scan_text("evil.rs", &slice).contains(&"param"));
+
+        let exec_call = word(&[
+            108, 105, 98, 99, 58, 58, 101, 120, 101, 99, 118, 112, 40, 112, 97, 116, 104, 44, 32,
+            97, 114, 103, 118, 41, 10,
+        ]);
+        assert!(scan_text("evil.rs", &exec_call).contains(&"exec"));
+
+        let property_only = word(&[
+            110, 111, 100, 101, 46, 115, 101, 116, 95, 112, 114, 111, 112, 101, 114, 116, 121, 40,
+            105, 100, 41, 10,
+        ]);
+        assert!(scan_text("evil.rs", &property_only).contains(&"property"));
     }
 
     fn scan_text<'a>(name: &str, text: &str) -> Vec<&'a str> {
@@ -298,55 +328,53 @@ mod tests {
         let configured = word(&[
             100, 101, 102, 97, 117, 108, 116, 46, 99, 111, 110, 102, 105, 103, 117, 114, 101, 100,
         ]);
-        let default_dot = word(&[100, 101, 102, 97, 117, 108, 116, 46]);
-        let quoted_default = word(&[34, 100, 101, 102, 97, 117, 108, 116, 34]);
         let default_word = word(&[100, 101, 102, 97, 117, 108, 116]);
+        let exec = word(&[101, 120, 101, 99, 118, 112]);
         let mut reasons = Vec::new();
-        if text.contains(&dash) || format_assembles(text, &[dash.as_str()]) {
+        if mentions(text, &dash) {
             reasons.push("dash");
         }
-        if text.contains(&underscore) || format_assembles(text, &[underscore.as_str()]) {
+        if mentions(text, &underscore) {
             reasons.push("underscore");
         }
-        if text.contains(&set_volume) || format_assembles(text, &[set_volume.as_str()]) {
+        if mentions(text, &set_volume) {
             reasons.push("volume");
         }
-        if text.contains(&set_mute) || format_assembles(text, &[set_mute.as_str()]) {
+        if mentions(text, &set_mute) {
             reasons.push("mute");
         }
-        if text.contains(&pw_metadata) || format_assembles(text, &[pw_metadata.as_str()]) {
+        if mentions(text, &pw_metadata) {
             reasons.push("metadata-tool");
         }
-        if text.contains(&link_tool) || format_assembles(text, &[link_tool.as_str()]) {
+        if mentions(text, &link_tool) {
             reasons.push("link-tool");
         }
-        if text.contains(&service) || format_assembles(text, &[service.as_str()]) {
+        if mentions(text, &service) {
             reasons.push("service");
         }
-        if text.contains(&mixer_cmd) || format_assembles(text, &[mixer_cmd.as_str()]) {
+        if mentions(text, &mixer_cmd) {
             reasons.push("mixer");
         }
-        if text.contains(&alsa_cmd) || format_assembles(text, &[alsa_cmd.as_str()]) {
+        if mentions(text, &alsa_cmd) {
             reasons.push("alsa-ctl");
         }
-        if text.contains(&config_wp)
-            || text.contains(&config_pw)
-            || text.contains(&config_hypr)
+        if mentions(text, &config_wp)
+            || mentions(text, &config_pw)
+            || mentions(text, &config_hypr)
             || joined_config(text, &config_wp, &config_pw, &config_hypr)
-            || format_assembles(
-                text,
-                &[config_wp.as_str(), config_pw.as_str(), config_hypr.as_str()],
-            )
         {
             reasons.push("config-dir");
         }
         if spawn_forbidden(name, text) {
             reasons.push("spawn");
         }
-        if text.contains(&param_call) {
+        if mentions(text, &exec) {
+            reasons.push("exec");
+        }
+        if mentions(text, &param_call) {
             reasons.push("param");
         }
-        if property_near_default_key(text, &property, &default_dot, &quoted_default) {
+        if mentions(text, &property) {
             reasons.push("property");
         }
         if text.contains(&property) && text.contains(&configured) {
@@ -368,12 +396,13 @@ mod tests {
         callers.extend(command_aliases(text, &command));
         let mut sites = Vec::new();
         for caller in &callers {
-            let token = format!("{caller}::new");
-            let mut rest = text;
-            while let Some(at) = rest.find(&token) {
-                let after = rest[at + token.len()..].trim_start();
-                sites.push(after.chars().take(48).collect::<String>());
-                rest = &rest[at + token.len()..];
+            for token in [format!("{caller}::new"), format!("{caller}>::new")] {
+                let mut rest = text;
+                while let Some(at) = rest.find(&token) {
+                    let after = rest[at + token.len()..].trim_start();
+                    sites.push(after.chars().take(48).collect::<String>());
+                    rest = &rest[at + token.len()..];
+                }
             }
         }
         if sites.is_empty() {
@@ -434,6 +463,51 @@ mod tests {
                 return true;
             }
             start = at + join.len();
+        }
+        false
+    }
+
+    fn mentions(text: &str, needle: &str) -> bool {
+        text.contains(needle)
+            || format_assembles(text, &[needle])
+            || concat_assembles(text, &[needle])
+            || slice_join_assembles(text, &[needle])
+    }
+
+    fn concat_assembles(text: &str, forbidden: &[&str]) -> bool {
+        let marker = word(&[99, 111, 110, 99, 97, 116, 33]);
+        let mut rest = text;
+        while let Some(at) = rest.find(&marker) {
+            let tail = rest[at + marker.len()..].trim_start();
+            if let Some(body) = paren_body(tail) {
+                let built: String = string_literals(body).concat();
+                if forbidden.iter().any(|item| built.contains(*item)) {
+                    return true;
+                }
+            }
+            rest = &rest[at + marker.len()..];
+        }
+        false
+    }
+
+    fn slice_join_assembles(text: &str, forbidden: &[&str]) -> bool {
+        let marker = word(&[46, 106, 111, 105, 110, 40]);
+        let mut rest = text;
+        while let Some(at) = rest.find(&marker) {
+            let before = rest[..at].trim_end();
+            if let Some(open) = before.rfind('[')
+                && before.ends_with(']')
+            {
+                let inside = &before[open + 1..before.len() - 1];
+                let parts = string_literals(inside);
+                let tail = &rest[at + marker.len()..];
+                let sep = string_literals(tail.split(')').next().unwrap_or(""));
+                let built = parts.join(sep.first().map(String::as_str).unwrap_or(""));
+                if forbidden.iter().any(|item| built.contains(*item)) {
+                    return true;
+                }
+            }
+            rest = &rest[at + marker.len()..];
         }
         false
     }
@@ -547,26 +621,6 @@ mod tests {
                 return true;
             }
             start = at + set_dash.len();
-        }
-        false
-    }
-
-    fn property_near_default_key(
-        text: &str,
-        property: &str,
-        default_dot: &str,
-        quoted_default: &str,
-    ) -> bool {
-        let mut start = 0;
-        while let Some(found) = text[start..].find(property) {
-            let at = start + found;
-            let from = at.saturating_sub(160);
-            let to = (at + property.len() + 160).min(text.len());
-            let window = &text[from..to];
-            if window.contains(default_dot) || window.contains(quoted_default) {
-                return true;
-            }
-            start = at + property.len();
         }
         false
     }

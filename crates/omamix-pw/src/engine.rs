@@ -30,7 +30,7 @@
 //! Unit tests do not call [`run_headless`].
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -288,6 +288,9 @@ fn pw_thread(
             engine_linked: false,
             engine_saw_edges: false,
             engine_link_keys: Vec::new(),
+            engine_up: [false, false],
+            engine_tries: 0,
+            engine_wait: 0,
             retired_slots: Vec::new(),
             quit: false,
             nodes: HashMap::new(),
@@ -295,6 +298,7 @@ fn pw_thread(
             edges: HashMap::new(),
             taps: HashMap::new(),
             refused: HashMap::new(),
+            unlinked_clients: HashSet::new(),
             clients: HashMap::new(),
             bind_queue: Vec::new(),
             bindings: Vec::new(),
@@ -546,6 +550,9 @@ struct LoopInner {
     engine_linked: bool,
     engine_saw_edges: bool,
     engine_link_keys: Vec<u64>,
+    engine_up: [bool; 2],
+    engine_tries: u8,
+    engine_wait: u8,
     retired_slots: Vec<usize>,
     quit: bool,
     nodes: HashMap<u32, NodeRec>,
@@ -553,6 +560,7 @@ struct LoopInner {
     edges: HashMap<u32, LinkEdge>,
     taps: HashMap<u32, Tap>,
     refused: HashMap<u32, bool>,
+    unlinked_clients: HashSet<u32>,
     clients: HashMap<u32, ClientRec>,
     bind_queue: Vec<GlobalObject<PropertiesBox>>,
     bindings: Vec<Binding>,
@@ -589,6 +597,8 @@ struct Tap {
     linked: bool,
     saw_edges: bool,
     link_keys: Vec<u64>,
+    tries: u8,
+    wait: u8,
 }
 
 struct LiveLink {
@@ -824,9 +834,62 @@ fn note_info(shared: &LoopShared, id: u32, props: &[(String, String)]) {
     }
 }
 
+fn fail_tap(tap: &mut Tap, peer: u32) {
+    tap.phase = link::link_failed(tap.phase);
+    tap.linked = false;
+    let before = tap.tries;
+    if before < link::RETRY_LIMIT {
+        link::arm_retry(&mut tap.tries, &mut tap.wait);
+    }
+    if before < link::RETRY_LIMIT && tap.tries >= link::RETRY_LIMIT {
+        eprintln!("omamix: tap for node {peer} stopped retrying");
+    }
+}
+
+fn fail_engine(inner: &mut LoopInner) {
+    let keys = std::mem::take(&mut inner.engine_link_keys);
+    for key in keys {
+        inner.links.remove(&key);
+    }
+    inner.engine_up = [false, false];
+    inner.engine_linked = false;
+    inner.engine_saw_edges = false;
+    let before = inner.engine_tries;
+    if before < link::RETRY_LIMIT {
+        link::arm_retry(&mut inner.engine_tries, &mut inner.engine_wait);
+    }
+    if before < link::RETRY_LIMIT && inner.engine_tries >= link::RETRY_LIMIT {
+        eprintln!("omamix: Mix Mic engine link stopped retrying");
+    } else if before < link::RETRY_LIMIT {
+        eprintln!("omamix: Mix Mic engine link failed; linking it again later");
+    }
+}
+
 fn note_link_state(shared: &LoopShared, key: u64, active: bool, error: bool) {
     let mut inner = shared.inner.borrow_mut();
     if !inner.links.contains_key(&key) {
+        return;
+    }
+    if let Some(index) = inner.engine_link_keys.iter().position(|item| *item == key) {
+        let mut sides = link::EngineSides {
+            up: inner.engine_up,
+            proxies: if inner.engine_link_keys.len() >= 2 {
+                2
+            } else {
+                inner.engine_link_keys.len() as u8
+            },
+        };
+        let drop_proxies = link::note_engine_link(&mut sides, index, active, error);
+        if drop_proxies {
+            fail_engine(&mut inner);
+            return;
+        }
+        inner.engine_up = sides.up;
+        inner.engine_linked = sides.ready();
+        if inner.engine_linked {
+            inner.engine_tries = 0;
+            inner.engine_wait = 0;
+        }
         return;
     }
     let peer = inner
@@ -841,8 +904,7 @@ fn note_link_state(shared: &LoopShared, key: u64, active: bool, error: bool) {
             return;
         };
         if error {
-            tap.phase = link::link_failed(tap.phase);
-            tap.linked = false;
+            fail_tap(tap, peer);
             std::mem::take(&mut tap.link_keys)
         } else if active && tap.phase == LinkPhase::Linking {
             tap.phase = link::advance_link(LinkPhase::Linking, true);
@@ -1021,18 +1083,30 @@ fn reconcile(shared: &Rc<LoopShared>, filter: &Rc<RefCell<Option<MixFilter>>>) {
     if !stale.is_empty() {
         let mut inner = shared.inner.borrow_mut();
         for peer in stale {
-            let looped = {
-                let mix = inner.mix_mic_node.unwrap_or(0);
-                let node_refs = node_refs(&inner);
-                let edges: Vec<LinkEdge> = inner.edges.values().copied().collect();
-                let graph = LoopGraph {
-                    mix_mic_node: mix,
-                    nodes: &node_refs,
-                    links: &edges,
-                };
-                mix != 0 && route::upstream_includes_mix_mic(peer, &graph)
+            let mix = inner.mix_mic_node.unwrap_or(0);
+            let node_refs = node_refs(&inner);
+            let edges: Vec<LinkEdge> = inner.edges.values().copied().collect();
+            let graph = LoopGraph {
+                mix_mic_node: mix,
+                nodes: &node_refs,
+                links: &edges,
             };
-            if looped && inner.refused.insert(peer, true).is_none() {
+            let looped = mix != 0 && route::upstream_includes_mix_mic(peer, &graph);
+            let client_id = inner.nodes.get(&peer).and_then(|node| node.identity.client_id);
+            let own_id = inner.own.map(|own| own.client_id);
+            let had_tap = inner.taps.contains_key(&peer);
+            let shared_client = had_tap
+                && mix != 0
+                && client_id.is_some_and(|id| {
+                    Some(id) != own_id && route::client_captures_mix_mic(id, &graph)
+                });
+            if shared_client && let Some(id) = client_id {
+                if route::claim_client_once(&mut inner.unlinked_clients, id) {
+                    eprintln!(
+                        "omamix: unlinking client {id}: a stream of that client captures Mix Mic"
+                    );
+                }
+            } else if looped && inner.refused.insert(peer, true).is_none() {
                 let name = inner
                     .nodes
                     .get(&peer)
@@ -1164,13 +1238,18 @@ fn ensure_tap(shared: &Rc<LoopShared>, filter: &Rc<RefCell<Option<MixFilter>>>, 
     }
 
     let (phase, slotted, peer_ports, our_ports) = {
-        let inner = shared.inner.borrow();
-        if inner
-            .taps
-            .get(&peer)
-            .is_some_and(|tap| matches!(tap.phase, LinkPhase::Failed | LinkPhase::PeerVanished))
-        {
-            return;
+        let mut inner = shared.inner.borrow_mut();
+        if let Some(tap) = inner.taps.get_mut(&peer) {
+            if tap.phase == LinkPhase::PeerVanished {
+                return;
+            }
+            if tap.phase == LinkPhase::Failed && !link::retry_due(tap.tries, &mut tap.wait) {
+                return;
+            }
+            if tap.phase == LinkPhase::Failed {
+                tap.phase = LinkPhase::WaitingForPorts;
+                tap.linked = false;
+            }
         }
         let slotted = inner.taps.get(&peer).is_some_and(|tap| tap.slot.is_some());
         let phase = inner
@@ -1197,11 +1276,13 @@ fn ensure_tap(shared: &Rc<LoopShared>, filter: &Rc<RefCell<Option<MixFilter>>>, 
             linked: false,
             saw_edges: false,
             link_keys: Vec::new(),
+            tries: 0,
+            wait: 0,
         });
         match result {
             Ok(slot) => tap.slot = Some(slot),
             Err(()) => {
-                tap.phase = link::link_failed(tap.phase);
+                fail_tap(tap, peer);
                 return;
             }
         }
@@ -1222,6 +1303,8 @@ fn ensure_tap(shared: &Rc<LoopShared>, filter: &Rc<RefCell<Option<MixFilter>>>, 
             linked: false,
             saw_edges: false,
             link_keys: Vec::new(),
+            tries: 0,
+            wait: 0,
         });
         tap.phase = phase;
         if tap.linked || tap.phase != LinkPhase::Linking {
@@ -1246,7 +1329,7 @@ fn ensure_tap(shared: &Rc<LoopShared>, filter: &Rc<RefCell<Option<MixFilter>>>, 
             Err(()) => {
                 let mut inner = shared.inner.borrow_mut();
                 if let Some(tap) = inner.taps.get_mut(&peer) {
-                    tap.phase = link::link_failed(tap.phase);
+                    fail_tap(tap, peer);
                     let keys = std::mem::take(&mut tap.link_keys);
                     for key in keys.into_iter().chain(created.drain(..)) {
                         inner.links.remove(&key);
@@ -1667,36 +1750,44 @@ fn ensure_published(
 }
 
 fn link_engine(shared: &Rc<LoopShared>) {
-    let (filter_node, mix, linked) = {
+    let (filter_node, mix) = {
         let inner = shared.inner.borrow();
-        (inner.filter_node, inner.mix_mic_node, inner.engine_linked)
+        (inner.filter_node, inner.mix_mic_node)
     };
     let (Some(filter_node), Some(mix)) = (filter_node, mix) else {
         return;
     };
-    if linked {
+    let due = {
         let mut inner = shared.inner.borrow_mut();
-        let count = inner
-            .edges
-            .values()
-            .filter(|edge| edge.output_node == filter_node && edge.input_node == mix)
-            .count();
-        if count > 0 {
-            inner.engine_saw_edges = true;
-            return;
+        if !inner.engine_link_keys.is_empty() {
+            if inner.engine_linked {
+                let count = inner
+                    .edges
+                    .values()
+                    .filter(|edge| edge.output_node == filter_node && edge.input_node == mix)
+                    .count();
+                if count > 0 {
+                    inner.engine_saw_edges = true;
+                    return;
+                }
+                if !inner.engine_saw_edges {
+                    return;
+                }
+                eprintln!("omamix: Mix Mic engine link went away; linking it again");
+                let keys = std::mem::take(&mut inner.engine_link_keys);
+                for key in keys {
+                    inner.links.remove(&key);
+                }
+                inner.engine_linked = false;
+                inner.engine_saw_edges = false;
+                inner.engine_up = [false, false];
+            } else {
+                return;
+            }
         }
-        if !inner.engine_saw_edges {
-            return;
-        }
-        eprintln!("omamix: Mix Mic engine link went away; linking it again");
-        let keys = std::mem::take(&mut inner.engine_link_keys);
-        for key in keys {
-            inner.links.remove(&key);
-        }
-        inner.engine_linked = false;
-        inner.engine_saw_edges = false;
-    }
-    if shared.inner.borrow().engine_linked {
+        link::retry_due(inner.engine_tries, &mut inner.engine_wait)
+    };
+    if !due {
         return;
     }
     let endpoints = {
@@ -1718,13 +1809,20 @@ fn link_engine(shared: &Rc<LoopShared>) {
                 for key in created {
                     inner.links.remove(&key);
                 }
+                fail_engine(&mut inner);
                 return;
             }
         }
     }
     let mut inner = shared.inner.borrow_mut();
+    let mut sides = link::EngineSides {
+        up: inner.engine_up,
+        proxies: 0,
+    };
+    link::engine_proxies_created(&mut sides);
+    inner.engine_up = sides.up;
     inner.engine_link_keys.extend(created);
-    inner.engine_linked = true;
+    inner.engine_linked = false;
 }
 
 fn relink_if_edges_gone(shared: &LoopShared, peer: u32) {

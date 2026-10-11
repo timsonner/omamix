@@ -85,6 +85,73 @@ pub fn link_failed(phase: LinkPhase) -> LinkPhase {
     LinkPhase::Failed
 }
 
+/// How many failures a tap or the engine link will schedule before it stops.
+pub const RETRY_LIMIT: u8 = 4;
+
+/// One timer tick. True when a new attempt may start.
+///
+/// `wait` counts down first, so a failure armed on this tick does not run
+/// again until a later tick. After [`RETRY_LIMIT`] failures the attempt stays
+/// idle.
+pub fn retry_due(tries: u8, wait: &mut u8) -> bool {
+    if *wait > 0 {
+        *wait -= 1;
+        return false;
+    }
+    tries < RETRY_LIMIT
+}
+
+/// Schedule the next attempt. The wait doubles from one tick, capped at eight.
+pub fn arm_retry(tries: &mut u8, wait: &mut u8) {
+    *tries = tries.saturating_add(1);
+    let shift = (*tries).saturating_sub(1).min(3);
+    *wait = 1_u8 << shift;
+}
+
+/// Both engine-to-Mix-Mic links. Ready only when both sides are up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EngineSides {
+    pub up: [bool; 2],
+    pub proxies: u8,
+}
+
+impl EngineSides {
+    pub fn idle() -> Self {
+        Self {
+            up: [false, false],
+            proxies: 0,
+        }
+    }
+
+    pub fn ready(self) -> bool {
+        self.proxies == 2 && self.up == [true, true]
+    }
+}
+
+/// Record one link info event.
+///
+/// An error drops both sides: a single failed link is not a live engine.
+/// Active or paused sets that side. Any other state clears it, so readiness
+/// follows the link rather than the moment `create_object` returned.
+/// The bool is true when the proxies should be dropped.
+pub fn note_engine_link(sides: &mut EngineSides, index: usize, active: bool, error: bool) -> bool {
+    if error {
+        sides.up = [false, false];
+        sides.proxies = 0;
+        return true;
+    }
+    if index < 2 {
+        sides.up[index] = active;
+    }
+    false
+}
+
+/// Both create calls returned a proxy. Neither side is up yet.
+pub fn engine_proxies_created(sides: &mut EngineSides) {
+    sides.proxies = 2;
+    sides.up = [false, false];
+}
+
 /// Move a live attempt forward. A vanished peer is handled by [`peer_removed`].
 pub fn advance_link(phase: LinkPhase, ports_ready: bool) -> LinkPhase {
     match phase {
@@ -129,6 +196,51 @@ mod tests {
         assert_eq!(link_failed(LinkPhase::Linking), LinkPhase::Failed);
         assert_eq!(advance_link(LinkPhase::Failed, true), LinkPhase::Failed);
         assert_eq!(link_properties(), [("object.linger", "false")]);
+    }
+
+    #[test]
+    fn a_failed_tap_retries_with_backoff_then_stops() {
+        let mut tries = 0;
+        let mut wait = 0;
+        assert!(retry_due(tries, &mut wait));
+        arm_retry(&mut tries, &mut wait);
+        assert_eq!((tries, wait), (1, 1));
+        assert!(!retry_due(tries, &mut wait));
+        assert_eq!(wait, 0);
+        assert!(retry_due(tries, &mut wait));
+
+        tries = 0;
+        wait = 0;
+        for _ in 0..RETRY_LIMIT {
+            assert!(retry_due(tries, &mut wait));
+            arm_retry(&mut tries, &mut wait);
+            while wait > 0 {
+                assert!(!retry_due(tries, &mut wait));
+            }
+        }
+        assert_eq!(tries, RETRY_LIMIT);
+        assert!(!retry_due(tries, &mut wait));
+        assert!(!retry_due(tries, &mut wait));
+    }
+
+    #[test]
+    fn an_engine_link_error_clears_ready() {
+        let mut sides = EngineSides::idle();
+        engine_proxies_created(&mut sides);
+        assert!(!sides.ready());
+        assert!(!note_engine_link(&mut sides, 0, true, false));
+        assert!(!sides.ready());
+        assert!(!note_engine_link(&mut sides, 1, true, false));
+        assert!(sides.ready());
+
+        assert!(!note_engine_link(&mut sides, 1, false, false));
+        assert!(!sides.ready());
+        assert_eq!(sides.proxies, 2);
+
+        assert!(note_engine_link(&mut sides, 0, false, true));
+        assert!(!sides.ready());
+        assert_eq!(sides.proxies, 0);
+        assert_eq!(sides.up, [false, false]);
     }
 
     #[test]

@@ -194,6 +194,12 @@ fn reaches_mix_mic_upstream(start: u32, graph: &LoopGraph<'_>) -> bool {
     false
 }
 
+/// True the first time `client_id` is claimed. Later nodes of that client
+/// do not log again.
+pub fn claim_client_once(logged: &mut std::collections::HashSet<u32>, client_id: u32) -> bool {
+    logged.insert(client_id)
+}
+
 /// True when any node of `client_id` is Mix Mic or is fed by Mix Mic.
 ///
 /// That is the OBS / browser-studio case: the capture node and the playback
@@ -652,6 +658,10 @@ mod tests {
             links: &links,
         };
         assert!(client_captures_mix_mic(40, &graph));
+        let mut logged = std::collections::HashSet::new();
+        assert!(claim_client_once(&mut logged, 40));
+        assert!(!claim_client_once(&mut logged, 40));
+        assert!(claim_client_once(&mut logged, 50));
 
         let mut play = PlaybackStream::app("obs", "pw-loopback");
         play.node_id = Some(5);
