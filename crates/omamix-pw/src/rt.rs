@@ -6,7 +6,7 @@
 //! not start that thread and does not open a client.
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering, fence};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use omamix_core::db::{self, BelowMin};
@@ -178,8 +178,10 @@ impl MixSlot {
     pub fn write(&self, left: &[f32], right: &[f32]) {
         let n = left.len().min(right.len()).min(MIX_SLOT_CAP);
         let seq = self.seq.load(Ordering::Relaxed);
-        // Odd sequence: a reader must retry.
+        // Odd sequence: a reader must retry. The release fence publishes that
+        // odd value before the sample stores.
         self.seq.store(seq.wrapping_add(1) | 1, Ordering::Relaxed);
+        fence(Ordering::Release);
         unsafe {
             let dst_l = &mut *self.left.get();
             let dst_r = &mut *self.right.get();
@@ -205,7 +207,9 @@ impl MixSlot {
                 left[..n].copy_from_slice(&src_l[..n]);
                 right[..n].copy_from_slice(&src_r[..n]);
             }
-            let end = self.seq.load(Ordering::Acquire);
+            // Acquire the writer's release fence before trusting the second sequence.
+            fence(Ordering::Acquire);
+            let end = self.seq.load(Ordering::Relaxed);
             if start == end && end & 1 == 0 {
                 return n;
             }

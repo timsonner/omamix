@@ -1,10 +1,9 @@
 //! Metadata writes, and what a default-device observation means.
 //!
-//! Every metadata write goes through [`allow_metadata_write`]. That function
-//! refuses the key `default` and every `default.*` key (`default.audio.source`,
-//! `default.audio.sink`, `default.configured.*`). Observing a default is
-//! separate: [`observe_default_source`] and [`observe_default_sink`] only
-//! classify a name that was read.
+//! Every metadata write goes through [`allow_metadata_write`]. The allow list
+//! is empty, so every key is refused, including `default` and `default.*`.
+//! Observing a default is separate: [`observe_default_source`] and
+//! [`observe_default_sink`] only classify a name that was read.
 
 use crate::route::MIX_MIC_NODE_NAME;
 
@@ -14,19 +13,59 @@ pub struct RefusedDefaultKey {
     pub key: String,
 }
 
+/// Keys a metadata write may set. Empty: this process does not write metadata.
+const ALLOWED_METADATA_KEYS: &[&str] = &[];
+
 /// `default` and `default.*` are session default-device keys.
 pub fn is_default_metadata_key(key: &str) -> bool {
-    key == "default" || key.starts_with("default.")
+    let key = key.trim();
+    key.eq_ignore_ascii_case("default") || key_has_default_prefix(key)
 }
 
-/// The only gate for a metadata write.
+fn key_has_default_prefix(key: &str) -> bool {
+    let prefix = format!("{}.", "default");
+    key.len() >= prefix.len() && key[..prefix.len()].eq_ignore_ascii_case(&prefix)
+}
+
+/// The only gate for a metadata write. Matching is trimmed and case-insensitive.
 pub fn allow_metadata_write(key: &str) -> Result<(), RefusedDefaultKey> {
-    if is_default_metadata_key(key) {
+    if metadata_key_allowed(key, ALLOWED_METADATA_KEYS) {
+        Ok(())
+    } else {
         Err(RefusedDefaultKey {
             key: key.to_string(),
         })
+    }
+}
+
+fn metadata_key_allowed(key: &str, allowed: &[&str]) -> bool {
+    let key = key.trim();
+    allowed.iter().any(|item| key.eq_ignore_ascii_case(item))
+}
+
+/// Node name inside a PipeWire metadata value.
+///
+/// WirePlumber stores `{"name":"alsa_input..."}`. A bare name is accepted too.
+/// This parses a value that was read. It does not write.
+pub fn metadata_node_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if !value.starts_with('{') {
+        return Some(value.to_string());
+    }
+    let marker = format!("\"{}\"", "name");
+    let at = value.find(&marker)?;
+    let rest = value[at + marker.len()..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    let name = &rest[..end];
+    if name.is_empty() {
+        None
     } else {
-        Ok(())
+        Some(name.to_string())
     }
 }
 
@@ -80,15 +119,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn metadata_write_refuses_default_keys() {
+    fn metadata_write_refuses_every_key_including_defaults() {
         for key in [
             "default",
             "default.audio.source",
             "default.audio.sink",
             "default.configured.audio.source",
             "default.configured.audio.sink",
+            " Default.Audio.Source ",
+            "node.name",
+            "priority.session",
+            "defaulted",
         ] {
-            assert!(is_default_metadata_key(key));
             assert_eq!(
                 allow_metadata_write(key),
                 Err(RefusedDefaultKey {
@@ -96,9 +138,35 @@ mod tests {
                 })
             );
         }
-        assert!(allow_metadata_write("node.name").is_ok());
-        assert!(allow_metadata_write("priority.session").is_ok());
-        assert!(allow_metadata_write("defaulted").is_ok());
+        assert!(is_default_metadata_key("default"));
+        assert!(is_default_metadata_key(" Default.Audio.Source "));
+        assert!(!is_default_metadata_key("defaulted"));
+        assert!(metadata_key_allowed(
+            " Default.Audio.Source ",
+            &["default.audio.source"]
+        ));
+        assert!(!metadata_key_allowed("node.name", &[]));
+    }
+
+    #[test]
+    fn only_source_selects_mix_mic_and_the_write_is_refused() {
+        assert_eq!(
+            observe_default_source(None, Some(MIX_MIC_NODE_NAME)),
+            DefaultDeviceObservation::MixMicIsDefault
+        );
+        assert_eq!(
+            observe_default_source(Some(MIX_MIC_NODE_NAME), Some(MIX_MIC_NODE_NAME)),
+            DefaultDeviceObservation::MixMicIsDefault
+        );
+        assert!(allow_metadata_write("default.audio.source").is_err());
+        assert_eq!(
+            metadata_node_name("{\"name\":\"alsa_input.usb-Shure\"}"),
+            Some("alsa_input.usb-Shure".into())
+        );
+        assert_eq!(
+            metadata_node_name("alsa_output.pci"),
+            Some("alsa_output.pci".into())
+        );
     }
 
     #[test]
@@ -142,26 +210,83 @@ mod tests {
         let dash = format!("{}-default", "set");
         let underscore = format!("{}_default", "set");
         let property = format!("set_{}", "property");
+        let set_volume = format!("{}-volume", "set");
+        let set_mute = format!("{}-mute", "set");
+        let pw_metadata = format!("{}-{}", "pw", "metadata");
+        let mixer_cmd = format!("{}ixer", "am");
+        let alsa_cmd = format!("{}ctl", "alsa");
+        let command_new = format!("Command::{}", "new");
+        let param_call = format!("set_{}", "param");
+        let set_dash = format!("{}-", "set");
+        let config_wp = format!(".config/{}", "wireplumber");
+        let config_pw = format!(".config/{}", "pipewire");
+        let config_hypr = format!(".config/{}", "hypr");
         let default_dot = format!("{}{}", "default", ".");
         let quoted_default = format!("\"{}\"", "default");
+        let default_word = "default";
         let mut hits = Vec::new();
         for path in source_files() {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            if text.contains(&dash) || text.contains(&underscore) {
-                hits.push(path.display().to_string());
-                continue;
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let mut reasons = Vec::new();
+            if text.contains(&dash) {
+                reasons.push("dash");
+            }
+            if text.contains(&underscore) {
+                reasons.push("underscore");
+            }
+            if text.contains(&set_volume) {
+                reasons.push("volume");
+            }
+            if text.contains(&set_mute) {
+                reasons.push("mute");
+            }
+            if text.contains(&pw_metadata) {
+                reasons.push("metadata-tool");
+            }
+            if text.contains(&mixer_cmd) {
+                reasons.push("mixer");
+            }
+            if text.contains(&alsa_cmd) {
+                reasons.push("alsa-ctl");
+            }
+            if text.contains(&config_wp) || text.contains(&config_pw) || text.contains(&config_hypr)
+            {
+                reasons.push("config-dir");
+            }
+            if name != "build.rs" && text.contains(&command_new) {
+                reasons.push("spawn");
+            }
+            if name != "filter.rs" && text.contains(&param_call) {
+                reasons.push("param");
             }
             if property_near_default_key(&text, &property, &default_dot, &quoted_default) {
-                hits.push(path.display().to_string());
+                reasons.push("property");
+            }
+            if set_dash_near(&text, &set_dash, default_word) {
+                reasons.push("split");
+            }
+            if !reasons.is_empty() {
+                hits.push(format!("{} ({})", path.display(), reasons.join(", ")));
             }
         }
-        assert!(
-            hits.is_empty(),
-            "default-device write in {}",
-            hits.join(", ")
-        );
+        assert!(hits.is_empty(), "device write in {}", hits.join(", "));
+    }
+
+    fn set_dash_near(text: &str, set_dash: &str, default_word: &str) -> bool {
+        let mut start = 0;
+        while let Some(found) = text[start..].find(set_dash) {
+            let at = start + found;
+            let from = at.saturating_sub(48);
+            let to = (at + set_dash.len() + 48).min(text.len());
+            if text[from..to].contains(default_word) {
+                return true;
+            }
+            start = at + set_dash.len();
+        }
+        false
     }
 
     fn property_near_default_key(

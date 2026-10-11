@@ -205,8 +205,9 @@ pub struct OwnedOutput {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OwnedRole {
-    /// The one `pw_filter`. This node is Mix Mic: `media.class` Audio/Source,
-    /// `node.name` [`route::MIX_MIC_NODE_NAME`]. Strip taps are its input ports.
+    /// The public Mix Mic source: `media.class` Audio/Source/Virtual,
+    /// `node.name` [`route::MIX_MIC_NODE_NAME`]. The mix engine is a separate
+    /// filter node. Strip taps are input ports on that filter.
     MixMic,
     HeadphoneSend(StripId),
     MonitorFinalMix,
@@ -225,7 +226,7 @@ pub fn owned_output_properties(output: &OwnedOutput) -> Vec<(&'static str, &'sta
         OwnedRole::MixMic => {
             props.push(("node.name", route::MIX_MIC_NODE_NAME));
             props.push(("node.description", "Mix Mic"));
-            props.push(("media.class", "Audio/Source"));
+            props.push(("media.class", "Audio/Source/Virtual"));
             props.push(("node.virtual", "true"));
         }
         OwnedRole::HeadphoneSend(_) => {

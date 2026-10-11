@@ -1,8 +1,8 @@
 //! Property bags and the monitor stream format.
 //!
-//! Compiled only with `--features pipewire`. Mix Mic itself is the `pw_filter`
-//! in [`crate::filter`], not a `pw_stream`. This module does not open a client.
-//! Unit tests build property objects and do not connect.
+//! Compiled only with `--features pipewire`. The public Mix Mic node is an
+//! adapter. The mix runs in the `pw_filter` in [`crate::filter`]. This module
+//! does not open a client. Unit tests build property objects and do not connect.
 
 use pipewire as pw;
 use pw::properties::PropertiesBox;

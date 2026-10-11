@@ -38,7 +38,7 @@ Tim records screen videos and streams (YouTube, X, Rumble browser studio) with h
 
 ## Tech direction
 
-Decided in [ARCHITECTURE.md](ARCHITECTURE.md): Rust, egui/eframe, pipewire-rs with an in-process DSP chain. The master is one app-owned `pw_filter` node with `media.class = Audio/Source` (that node is Mix Mic). DSP stages sit behind a trait; RNNoise (library is installed) and optional LV2 come later. PipeWire filter-chain / a full LV2 host is not the v1 engine.
+Decided in [ARCHITECTURE.md](ARCHITECTURE.md): Rust, egui/eframe, pipewire-rs with an in-process DSP chain. Mix Mic is an app-owned `Audio/Source/Virtual` adapter. The mix itself is one `pw_filter` (`omamix.mix-engine`) whose outputs feed that adapter. DSP stages sit behind a trait; RNNoise (library is installed) and optional LV2 come later. PipeWire filter-chain / a full LV2 host is not the v1 engine.
 
 Package: plain cargo build for dev; an Arch `PKGBUILD` stub is in the repo (no AUR dependency).
 

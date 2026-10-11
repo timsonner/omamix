@@ -90,6 +90,8 @@ pub struct PlaybackStream {
     pub client_id: Option<u32>,
     /// Object id of this node, once the registry has seen it.
     pub node_id: Option<u32>,
+    /// `media.class`. Playback taps require `Stream/Output/Audio`.
+    pub media_class: String,
     /// The `omamix.owned` property, once bound. Globals omit it.
     /// The loop guard does not trust this on a playback node; it compares
     /// [`OwnClient`] and walks links.
@@ -106,8 +108,31 @@ impl PlaybackStream {
             object_serial: None,
             client_id: None,
             node_id: None,
+            media_class: "Stream/Output/Audio".into(),
             omamix_owned: false,
         }
+    }
+}
+
+/// `Stream/Output/Audio` is a playback stream. Anything else fails closed.
+pub fn is_playback_stream_class(class: &str) -> bool {
+    class == "Stream/Output/Audio"
+}
+
+/// Device strips attach these capture classes only.
+pub fn is_capture_device_class(class: &str) -> bool {
+    matches!(
+        class,
+        "Audio/Source" | "Audio/Source/Virtual" | "Audio/Duplex"
+    )
+}
+
+/// Node globals often omit `application.process.binary`. The client object has it.
+pub fn resolve_binary(node_binary: &str, client_binary: &str) -> String {
+    if !node_binary.is_empty() {
+        node_binary.to_string()
+    } else {
+        client_binary.to_string()
     }
 }
 
@@ -135,27 +160,17 @@ pub struct LoopGraph<'a> {
 
 /// True when tapping `node_id` would put Mix Mic back into Mix Mic.
 ///
-/// Two walks:
+/// The walk follows links upstream from `node_id`, including through
+/// intermediate nodes. A hit on Mix Mic means this node is already fed by it.
+/// The walk stops on a repeated node, so a cycle that never reaches Mix Mic
+/// does not run forever and does not refuse the node.
 ///
-/// 1. Follow links upstream from `node_id`. A hit on Mix Mic means this node
-///    is already fed by it (a loopback or a monitor node).
-/// 2. Follow links downstream from Mix Mic and collect `client.id`. If
-///    `client_id` is in that set, the same client is capturing Mix Mic and
-///    this playback node is its rebroadcast (OBS monitor, a browser studio).
-///    That loop is inside the client, so the playback node has no PipeWire
-///    edge of its own back to Mix Mic.
-pub fn upstream_includes_mix_mic(
-    node_id: u32,
-    client_id: Option<u32>,
-    graph: &LoopGraph<'_>,
-) -> bool {
-    if node_id == graph.mix_mic_node || reaches_mix_mic_upstream(node_id, graph) {
-        return true;
-    }
-    match client_id {
-        Some(client_id) => clients_downstream_of_mix_mic(graph).contains(&client_id),
-        None => false,
-    }
+/// Refusal is per node. A second stream of the same client, with no PipeWire
+/// edge to Mix Mic, stays eligible. A browser tab that captures Mix Mic does
+/// not block a sibling tab. A same-client rebroadcast that has no PipeWire
+/// edge is not visible to this walk.
+pub fn upstream_includes_mix_mic(node_id: u32, graph: &LoopGraph<'_>) -> bool {
+    node_id == graph.mix_mic_node || reaches_mix_mic_upstream(node_id, graph)
 }
 
 fn reaches_mix_mic_upstream(start: u32, graph: &LoopGraph<'_>) -> bool {
@@ -176,27 +191,6 @@ fn reaches_mix_mic_upstream(start: u32, graph: &LoopGraph<'_>) -> bool {
         }
     }
     false
-}
-
-fn clients_downstream_of_mix_mic(graph: &LoopGraph<'_>) -> Vec<u32> {
-    let mut seen = vec![graph.mix_mic_node];
-    let mut queue = vec![graph.mix_mic_node];
-    let mut clients = Vec::new();
-    while let Some(node) = queue.pop() {
-        for link in graph.links {
-            if link.output_node != node || seen.contains(&link.input_node) {
-                continue;
-            }
-            seen.push(link.input_node);
-            queue.push(link.input_node);
-            if let Some(found) = graph.nodes.iter().find(|item| item.id == link.input_node)
-                && let Some(client_id) = found.client_id
-            {
-                clients.push(client_id);
-            }
-        }
-    }
-    clients
 }
 
 /// Identity fields copied off a node global and, after bind, its info props.
@@ -271,6 +265,7 @@ impl NodeIdentity {
             object_serial: self.object_serial,
             client_id: self.client_id,
             node_id: Some(node_id),
+            media_class: self.media_class.clone(),
             omamix_owned: self.omamix_owned,
         }
     }
@@ -300,19 +295,23 @@ pub fn is_our_client(stream: &PlaybackStream, own: &OwnClient) -> bool {
 ///
 /// Refused:
 ///
+/// - `media.class` is not `Stream/Output/Audio`. Capture nodes, including
+///   `Stream/Input/Audio`, stay out. An empty class fails closed.
 /// - `omamix.owned` is set (after bind).
 /// - `client.id` or pid is ours. Headphone sends and the monitor share our
 ///   client, and that id is not a property a playback app can put on itself.
-/// - [`upstream_includes_mix_mic`] when `graph` is present. That walk is how
-///   an OBS monitor or a browser studio is kept out: the playback node is a
-///   different object from the capture, so a flag on the playback node cannot
-///   see the loop. Without a `node_id` the walk cannot run, and the stream is
-///   refused until the registry has one.
+/// - [`upstream_includes_mix_mic`] when `graph` is present. The walk is per
+///   node. A sibling stream of a client that also captures Mix Mic is still
+///   eligible when that sibling has no edge to Mix Mic. Without a `node_id`
+///   the walk cannot run, and the stream is refused until the registry has one.
 pub fn feeds_mix_mic(
     stream: &PlaybackStream,
     own: Option<&OwnClient>,
     graph: Option<&LoopGraph<'_>>,
 ) -> bool {
+    if !is_playback_stream_class(&stream.media_class) {
+        return false;
+    }
     if stream.omamix_owned {
         return false;
     }
@@ -325,7 +324,7 @@ pub fn feeds_mix_mic(
         let Some(node_id) = stream.node_id else {
             return false;
         };
-        if upstream_includes_mix_mic(node_id, stream.client_id, graph) {
+        if upstream_includes_mix_mic(node_id, graph) {
             return false;
         }
     }
@@ -520,7 +519,7 @@ mod tests {
             nodes: &nodes,
             links: &links,
         };
-        assert!(upstream_includes_mix_mic(2, Some(20), &graph));
+        assert!(upstream_includes_mix_mic(2, &graph));
         let mut stream = PlaybackStream::app("loopback", "pw-loopback");
         stream.node_id = Some(2);
         stream.client_id = Some(20);
@@ -528,9 +527,10 @@ mod tests {
     }
 
     #[test]
-    fn same_client_capture_of_mix_mic_refuses_its_playback() {
-        // Browser studio / OBS: capture node 4 reads Mix Mic, playback node 5
-        // is a different object with the same client and no link of its own.
+    fn same_client_capture_refuses_only_the_capturing_node() {
+        // Node 4 reads Mix Mic. Node 5 is another stream of that client and
+        // has no edge of its own, so it stays eligible. An Application strip
+        // can still match it by media.name.
         let nodes = [
             NodeRef {
                 id: 4,
@@ -554,22 +554,100 @@ mod tests {
             nodes: &nodes,
             links: &links,
         };
-        assert!(upstream_includes_mix_mic(5, Some(40), &graph));
-        assert!(!upstream_includes_mix_mic(6, Some(50), &graph));
+        assert!(upstream_includes_mix_mic(4, &graph));
+        assert!(!upstream_includes_mix_mic(5, &graph));
+        assert!(!upstream_includes_mix_mic(6, &graph));
 
         let mut studio = PlaybackStream::app("Chromium", "chromium");
         studio.node_id = Some(5);
         studio.client_id = Some(40);
-        studio.media_name = "studio".into();
-        assert!(!feeds_mix_mic(&studio, None, Some(&graph)));
+        studio.media_name = "music".into();
+        assert!(feeds_mix_mic(&studio, None, Some(&graph)));
+
+        let mut capture = PlaybackStream::app("Chromium", "chromium");
+        capture.node_id = Some(4);
+        capture.client_id = Some(40);
+        capture.media_class = "Stream/Input/Audio".into();
+        assert!(!feeds_mix_mic(&capture, None, Some(&graph)));
 
         let mut mpv = PlaybackStream::app("mpv", "mpv");
         mpv.node_id = Some(6);
         mpv.client_id = Some(50);
         assert!(feeds_mix_mic(&mpv, None, Some(&graph)));
+    }
 
-        let mut unbound = PlaybackStream::app("mpv", "mpv");
-        unbound.client_id = Some(50);
-        assert!(!feeds_mix_mic(&unbound, None, Some(&graph)));
+    #[test]
+    fn upstream_walk_covers_multiple_hops_cycles_and_late_links() {
+        let nodes = [
+            NodeRef {
+                id: 2,
+                client_id: None,
+            },
+            NodeRef {
+                id: 3,
+                client_id: None,
+            },
+        ];
+        let before = LoopGraph {
+            mix_mic_node: 1,
+            nodes: &nodes,
+            links: &[],
+        };
+        assert!(!upstream_includes_mix_mic(3, &before));
+
+        let late = [
+            LinkEdge {
+                output_node: 1,
+                input_node: 2,
+            },
+            LinkEdge {
+                output_node: 2,
+                input_node: 3,
+            },
+        ];
+        let after = LoopGraph {
+            mix_mic_node: 1,
+            nodes: &nodes,
+            links: &late,
+        };
+        assert!(upstream_includes_mix_mic(3, &after));
+        assert!(upstream_includes_mix_mic(2, &after));
+
+        let cycle = [
+            LinkEdge {
+                output_node: 2,
+                input_node: 3,
+            },
+            LinkEdge {
+                output_node: 3,
+                input_node: 2,
+            },
+        ];
+        let cycled = LoopGraph {
+            mix_mic_node: 1,
+            nodes: &nodes,
+            links: &cycle,
+        };
+        assert!(!upstream_includes_mix_mic(2, &cycled));
+        assert!(!upstream_includes_mix_mic(3, &cycled));
+    }
+
+    #[test]
+    fn capture_classes_and_client_binary_are_separate_from_playback() {
+        assert!(is_playback_stream_class("Stream/Output/Audio"));
+        assert!(!is_playback_stream_class("Stream/Input/Audio"));
+        assert!(!is_playback_stream_class(""));
+        assert!(is_capture_device_class("Audio/Source"));
+        assert!(is_capture_device_class("Audio/Source/Virtual"));
+        assert!(is_capture_device_class("Audio/Duplex"));
+        assert!(!is_capture_device_class("Stream/Input/Audio"));
+        assert!(!is_capture_device_class("Audio/DSP"));
+        assert_eq!(resolve_binary("", "pw-cat"), "pw-cat");
+        assert_eq!(resolve_binary("pw-play", "pipewire"), "pw-play");
+
+        let mut native = PlaybackStream::app("pw-cat", "");
+        native.binary.clear();
+        native.binary = resolve_binary(&native.binary, "pw-cat");
+        assert!(feeds_mix_mic(&native, None, None));
     }
 }

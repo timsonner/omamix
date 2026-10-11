@@ -1,6 +1,9 @@
 # Maintainer: timsonner
-# The Origin git URL is not anonymous. A clean chroot clone needs credentials.
+# The git source is unpinned: sha256sums is SKIP and pkgver() follows
+# whatever commit HEAD is when makepkg runs. The Origin git URL is not
+# anonymous. A clean chroot clone needs credentials.
 # `makepkg --nobuild` failed here without them.
+# The omamix binary does not call pactl. libpulse is not a dependency.
 pkgname=omamix-git
 pkgver=0.1.0
 pkgrel=1

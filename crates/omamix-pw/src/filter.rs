@@ -1,8 +1,9 @@
-//! `pw_filter` for Mix Mic.
+//! Internal `pw_filter` for the mix engine.
 //!
 //! pipewire-rs 0.10 does not wrap `pw_filter`. These declarations match
-//! `pipewire/filter.h` on the 1.6 headers. The filter node is Mix Mic: one
-//! node, one `process` callback. Strip taps are input ports on it.
+//! `pipewire/filter.h` on the 1.6 headers. The public Mix Mic node is an
+//! adapter. This filter is `omamix.mix-engine`: one `process` callback.
+//! Strip taps are input ports on it. Output ports feed the adapter.
 
 use std::ffi::{CString, c_char, c_void};
 use std::ptr::{self, NonNull};
@@ -89,6 +90,7 @@ unsafe extern "C" {
         n_params: u32,
     ) -> *mut c_void;
     fn pw_filter_get_dsp_buffer(port_data: *mut c_void, n_samples: u32) -> *mut c_void;
+    fn pw_filter_remove_port(port_data: *mut c_void) -> i32;
     fn pw_filter_disconnect(filter: *mut c_void) -> i32;
 }
 
@@ -146,7 +148,7 @@ impl MixFilter {
         props: PropertiesBox,
         tone: bool,
     ) -> Result<Self, pw::Error> {
-        let name = CString::new("Mix Mic").expect("name");
+        let name = CString::new("omamix mix engine").expect("name");
         let shared = Arc::new(ProcessShared::new());
         shared.tone.store(tone, Ordering::Release);
         let raw = unsafe { pw_filter_new(core.as_raw_ptr(), name.as_ptr(), props.into_raw()) };
@@ -218,12 +220,18 @@ impl MixFilter {
         }
     }
 
-    /// One stereo tap. Returns the port userdata pointers `(fl, fr)`.
-    pub fn add_tap_ports(&mut self, peer: u32) -> Result<(*mut c_void, *mut c_void), ()> {
-        let count = self.shared.input_count.load(Ordering::Acquire);
-        if count >= MAX_TAP_PORTS {
-            return Err(());
-        }
+    /// One stereo tap. Reuses the first empty slot. Returns that slot.
+    pub fn add_tap_ports(&mut self, peer: u32) -> Result<usize, ()> {
+        let slot = (0..MAX_TAP_PORTS)
+            .find(|index| {
+                self.shared.inputs_fl[*index]
+                    .load(Ordering::Acquire)
+                    .is_null()
+                    && self.shared.inputs_fr[*index]
+                        .load(Ordering::Acquire)
+                        .is_null()
+            })
+            .ok_or(())?;
         let fl = self.add_port(
             pw::spa::utils::Direction::Input,
             &format!("in-{peer}-FL"),
@@ -234,10 +242,42 @@ impl MixFilter {
             &format!("in-{peer}-FR"),
             "FR",
         )?;
-        self.shared.inputs_fl[count].store(fl, Ordering::Release);
-        self.shared.inputs_fr[count].store(fr, Ordering::Release);
-        self.shared.input_count.store(count + 1, Ordering::Release);
-        Ok((fl, fr))
+        self.shared.inputs_fl[slot].store(fl, Ordering::Release);
+        self.shared.inputs_fr[slot].store(fr, Ordering::Release);
+        let count = self.shared.input_count.load(Ordering::Acquire);
+        if slot >= count {
+            self.shared.input_count.store(slot + 1, Ordering::Release);
+        }
+        Ok(slot)
+    }
+
+    /// Drop one tap's ports so a later tap can reuse the slot.
+    pub fn remove_tap_ports(&mut self, slot: usize) {
+        if slot >= MAX_TAP_PORTS {
+            return;
+        }
+        let fl = self.shared.inputs_fl[slot].swap(ptr::null_mut(), Ordering::AcqRel);
+        let fr = self.shared.inputs_fr[slot].swap(ptr::null_mut(), Ordering::AcqRel);
+        unsafe {
+            if !fl.is_null() {
+                let _ = pw_filter_remove_port(fl);
+            }
+            if !fr.is_null() {
+                let _ = pw_filter_remove_port(fr);
+            }
+        }
+        let mut count = self.shared.input_count.load(Ordering::Acquire);
+        while count > 0
+            && self.shared.inputs_fl[count - 1]
+                .load(Ordering::Acquire)
+                .is_null()
+            && self.shared.inputs_fr[count - 1]
+                .load(Ordering::Acquire)
+                .is_null()
+        {
+            count -= 1;
+        }
+        self.shared.input_count.store(count, Ordering::Release);
     }
 
     fn add_output_ports(&mut self) -> Result<(), pw::Error> {
@@ -364,7 +404,14 @@ fn render(shared: &ProcessShared, position: &SpaIoPosition) {
     }
 
     if shared.tone.load(Ordering::Acquire) {
-        write_tone(shared, n, position.clock.rate.num, out_l, out_r);
+        write_tone(
+            shared,
+            n,
+            position.clock.rate.num,
+            position.clock.rate.denom,
+            out_l,
+            out_r,
+        );
     }
 
     // Unity unless the loop thread published a fader. No hidden mic boost.
@@ -401,7 +448,28 @@ fn advance_tone(phase: f32, rate: u32) -> (f32, f32) {
     (sample, next)
 }
 
-fn write_tone(shared: &ProcessShared, n: u32, rate: u32, out_l: &mut [f32], out_r: &mut [f32]) {
+/// `spa_io_clock.rate` is `1/samplerate` when PipeWire fills it that way
+/// (`num` 1, `denom` 48000). Prefer a denominator in the audio range, then
+/// the numerator, then 48 kHz.
+pub(crate) fn negotiated_rate(num: u32, denom: u32) -> u32 {
+    if (8_000..384_000).contains(&denom) {
+        denom
+    } else if (8_000..384_000).contains(&num) {
+        num
+    } else {
+        48_000
+    }
+}
+
+fn write_tone(
+    shared: &ProcessShared,
+    n: u32,
+    num: u32,
+    denom: u32,
+    out_l: &mut [f32],
+    out_r: &mut [f32],
+) {
+    let rate = negotiated_rate(num, denom);
     let mut phase = f32::from_bits(shared.tone_phase.load(Ordering::Relaxed));
     if !phase.is_finite() || !(0.0..1.0).contains(&phase) {
         phase = 0.0;
@@ -564,5 +632,12 @@ mod tests {
         // The rise at t=0 is the starting sample, and the 440th rise is the
         // first sample of the next second, outside this loop.
         assert_eq!(rises, 439);
+    }
+
+    #[test]
+    fn negotiated_rate_uses_the_denominator_of_a_one_over_rate_clock() {
+        assert_eq!(negotiated_rate(1, 48_000), 48_000);
+        assert_eq!(negotiated_rate(48_000, 1), 48_000);
+        assert_eq!(negotiated_rate(1, 1), 48_000);
     }
 }

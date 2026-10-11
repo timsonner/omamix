@@ -29,29 +29,39 @@ pub struct PortEndpoint {
 
 /// Output ports of `node_id` to link into a stereo tap, as `(fl, fr)`.
 ///
-/// Labeled FL/FR win. Two unlabeled outputs are used in id order. One unlabeled
-/// output is returned for both sides so a mono peer still connects.
+/// Labeled FL/FR win. A single output is used for both sides, including a
+/// port labeled MONO, FC, or AUX. Two unlabeled outputs are used in id order.
+/// Several labeled ports with no FL/FR pair stay unpaired.
 pub fn stereo_output_ports(ports: &[PortEndpoint], node_id: u32) -> Option<(u32, u32)> {
-    let mut outputs: Vec<&PortEndpoint> = ports
+    stereo_ports(ports, node_id, "out")
+}
+
+/// Input ports of `node_id`, with the same pairing rules as [`stereo_output_ports`].
+pub fn stereo_input_ports(ports: &[PortEndpoint], node_id: u32) -> Option<(u32, u32)> {
+    stereo_ports(ports, node_id, "in")
+}
+
+fn stereo_ports(ports: &[PortEndpoint], node_id: u32, direction: &str) -> Option<(u32, u32)> {
+    let mut matched: Vec<&PortEndpoint> = ports
         .iter()
-        .filter(|port| port.node_id == node_id && port.direction == "out")
+        .filter(|port| port.node_id == node_id && port.direction == direction)
         .collect();
-    outputs.sort_by_key(|port| port.id);
-    if outputs.is_empty() {
+    matched.sort_by_key(|port| port.id);
+    if matched.is_empty() {
         return None;
     }
-    let fl = outputs.iter().find(|port| port.channel == "FL");
-    let fr = outputs.iter().find(|port| port.channel == "FR");
+    let fl = matched.iter().find(|port| port.channel == "FL");
+    let fr = matched.iter().find(|port| port.channel == "FR");
     if let (Some(fl), Some(fr)) = (fl, fr) {
         return Some((fl.id, fr.id));
     }
-    if outputs.iter().any(|port| !port.channel.is_empty()) {
+    if matched.len() == 1 {
+        return Some((matched[0].id, matched[0].id));
+    }
+    if matched.iter().any(|port| !port.channel.is_empty()) {
         return None;
     }
-    if outputs.len() == 1 {
-        return Some((outputs[0].id, outputs[0].id));
-    }
-    Some((outputs[0].id, outputs[1].id))
+    Some((matched[0].id, matched[1].id))
 }
 
 /// Begin a link. Ports that are not ready stay in [`LinkPhase::WaitingForPorts`].
@@ -171,5 +181,40 @@ mod tests {
             channel: String::new(),
         }];
         assert_eq!(stereo_output_ports(&mono, 1), Some((7, 7)));
+    }
+
+    #[test]
+    fn a_single_labeled_mono_port_is_duplicated() {
+        for channel in ["MONO", "FC", "AUX"] {
+            let ports = [PortEndpoint {
+                id: 3,
+                node_id: 1,
+                direction: "out".into(),
+                channel: channel.into(),
+            }];
+            assert_eq!(stereo_output_ports(&ports, 1), Some((3, 3)), "{channel}");
+        }
+        let mixed = [
+            PortEndpoint {
+                id: 1,
+                node_id: 1,
+                direction: "out".into(),
+                channel: "MONO".into(),
+            },
+            PortEndpoint {
+                id: 2,
+                node_id: 1,
+                direction: "out".into(),
+                channel: "AUX".into(),
+            },
+        ];
+        assert_eq!(stereo_output_ports(&mixed, 1), None);
+        let input = [PortEndpoint {
+            id: 9,
+            node_id: 4,
+            direction: "in".into(),
+            channel: "FL".into(),
+        }];
+        assert_eq!(stereo_input_ports(&input, 4), Some((9, 9)));
     }
 }

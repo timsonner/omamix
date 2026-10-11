@@ -1,19 +1,20 @@
 //! Node properties the PipeWire backend sets.
 //!
 //! These are the PipeWire key strings (`PW_KEY_*`), kept here so the contract
-//! can be tested with no libpipewire. The `pw_filter` node is Mix Mic: one
-//! bag, `media.class` Audio/Source. See docs/ARCHITECTURE.md.
+//! can be tested with no libpipewire. Mix Mic is an adapter-backed
+//! `Audio/Source/Virtual` node. The `pw_filter` is a separate internal node.
+//! See docs/ARCHITECTURE.md.
 
 pub use omamix_core::graph::OMAMIX_OWNED_KEY;
 pub use omamix_core::route::MIX_MIC_NODE_NAME;
 
 /// `priority.session` and `priority.driver` for Mix Mic.
 ///
-/// Below every ALSA device (typically >= 1000). A figure of 500 is sometimes
-/// cited for a WirePlumber fallback source that would still beat this value
-/// after every ALSA source is unplugged. That fallback source is UNVERIFIED
-/// on WirePlumber 0.5.17 (the stock fallback is a sink). If Mix Mic is the
-/// only Audio/Source, priority does not keep it from becoming the default.
+/// WirePlumber ranks candidates by `priority.session`, then `priority.driver`,
+/// otherwise 0. A higher candidate always wins. There is no fallback source
+/// at another priority. If Mix Mic is the only `Audio/Source`,
+/// `Audio/Source/Virtual`, or `Audio/Duplex`, it becomes the default, and
+/// omamix then destroys that node. `default.configured.*` is never written.
 /// The unplug check is `scripts/unplug-watch.sh`, not this constant.
 pub const MIX_MIC_SESSION_PRIORITY: i32 = 1;
 
@@ -39,8 +40,16 @@ pub const CLOCK_PLAN: ClockPlan = ClockPlan::SingleFilter;
 /// `node.description` shown in source pickers.
 pub const MIX_MIC_DESCRIPTION: &str = "Mix Mic";
 
-/// `media.class` of the master. A real source node, owned by this process.
-pub const MIX_MIC_MEDIA_CLASS: &str = "Audio/Source";
+/// `media.class` of the public Mix Mic node. An adapter so session managers
+/// register it as a source.
+pub const MIX_MIC_MEDIA_CLASS: &str = "Audio/Source/Virtual";
+
+/// Internal mix engine. Not a source, so it is not a default candidate.
+pub const FILTER_NODE_NAME: &str = "omamix.mix-engine";
+
+/// `media.class` of the internal filter. Not `Audio/Source`,
+/// `Audio/Source/Virtual`, `Audio/Duplex`, or `Stream/Output/Audio`.
+pub const FILTER_MEDIA_CLASS: &str = "Audio/DSP";
 
 /// Playback-app taps use this class. They are not sources.
 pub const APP_CAPTURE_MEDIA_CLASS: &str = "Stream/Input/Audio";
@@ -55,7 +64,6 @@ pub fn mix_mic_properties() -> Vec<(&'static str, &'static str)> {
         ("media.role", "Production"),
         ("audio.channels", "2"),
         ("audio.position", "FL,FR"),
-        // 1, below ALSA. Whether a priority-500 fallback source exists is UNVERIFIED.
         ("priority.session", "1"),
         ("priority.driver", "1"),
         ("node.latency", MIX_MIC_NODE_LATENCY),
@@ -90,10 +98,21 @@ pub fn app_capture_properties(node_name: &str) -> Vec<(String, String)> {
     ]
 }
 
-/// The single `pw_filter`. That node is Mix Mic, so this is the same bag as
-/// [`mix_mic_properties`]. There is no second node and no second clock.
+/// The internal `pw_filter`. One process callback. Not the public Mix Mic node.
 pub fn filter_properties() -> Vec<(&'static str, &'static str)> {
-    mix_mic_properties()
+    vec![
+        ("node.name", FILTER_NODE_NAME),
+        ("node.description", "omamix mix engine"),
+        ("media.class", FILTER_MEDIA_CLASS),
+        ("node.virtual", "true"),
+        ("priority.session", "1"),
+        ("priority.driver", "1"),
+        ("node.latency", MIX_MIC_NODE_LATENCY),
+        ("node.dont-reconnect", "true"),
+        ("node.autoconnect", "false"),
+        ("object.linger", "false"),
+        (OMAMIX_OWNED_KEY, "true"),
+    ]
 }
 
 /// Headphone send. Same client as Mix Mic, so the loop guard excludes it.
@@ -149,7 +168,14 @@ mod tests {
         assert_eq!(get(&props, OMAMIX_OWNED_KEY), Some("true"));
         assert!(props.iter().all(|(key, _)| *key != "factory.name"));
         assert_eq!(CLOCK_PLAN, ClockPlan::SingleFilter);
-        assert_eq!(filter_properties(), mix_mic_properties());
+        let filter = filter_properties();
+        assert_ne!(filter, mix_mic_properties());
+        assert_eq!(get(&filter, "node.name"), Some(FILTER_NODE_NAME));
+        assert_eq!(get(&filter, "media.class"), Some(FILTER_MEDIA_CLASS));
+        assert_eq!(get(&filter, OMAMIX_OWNED_KEY), Some("true"));
+        assert_eq!(get(&filter, "object.linger"), Some("false"));
+        assert_eq!(get(&filter, "priority.session"), Some("1"));
+        assert_eq!(get(&filter, "node.autoconnect"), Some("false"));
     }
 
     #[test]
@@ -230,15 +256,9 @@ mod tests {
     }
 
     #[test]
-    fn priority_one_loses_to_a_higher_candidate_including_an_unverified_500() {
-        let x2u = 1000;
-        assert!(!mix_mic_selected_as_default(&[x2u]));
-        // UNVERIFIED: a WirePlumber fallback *source* at 500. The comparison
-        // is what priority 1 would do if that node exists. It is not evidence
-        // that the node exists. An empty candidate list selects Mix Mic.
-        let fallback = 500;
-        assert!(!mix_mic_selected_as_default(&[fallback]));
-        assert!(!mix_mic_selected_as_default(&[x2u, fallback]));
+    fn priority_one_loses_to_a_higher_candidate_and_an_empty_list_selects_mix_mic() {
+        assert!(!mix_mic_selected_as_default(&[1000]));
+        assert!(!mix_mic_selected_as_default(&[2]));
         assert!(mix_mic_selected_as_default(&[]));
     }
 

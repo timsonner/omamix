@@ -59,7 +59,7 @@ omamix [--headless] [--mix-mic] [--duration SECS] [--monitor-mix] [--tone]
        [--strips other] [--strips device:NODE] [--strips app:NAME:BINARY]
 
 --headless does not open a window.
---mix-mic publishes the Mix Mic Audio/Source. Without it, --headless
+--mix-mic publishes the Mix Mic Audio/Source/Virtual. Without it, --headless
 connects to nothing.
 --duration stops the process after that many seconds (headless only).
 --monitor-mix also publishes the monitor playback stream.

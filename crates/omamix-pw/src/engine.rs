@@ -6,22 +6,26 @@
 //! neither: it writes [`crate::rt::AtomicMeter`], reads [`crate::rt::AtomicParams`],
 //! and publishes the master quantum in [`crate::rt::MixSlot`].
 //!
-//! Mix Mic is the `pw_filter` node (`media.class` Audio/Source). Strip taps
-//! are input ports on that node, linked from the peer's output ports.
-//! Headphone sends and the monitor are separate `Stream/Output/Audio` streams.
-//! They are not a second mixer. The monitor's `process` copies [`crate::rt::MixSlot`],
-//! which is the master mix the filter just wrote. A headphone send must copy
-//! that strip's own tap, not the master mix, because the master includes the
-//! mic. This backend creates the monitor stream when the scene's `monitor_mix`
-//! flag is set (`--monitor-mix`). It does not create headphone streams: there
-//! is no per-strip slot yet, and playing MixSlot into a headphone send would
-//! put the mic in the headphones. Neither stream sets `target.object` or
-//! `AUTOCONNECT`, so neither attaches itself to a sink.
+//! Mix Mic is an adapter node (`media.class` Audio/Source/Virtual,
+//! `node.name` omamix.mix-mic) created with `support.null-audio-sink`. The
+//! `pw_filter` is a separate internal node, `omamix.mix-engine`. Strip taps
+//! are input ports on the filter. The filter's output ports link into the
+//! adapter. Headphone sends and the monitor are separate `Stream/Output/Audio`
+//! streams. They are not a second mixer. The monitor's `process` copies
+//! [`crate::rt::MixSlot`], which is the master mix the filter just wrote. A
+//! headphone send must copy that strip's own tap, not the master mix, because
+//! the master includes the mic. This backend creates the monitor stream when
+//! the scene's `monitor_mix` flag is set (`--monitor-mix`). It does not create
+//! headphone streams: there is no per-strip slot yet, and playing MixSlot into
+//! a headphone send would put the mic in the headphones. Neither stream sets
+//! `target.object` or `AUTOCONNECT`, so neither attaches itself to a sink.
 //!
-//! The control thread reads the default source and sink and logs when either
-//! name changes. It does not write them. If the default source is Mix Mic,
-//! it shuts the loop down, which destroys the Mix Mic node and leaves the
-//! session default where the session manager put it.
+//! The loop thread binds the `default` metadata object and listens to
+//! `property` events. It does not write metadata. Mix Mic is created
+//! only after `default.audio.source` has been read. If that read never
+//! arrives, Mix Mic is not published. If the default source is Mix Mic, the
+//! loop quits, which destroys the Mix Mic node and leaves the session default
+//! where the session manager put it.
 //!
 //! Unit tests do not call [`run_headless`].
 
@@ -72,18 +76,26 @@ pub struct HeadlessReport {
 
 enum LoopMsg {
     Shutdown,
-    /// Applied when a caller sends it. Headless shutdown is the message this
-    /// process sends; the fader and monitor arms stay so the loop can apply
-    /// them without a second channel.
-    #[allow(dead_code)]
     SetMasterFaderDb(f32),
-    #[allow(dead_code)]
     SetMonitorMix(bool),
+}
+
+fn engine_command_msg(command: EngineCommand) -> LoopMsg {
+    match command {
+        EngineCommand::Shutdown => LoopMsg::Shutdown,
+        EngineCommand::SetMasterFaderDb(db) => LoopMsg::SetMasterFaderDb(db),
+        EngineCommand::SetMonitorMix(on) => LoopMsg::SetMonitorMix(on),
+    }
 }
 
 struct Ready {
     node_id: u32,
     client_id: u32,
+}
+
+enum Boot {
+    Ready(Ready),
+    Failed(String),
 }
 
 /// Open a client only when `publish_mix_mic` is set. Blocks until shutdown.
@@ -96,7 +108,7 @@ pub fn run_headless(options: HeadlessOptions) -> Result<HeadlessReport, EngineEr
         });
     }
 
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Ready>();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Boot>();
     let (pw_tx, pw_rx) = pw::channel::channel::<LoopMsg>();
     arm_signals();
 
@@ -111,14 +123,12 @@ pub fn run_headless(options: HeadlessOptions) -> Result<HeadlessReport, EngineEr
         })
         .map_err(|err| EngineError::PipeWire(err.to_string()))?;
 
-    let ready = match ready_rx.recv_timeout(Duration::from_secs(5)) {
+    let ready = match wait_until_ready(&thread, &ready_rx, &pw_tx) {
         Ok(ready) => ready,
-        Err(_) => {
+        Err(err) => {
             let _ = pw_tx.send(LoopMsg::Shutdown);
             let _ = thread.join();
-            return Err(EngineError::PipeWire(
-                "Mix Mic was not ready within 5s".into(),
-            ));
+            return Err(err);
         }
     };
     println!(
@@ -129,9 +139,7 @@ pub fn run_headless(options: HeadlessOptions) -> Result<HeadlessReport, EngineEr
         println!("omamix: Mix Mic tone is 440 Hz at amplitude 0.2");
     }
 
-    let mut seen_source = pactl_default("source");
-    let mut seen_sink = pactl_default("sink");
-    let deadline = duration.map(|d| Instant::now() + d);
+    let deadline = duration.map(|span| Instant::now() + span);
     loop {
         if STOP.swap(false, Ordering::SeqCst) {
             break;
@@ -139,26 +147,8 @@ pub fn run_headless(options: HeadlessOptions) -> Result<HeadlessReport, EngineEr
         if deadline.is_some_and(|at| Instant::now() >= at) {
             break;
         }
-        let source_now = pactl_default("source");
-        match metadata::observe_default_source(seen_source.as_deref(), source_now.as_deref()) {
-            DefaultDeviceObservation::MixMicIsDefault => {
-                eprintln!(
-                    "omamix: warning: Mix Mic is the default source; tearing the Mix Mic node down"
-                );
-                break;
-            }
-            DefaultDeviceObservation::Changed { now } => {
-                eprintln!("omamix: default source is now {now}");
-                seen_source = Some(now);
-            }
-            DefaultDeviceObservation::Steady => {}
-        }
-        let sink_now = pactl_default("sink");
-        if let DefaultDeviceObservation::Changed { now } =
-            metadata::observe_default_sink(seen_sink.as_deref(), sink_now.as_deref())
-        {
-            eprintln!("omamix: default sink is now {now}");
-            seen_sink = Some(now);
+        if thread.is_finished() {
+            break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -172,21 +162,42 @@ pub fn run_headless(options: HeadlessOptions) -> Result<HeadlessReport, EngineEr
     })
 }
 
-/// Read the session default name. The result is logged, never written back.
-fn pactl_default(kind: &str) -> Option<String> {
-    let output = std::process::Command::new("pactl")
-        .arg(format!("get-default-{kind}"))
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(output.stdout).ok()?;
-    let text = text.trim();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text.to_string())
+fn wait_until_ready(
+    thread: &std::thread::JoinHandle<()>,
+    ready_rx: &std::sync::mpsc::Receiver<Boot>,
+    pw_tx: &pw::channel::Sender<LoopMsg>,
+) -> Result<Ready, EngineError> {
+    let started = Instant::now();
+    loop {
+        if thread.is_finished() {
+            return Err(EngineError::PipeWire(
+                "PipeWire thread stopped before Mix Mic was ready".into(),
+            ));
+        }
+        match ready_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(Boot::Ready(ready)) => return Ok(ready),
+            Ok(Boot::Failed(message)) => {
+                let _ = pw_tx.send(LoopMsg::Shutdown);
+                return Err(EngineError::PipeWire(message));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if STOP.load(Ordering::SeqCst) {
+                    return Err(EngineError::PipeWire(
+                        "stopped before Mix Mic was ready".into(),
+                    ));
+                }
+                if started.elapsed() >= Duration::from_secs(5) {
+                    return Err(EngineError::PipeWire(
+                        "Mix Mic was not ready within 5s".into(),
+                    ));
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(EngineError::PipeWire(
+                    "PipeWire thread stopped before Mix Mic was ready".into(),
+                ));
+            }
+        }
     }
 }
 
@@ -206,7 +217,7 @@ fn arm_signals() {
 fn pw_thread(
     options: HeadlessOptions,
     pw_rx: pw::channel::Receiver<LoopMsg>,
-    ready_tx: std::sync::mpsc::Sender<Ready>,
+    ready_tx: std::sync::mpsc::Sender<Boot>,
 ) {
     let mainloop = match pw::main_loop::MainLoopRc::new(None) {
         Ok(loop_) => loop_,
@@ -252,20 +263,8 @@ fn pw_thread(
         }
     };
 
-    let mut filter_props = PropertiesBox::new();
-    for (key, value) in contract::filter_properties() {
-        filter_props.insert(key, value);
-    }
-    let filter = match MixFilter::create(&core, filter_props, options.tone) {
-        Ok(filter) => filter,
-        Err(err) => {
-            eprintln!("omamix: filter: {err}");
-            return;
-        }
-    };
-    let _ = filter.events_version();
-    let shared = filter.shared();
-    let filter = Rc::new(RefCell::new(filter));
+    let filter: Rc<RefCell<Option<MixFilter>>> = Rc::new(RefCell::new(None));
+    let monitor_keep: Rc<RefCell<Option<MonitorKeep>>> = Rc::new(RefCell::new(None));
 
     let queue = CommandQueue::new();
     let _command_sender = queue.sender();
@@ -274,20 +273,34 @@ fn pw_thread(
         inner: RefCell::new(LoopInner {
             instance,
             scene: options.scene,
+            tone: options.tone,
             queue,
             ready_tx: Some(ready_tx),
             ready_sent: false,
             own: None,
             mix_mic_node: None,
+            filter_node: None,
+            source_seen: false,
+            sink_seen: false,
+            default_source: None,
+            default_sink: None,
+            published: false,
+            engine_linked: false,
+            engine_saw_edges: false,
+            engine_link_keys: Vec::new(),
+            retired_slots: Vec::new(),
+            quit: false,
             nodes: HashMap::new(),
             ports: HashMap::new(),
             edges: HashMap::new(),
             taps: HashMap::new(),
             refused: HashMap::new(),
+            clients: HashMap::new(),
             bind_queue: Vec::new(),
             bindings: Vec::new(),
             links: HashMap::new(),
             next_link_key: 1,
+            adapter: None,
             core: core.as_raw_ptr(),
             registry: registry.as_raw_ptr(),
         }),
@@ -315,36 +328,26 @@ fn pw_thread(
     let monitor_on = Arc::new(AtomicBool::new(
         shared_loop.inner.borrow().scene.master.monitor_mix,
     ));
-    let monitor = if monitor_on.load(Ordering::Relaxed) {
-        match connect_monitor(&core, Arc::clone(&shared), Arc::clone(&monitor_on)) {
-            Ok(pair) => Some(pair),
-            Err(err) => {
-                eprintln!("omamix: monitor stream: {err}");
-                None
-            }
-        }
-    } else {
-        None
-    };
 
     let _attached = pw_rx.attach(mainloop.loop_(), {
         let mainloop = mainloop.clone();
         let filter = Rc::clone(&filter);
         let monitor_on = Arc::clone(&monitor_on);
-        move |msg| match msg {
-            LoopMsg::Shutdown => mainloop.quit(),
-            LoopMsg::SetMasterFaderDb(db) => filter.borrow().shared().params.set_master_db(db),
-            LoopMsg::SetMonitorMix(on) => monitor_on.store(on, Ordering::Relaxed),
+        move |msg| {
+            if apply_loop_msg(&msg, &filter, &monitor_on) {
+                mainloop.quit();
+            }
         }
     });
 
     let timer = mainloop.loop_().add_timer({
         let shared_loop = Rc::clone(&shared_loop);
         let filter = Rc::clone(&filter);
+        let monitor_keep = Rc::clone(&monitor_keep);
         let mainloop = mainloop.clone();
         let monitor_on = Arc::clone(&monitor_on);
         move |_| {
-            if tick(&shared_loop, &filter, &monitor_on) {
+            if tick(&shared_loop, &filter, &monitor_keep, &monitor_on) {
                 mainloop.quit();
             }
         }
@@ -362,14 +365,34 @@ fn pw_thread(
     // exported. Drop the filter explicitly before the core.
     drop(timer);
     drop(_attached);
-    drop(monitor);
     drop(listener);
+    drop(monitor_keep);
     drop(shared_loop);
     drop(filter);
     drop(registry);
     drop(core);
     drop(context);
     drop(mainloop);
+}
+
+fn apply_loop_msg(
+    msg: &LoopMsg,
+    filter: &RefCell<Option<MixFilter>>,
+    monitor_on: &AtomicBool,
+) -> bool {
+    match msg {
+        LoopMsg::Shutdown => true,
+        LoopMsg::SetMasterFaderDb(db) => {
+            if let Some(filter) = filter.borrow().as_ref() {
+                filter.shared().params.set_master_db(*db);
+            }
+            false
+        }
+        LoopMsg::SetMonitorMix(on) => {
+            monitor_on.store(*on, Ordering::Relaxed);
+            false
+        }
+    }
 }
 
 fn connect_monitor(
@@ -499,27 +522,51 @@ enum Pending {
         active: bool,
         error: bool,
     },
+    Metadata {
+        key: String,
+        value: Option<String>,
+    },
 }
 
 struct LoopInner {
     instance: String,
     scene: Scene,
+    tone: bool,
     queue: CommandQueue,
-    ready_tx: Option<std::sync::mpsc::Sender<Ready>>,
+    ready_tx: Option<std::sync::mpsc::Sender<Boot>>,
     ready_sent: bool,
     own: Option<OwnClient>,
     mix_mic_node: Option<u32>,
+    filter_node: Option<u32>,
+    source_seen: bool,
+    sink_seen: bool,
+    default_source: Option<String>,
+    default_sink: Option<String>,
+    published: bool,
+    engine_linked: bool,
+    engine_saw_edges: bool,
+    engine_link_keys: Vec<u64>,
+    retired_slots: Vec<usize>,
+    quit: bool,
     nodes: HashMap<u32, NodeRec>,
     ports: HashMap<u32, PortRec>,
     edges: HashMap<u32, LinkEdge>,
     taps: HashMap<u32, Tap>,
     refused: HashMap<u32, bool>,
+    clients: HashMap<u32, ClientRec>,
     bind_queue: Vec<GlobalObject<PropertiesBox>>,
     bindings: Vec<Binding>,
     links: HashMap<u64, LiveLink>,
     next_link_key: u64,
+    adapter: Option<pw::node::Node>,
     core: *mut pw::sys::pw_core,
     registry: *mut pw::sys::pw_registry,
+}
+
+#[derive(Default)]
+struct ClientRec {
+    binary: String,
+    application_name: String,
 }
 
 struct NodeRec {
@@ -538,8 +585,9 @@ struct PortRec {
 
 struct Tap {
     phase: LinkPhase,
-    added_ports: bool,
+    slot: Option<usize>,
     linked: bool,
+    saw_edges: bool,
     link_keys: Vec<u64>,
 }
 
@@ -561,6 +609,7 @@ enum ProxyKeep {
     Client(pw::client::Client),
     Port(pw::port::Port),
     Link(pw::link::Link),
+    Metadata(pw::metadata::Metadata),
 }
 
 #[allow(dead_code)]
@@ -569,9 +618,22 @@ enum ProxyListener {
     Client(pw::client::ClientListener),
     Port(pw::port::PortListener),
     Link(pw::link::LinkListener),
+    Metadata(pw::metadata::MetadataListener),
 }
 
-fn tick(shared: &Rc<LoopShared>, filter: &Rc<RefCell<MixFilter>>, monitor_on: &AtomicBool) -> bool {
+/// Monitor stream stored with a `'static` lifetime. `pw_thread` drops this
+/// before the core it was created from.
+struct MonitorKeep {
+    _listener: pw::stream::StreamListener<MonitorData>,
+    _stream: pw::stream::StreamBox<'static>,
+}
+
+fn tick(
+    shared: &Rc<LoopShared>,
+    filter: &Rc<RefCell<Option<MixFilter>>>,
+    monitor_keep: &Rc<RefCell<Option<MonitorKeep>>>,
+    monitor_on: &Arc<AtomicBool>,
+) -> bool {
     let quit = drain_commands(shared, filter, monitor_on);
     for _ in 0..8 {
         let batch = match shared.pending.lock() {
@@ -586,14 +648,23 @@ fn tick(shared: &Rc<LoopShared>, filter: &Rc<RefCell<MixFilter>>, monitor_on: &A
         }
         bind_outstanding(shared);
     }
+    retire_ports(shared, filter);
+    if shared.inner.borrow().quit {
+        return true;
+    }
+    ensure_published(shared, filter, monitor_keep, monitor_on);
+    if shared.inner.borrow().quit {
+        return true;
+    }
+    link_engine(shared);
     reconcile(shared, filter);
-    publish_ready(shared, filter);
-    quit
+    publish_ready(shared);
+    quit || shared.inner.borrow().quit
 }
 
 fn drain_commands(
     shared: &LoopShared,
-    filter: &Rc<RefCell<MixFilter>>,
+    filter: &RefCell<Option<MixFilter>>,
     monitor_on: &AtomicBool,
 ) -> bool {
     let mut commands = Vec::new();
@@ -604,12 +675,10 @@ fn drain_commands(
         }
     }
     let mut quit = false;
-    let params = filter.borrow().shared();
     for command in commands {
-        match command {
-            EngineCommand::Shutdown => quit = true,
-            EngineCommand::SetMasterFaderDb(db) => params.params.set_master_db(db),
-            EngineCommand::SetMonitorMix(on) => monitor_on.store(on, Ordering::Relaxed),
+        let msg = engine_command_msg(command);
+        if apply_loop_msg(&msg, filter, monitor_on) {
+            quit = true;
         }
     }
     quit
@@ -621,6 +690,7 @@ fn apply_event(shared: &Rc<LoopShared>, event: Pending) {
         Pending::Remove(id) => note_remove(shared, id),
         Pending::Info { id, props } => note_info(shared, id, &props),
         Pending::LinkState { key, active, error } => note_link_state(shared, key, active, error),
+        Pending::Metadata { key, value } => note_metadata(shared, &key, value.as_deref()),
     }
 }
 
@@ -641,6 +711,9 @@ fn note_global(shared: &Rc<LoopShared>, global: GlobalObject<PropertiesBox>) {
             if identity.node_name == MIX_MIC_NODE_NAME {
                 inner.mix_mic_node = Some(global.id);
             }
+            if identity.node_name == contract::FILTER_NODE_NAME {
+                inner.filter_node = Some(global.id);
+            }
             inner.nodes.insert(
                 global.id,
                 NodeRec {
@@ -659,18 +732,22 @@ fn note_global(shared: &Rc<LoopShared>, global: GlobalObject<PropertiesBox>) {
                 inner.edges.insert(global.id, edge);
             }
         }
-        pw::types::ObjectType::Client if marks_our_client(&props, &inner.instance) => {
-            inner.own = Some(OwnClient {
-                client_id: global.id,
-                pid: std::process::id(),
-            });
+        pw::types::ObjectType::Client => {
+            remember_client(&mut inner, global.id, &props);
+            if inner.own.is_none() && marks_our_client(&props, &inner.instance) {
+                inner.own = Some(OwnClient {
+                    client_id: global.id,
+                    pid: std::process::id(),
+                });
+            }
         }
-        pw::types::ObjectType::Client => {}
+        pw::types::ObjectType::Metadata if prop(&props, "metadata.name") == Some("default") => {}
         _ => {}
     }
     let should_bind = match global.type_ {
         pw::types::ObjectType::Node => inner.nodes.contains_key(&global.id),
         pw::types::ObjectType::Client => true,
+        pw::types::ObjectType::Metadata => prop(&props, "metadata.name") == Some("default"),
         pw::types::ObjectType::Port => inner.ports.get(&global.id).is_some_and(|port| {
             port.port_id.is_none() || (port.node_id == 0 && port.direction.is_empty())
         }),
@@ -694,36 +771,46 @@ fn note_remove(shared: &LoopShared, id: u32) {
     if inner.mix_mic_node == Some(id) {
         inner.mix_mic_node = None;
     }
-    let keys = if let Some(tap) = inner.taps.get_mut(&id) {
-        let _ = link::peer_removed(tap.phase);
-        tap.phase = LinkPhase::PeerVanished;
-        std::mem::take(&mut tap.link_keys)
-    } else {
-        Vec::new()
-    };
-    for key in keys {
-        inner.links.remove(&key);
+    if inner.filter_node == Some(id) {
+        inner.filter_node = None;
     }
-    inner.taps.remove(&id);
+    inner.clients.remove(&id);
+    if let Some(tap) = inner.taps.remove(&id) {
+        if let Some(slot) = tap.slot {
+            inner.retired_slots.push(slot);
+        }
+        for key in tap.link_keys {
+            inner.links.remove(&key);
+        }
+    }
     inner.bindings.retain(|binding| binding.id != id);
 }
 
 fn note_info(shared: &LoopShared, id: u32, props: &[(String, String)]) {
     let mut inner = shared.inner.borrow_mut();
-    if let Some(node) = inner.nodes.get_mut(&id) {
+    let bound_name = if let Some(node) = inner.nodes.get_mut(&id) {
         let bound = NodeIdentity::from_props(props.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         node.identity.merge_bind(&bound);
         node.bound = true;
-        if node.identity.node_name == MIX_MIC_NODE_NAME {
-            inner.mix_mic_node = Some(id);
-        }
+        Some(node.identity.node_name.clone())
+    } else {
+        None
+    };
+    if bound_name.as_deref() == Some(MIX_MIC_NODE_NAME) {
+        inner.mix_mic_node = Some(id);
     }
-    let instance = inner.instance.clone();
-    if marks_our_client(props, &instance) {
-        inner.own = Some(OwnClient {
-            client_id: id,
-            pid: std::process::id(),
-        });
+    if bound_name.as_deref() == Some(contract::FILTER_NODE_NAME) {
+        inner.filter_node = Some(id);
+    }
+    if inner.clients.contains_key(&id) {
+        remember_client(&mut inner, id, props);
+        let instance = inner.instance.clone();
+        if inner.own.is_none() && marks_our_client(props, &instance) {
+            inner.own = Some(OwnClient {
+                client_id: id,
+                pid: std::process::id(),
+            });
+        }
     }
     if let Some(port) = inner.ports.get_mut(&id) {
         let parsed = port_from_props(id, props);
@@ -869,6 +956,32 @@ fn bind_one(shared: &Rc<LoopShared>, global: &GlobalObject<PropertiesBox>) {
                 _proxy: ProxyKeep::Port(port),
             }
         }
+        pw::types::ObjectType::Metadata => {
+            let Ok(metadata) = registry.bind::<pw::metadata::Metadata, _>(global) else {
+                return;
+            };
+            let shared_loop = Rc::clone(shared);
+            let listener = metadata
+                .add_listener_local()
+                .property(move |_subject, key, _type, value| {
+                    let Some(key) = key else {
+                        return 0;
+                    };
+                    if let Ok(mut pending) = shared_loop.pending.lock() {
+                        pending.push(Pending::Metadata {
+                            key: key.to_string(),
+                            value: value.map(str::to_string),
+                        });
+                    }
+                    0
+                })
+                .register();
+            Binding {
+                id,
+                _listener: ProxyListener::Metadata(listener),
+                _proxy: ProxyKeep::Metadata(metadata),
+            }
+        }
         pw::types::ObjectType::Link => {
             let Ok(link) = registry.bind::<pw::link::Link, _>(global) else {
                 return;
@@ -899,14 +1012,48 @@ fn bind_one(shared: &Rc<LoopShared>, global: &GlobalObject<PropertiesBox>) {
     }
 }
 
-fn reconcile(shared: &Rc<LoopShared>, filter: &Rc<RefCell<MixFilter>>) {
+fn reconcile(shared: &Rc<LoopShared>, filter: &Rc<RefCell<Option<MixFilter>>>) {
     let peers = {
         let inner = shared.inner.borrow();
-        if inner.own.is_none() || inner.mix_mic_node.is_none() {
+        if inner.own.is_none() || inner.mix_mic_node.is_none() || inner.filter_node.is_none() {
             return;
         }
         wanted_peers(&inner)
     };
+    let stale: Vec<u32> = {
+        let inner = shared.inner.borrow();
+        inner
+            .taps
+            .keys()
+            .copied()
+            .filter(|peer| !peers.contains(peer))
+            .collect()
+    };
+    if !stale.is_empty() {
+        let mut inner = shared.inner.borrow_mut();
+        for peer in stale {
+            let looped = {
+                let mix = inner.mix_mic_node.unwrap_or(0);
+                let node_refs = node_refs(&inner);
+                let edges: Vec<LinkEdge> = inner.edges.values().copied().collect();
+                let graph = LoopGraph {
+                    mix_mic_node: mix,
+                    nodes: &node_refs,
+                    links: &edges,
+                };
+                mix != 0 && route::upstream_includes_mix_mic(peer, &graph)
+            };
+            if looped && inner.refused.insert(peer, true).is_none() {
+                let name = inner
+                    .nodes
+                    .get(&peer)
+                    .map(|node| node.identity.node_name.clone())
+                    .unwrap_or_default();
+                eprintln!("omamix: unlinking node {peer} ({name}): upstream includes Mix Mic");
+            }
+            drop_tap(&mut inner, peer);
+        }
+    }
     for peer in peers {
         ensure_tap(shared, filter, peer);
     }
@@ -941,23 +1088,29 @@ fn wanted_peers(inner: &LoopInner) -> Vec<u32> {
                     if *id == mix || node.identity.node_name != *node_name {
                         continue;
                     }
-                    if !node.identity.media_class.contains("Source") {
+                    if !route::is_capture_device_class(&node.identity.media_class) {
                         continue;
                     }
-                    if route::upstream_includes_mix_mic(*id, node.identity.client_id, &graph) {
+                    if node.identity.omamix_owned || node.identity.node_name == MIX_MIC_NODE_NAME {
+                        continue;
+                    }
+                    if inner.filter_node == Some(*id) {
+                        continue;
+                    }
+                    if route::upstream_includes_mix_mic(*id, &graph) {
                         continue;
                     }
                     peers.push(*id);
                 }
             }
             SourceKind::Application(_) => {
-                for (id, node) in &inner.nodes {
-                    if *id == mix {
+                for id in inner.nodes.keys().copied().collect::<Vec<_>>() {
+                    if id == mix {
                         continue;
                     }
-                    let stream = node.identity.playback_stream(*id);
+                    let stream = playback_of(inner, id);
                     if route::strip_should_attach(strip, &stream, Some(&own), Some(&graph)) {
-                        peers.push(*id);
+                        peers.push(id);
                     }
                 }
             }
@@ -972,8 +1125,8 @@ fn wanted_peers(inner: &LoopInner) -> Vec<u32> {
     {
         let streams: Vec<PlaybackStream> = inner
             .nodes
-            .iter()
-            .map(|(id, node)| node.identity.playback_stream(*id))
+            .keys()
+            .map(|id| playback_of(inner, *id))
             .collect();
         for stream in inner
             .scene
@@ -989,34 +1142,24 @@ fn wanted_peers(inner: &LoopInner) -> Vec<u32> {
     peers
 }
 
-fn ensure_tap(shared: &Rc<LoopShared>, filter: &Rc<RefCell<MixFilter>>, peer: u32) {
+fn ensure_tap(shared: &Rc<LoopShared>, filter: &Rc<RefCell<Option<MixFilter>>>, peer: u32) {
+    relink_if_edges_gone(shared, peer);
     let refuse = {
         let inner = shared.inner.borrow();
         let mix = inner.mix_mic_node.unwrap_or(0);
-        let node_refs: Vec<NodeRef> = inner
-            .nodes
-            .iter()
-            .map(|(id, node)| NodeRef {
-                id: *id,
-                client_id: node.identity.client_id,
-            })
-            .collect();
+        let refs = node_refs(&inner);
         let edges: Vec<LinkEdge> = inner.edges.values().copied().collect();
         let graph = LoopGraph {
             mix_mic_node: mix,
-            nodes: &node_refs,
+            nodes: &refs,
             links: &edges,
         };
-        let client_id = inner
-            .nodes
-            .get(&peer)
-            .and_then(|node| node.identity.client_id);
         let name = inner
             .nodes
             .get(&peer)
             .map(|node| node.identity.node_name.clone())
             .unwrap_or_default();
-        if mix != 0 && route::upstream_includes_mix_mic(peer, client_id, &graph) {
+        if mix != 0 && route::upstream_includes_mix_mic(peer, &graph) {
             Some(name)
         } else {
             None
@@ -1027,10 +1170,11 @@ fn ensure_tap(shared: &Rc<LoopShared>, filter: &Rc<RefCell<MixFilter>>, peer: u3
         if inner.refused.insert(peer, true).is_none() {
             eprintln!("omamix: not tapping node {peer} ({name}): upstream includes Mix Mic");
         }
+        drop_tap(&mut inner, peer);
         return;
     }
 
-    let (phase, added, peer_ports, our_ports) = {
+    let (phase, slotted, peer_ports, our_ports) = {
         let inner = shared.inner.borrow();
         if inner
             .taps
@@ -1039,7 +1183,7 @@ fn ensure_tap(shared: &Rc<LoopShared>, filter: &Rc<RefCell<MixFilter>>, peer: u3
         {
             return;
         }
-        let added = inner.taps.get(&peer).is_some_and(|tap| tap.added_ports);
+        let slotted = inner.taps.get(&peer).is_some_and(|tap| tap.slot.is_some());
         let phase = inner
             .taps
             .get(&peer)
@@ -1048,20 +1192,25 @@ fn ensure_tap(shared: &Rc<LoopShared>, filter: &Rc<RefCell<MixFilter>>, peer: u3
         let endpoints = port_endpoints(&inner);
         let peer_ports = link::stereo_output_ports(&endpoints, peer);
         let our_ports = our_input_ports(&inner, peer);
-        (phase, added, peer_ports, our_ports)
+        (phase, slotted, peer_ports, our_ports)
     };
 
-    if !added && peer_ports.is_some() {
-        let result = filter.borrow_mut().add_tap_ports(peer);
+    if !slotted && peer_ports.is_some() {
+        let result = filter
+            .borrow_mut()
+            .as_mut()
+            .ok_or(())
+            .and_then(|engine| engine.add_tap_ports(peer));
         let mut inner = shared.inner.borrow_mut();
         let tap = inner.taps.entry(peer).or_insert(Tap {
             phase: link::start_link(false),
-            added_ports: false,
+            slot: None,
             linked: false,
+            saw_edges: false,
             link_keys: Vec::new(),
         });
         match result {
-            Ok(_) => tap.added_ports = true,
+            Ok(slot) => tap.slot = Some(slot),
             Err(()) => {
                 tap.phase = link::link_failed(tap.phase);
                 return;
@@ -1080,8 +1229,9 @@ fn ensure_tap(shared: &Rc<LoopShared>, filter: &Rc<RefCell<MixFilter>>, peer: u3
         let mut inner = shared.inner.borrow_mut();
         let tap = inner.taps.entry(peer).or_insert(Tap {
             phase,
-            added_ports: added || peer_ports.is_some(),
+            slot: None,
             linked: false,
+            saw_edges: false,
             link_keys: Vec::new(),
         });
         tap.phase = phase;
@@ -1095,14 +1245,14 @@ fn ensure_tap(shared: &Rc<LoopShared>, filter: &Rc<RefCell<MixFilter>>, peer: u3
     let (Some((out_fl, out_fr)), Some((in_fl, in_fr))) = (peer_ports, our_ports) else {
         return;
     };
-    let mix = shared.inner.borrow().mix_mic_node;
-    let Some(mix) = mix else {
+    let filter_node = shared.inner.borrow().filter_node;
+    let Some(filter_node) = filter_node else {
         return;
     };
     let pairs = [(out_fl, in_fl), (out_fr, in_fr)];
     let mut created = Vec::new();
     for (output_port, input_port) in pairs {
-        match create_link(shared, peer, mix, output_port, input_port) {
+        match create_link(shared, peer, filter_node, output_port, input_port) {
             Ok(key) => created.push(key),
             Err(()) => {
                 let mut inner = shared.inner.borrow_mut();
@@ -1176,14 +1326,10 @@ fn create_link(
     Ok(key)
 }
 
-fn publish_ready(shared: &LoopShared, filter: &Rc<RefCell<MixFilter>>) {
+fn publish_ready(shared: &LoopShared) {
     let mut inner = shared.inner.borrow_mut();
-    if inner.ready_sent {
+    if inner.ready_sent || !inner.engine_linked {
         return;
-    }
-    let from_filter = filter.borrow().node_id();
-    if inner.mix_mic_node.is_none() {
-        inner.mix_mic_node = from_filter;
     }
     let (Some(node_id), Some(own)) = (inner.mix_mic_node, inner.own) else {
         return;
@@ -1193,10 +1339,10 @@ fn publish_ready(shared: &LoopShared, filter: &Rc<RefCell<MixFilter>>) {
     }
     inner.ready_sent = true;
     if let Some(tx) = inner.ready_tx.take() {
-        let _ = tx.send(Ready {
+        let _ = tx.send(Boot::Ready(Ready {
             node_id,
             client_id: own.client_id,
-        });
+        }));
     }
 }
 
@@ -1210,14 +1356,14 @@ fn port_endpoints(inner: &LoopInner) -> Vec<PortEndpoint> {
                 id,
                 node_id: port.node_id,
                 direction: port.direction.clone(),
-                channel: port.channel.clone(),
+                channel: channel_label(&port.channel, &port.name),
             })
         })
         .collect()
 }
 
 fn our_input_ports(inner: &LoopInner, peer: u32) -> Option<(u32, u32)> {
-    let mix = inner.mix_mic_node?;
+    let mix = inner.filter_node?;
     let fl_name = format!("in-{peer}-FL");
     let fr_name = format!("in-{peer}-FR");
     let find = |name: &str| {
@@ -1281,4 +1427,295 @@ fn dict_pairs(dict: &pw::spa::utils::dict::DictRef) -> Vec<(String, String)> {
     dict.iter()
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect()
+}
+
+fn channel_label(channel: &str, name: &str) -> String {
+    if !channel.is_empty() {
+        return channel.to_string();
+    }
+    for label in ["FL", "FR", "MONO", "FC", "AUX"] {
+        if name == label
+            || name.ends_with(&format!("_{label}"))
+            || name.ends_with(&format!("-{label}"))
+        {
+            return label.to_string();
+        }
+    }
+    String::new()
+}
+
+fn node_refs(inner: &LoopInner) -> Vec<NodeRef> {
+    inner
+        .nodes
+        .iter()
+        .map(|(id, node)| NodeRef {
+            id: *id,
+            client_id: node.identity.client_id,
+        })
+        .collect()
+}
+
+fn playback_of(inner: &LoopInner, id: u32) -> PlaybackStream {
+    let Some(node) = inner.nodes.get(&id) else {
+        let mut missing = PlaybackStream::app("", "");
+        missing.media_class.clear();
+        missing.binary.clear();
+        return missing;
+    };
+    let mut stream = node.identity.playback_stream(id);
+    if stream.binary.is_empty() {
+        let client_binary = stream
+            .client_id
+            .and_then(|client_id| inner.clients.get(&client_id))
+            .map(|client| client.binary.as_str())
+            .unwrap_or("");
+        stream.binary = route::resolve_binary(&stream.binary, client_binary);
+    }
+    stream
+}
+
+fn remember_client(inner: &mut LoopInner, id: u32, props: &[(String, String)]) {
+    let rec = inner.clients.entry(id).or_default();
+    if let Some(binary) = prop(props, "application.process.binary")
+        && !binary.is_empty()
+        && rec.binary.is_empty()
+    {
+        rec.binary = binary.to_string();
+    }
+    if let Some(name) = prop(props, "application.name")
+        && !name.is_empty()
+        && rec.application_name.is_empty()
+    {
+        rec.application_name = name.to_string();
+    }
+}
+
+fn drop_tap(inner: &mut LoopInner, peer: u32) {
+    let Some(tap) = inner.taps.remove(&peer) else {
+        return;
+    };
+    if let Some(slot) = tap.slot {
+        inner.retired_slots.push(slot);
+    }
+    for key in tap.link_keys {
+        inner.links.remove(&key);
+    }
+}
+
+fn retire_ports(shared: &LoopShared, filter: &RefCell<Option<MixFilter>>) {
+    let slots = std::mem::take(&mut shared.inner.borrow_mut().retired_slots);
+    let mut filter = filter.borrow_mut();
+    let Some(engine) = filter.as_mut() else {
+        return;
+    };
+    for slot in slots {
+        engine.remove_tap_ports(slot);
+    }
+}
+
+fn note_metadata(shared: &LoopShared, key: &str, value: Option<&str>) {
+    let name = value.and_then(metadata::metadata_node_name);
+    let mut inner = shared.inner.borrow_mut();
+    if key == "default.audio.source" {
+        if name.as_deref() == Some(MIX_MIC_NODE_NAME) {
+            eprintln!(
+                "omamix: warning: Mix Mic is the default source; tearing the Mix Mic node down"
+            );
+            inner.source_seen = true;
+            inner.default_source = name;
+            inner.quit = true;
+            if !inner.ready_sent
+                && let Some(tx) = inner.ready_tx.take()
+            {
+                let _ = tx.send(Boot::Failed(
+                    "Mix Mic is the default source, so it was not left published".into(),
+                ));
+            }
+            return;
+        }
+        if inner.source_seen
+            && let DefaultDeviceObservation::Changed { now } =
+                metadata::observe_default_source(inner.default_source.as_deref(), name.as_deref())
+        {
+            eprintln!("omamix: default source is now {now}");
+        }
+        inner.source_seen = true;
+        inner.default_source = name;
+    } else if key == "default.audio.sink" {
+        if inner.sink_seen
+            && let DefaultDeviceObservation::Changed { now } =
+                metadata::observe_default_sink(inner.default_sink.as_deref(), name.as_deref())
+        {
+            eprintln!("omamix: default sink is now {now}");
+        }
+        inner.sink_seen = true;
+        inner.default_sink = name;
+    }
+}
+
+fn fail_closed(shared: &LoopShared, message: &str) {
+    let mut inner = shared.inner.borrow_mut();
+    inner.quit = true;
+    if let Some(tx) = inner.ready_tx.take() {
+        let _ = tx.send(Boot::Failed(message.to_string()));
+    }
+}
+
+fn ensure_published(
+    shared: &Rc<LoopShared>,
+    filter: &Rc<RefCell<Option<MixFilter>>>,
+    monitor_keep: &Rc<RefCell<Option<MonitorKeep>>>,
+    monitor_on: &Arc<AtomicBool>,
+) {
+    let ready = {
+        let inner = shared.inner.borrow();
+        inner.source_seen && !inner.published && !inner.quit
+    };
+    if !ready || filter.borrow().is_some() {
+        return;
+    }
+    let core_ptr = shared.inner.borrow().core;
+    let core = unsafe { &*core_ptr.cast::<pw::core::Core>() };
+    let tone = shared.inner.borrow().tone;
+    let mut filter_props = PropertiesBox::new();
+    for (key, value) in contract::filter_properties() {
+        filter_props.insert(key, value);
+    }
+    let engine = match MixFilter::create(core, filter_props, tone) {
+        Ok(engine) => engine,
+        Err(err) => {
+            eprintln!("omamix: filter: {err}");
+            fail_closed(shared, "mix engine was not created");
+            return;
+        }
+    };
+    let _ = engine.events_version();
+    let shared_audio = engine.shared();
+    let filter_id = engine.node_id();
+    *filter.borrow_mut() = Some(engine);
+    if let Some(id) = filter_id {
+        shared.inner.borrow_mut().filter_node = Some(id);
+    }
+
+    let mut adapter_props = crate::backend::mix_mic_properties();
+    adapter_props.insert("factory.name", "support.null-audio-sink");
+    match core.create_object::<pw::node::Node>("adapter", &adapter_props) {
+        Ok(node) => {
+            let mut inner = shared.inner.borrow_mut();
+            inner.adapter = Some(node);
+            inner.published = true;
+        }
+        Err(err) => {
+            eprintln!("omamix: mix mic: {err}");
+            fail_closed(shared, "Mix Mic was not created");
+            return;
+        }
+    }
+
+    if monitor_on.load(Ordering::Relaxed) && monitor_keep.borrow().is_none() {
+        match connect_monitor(core, shared_audio, Arc::clone(monitor_on)) {
+            Ok((stream, listener)) => {
+                let stream: pw::stream::StreamBox<'static> = unsafe { std::mem::transmute(stream) };
+                *monitor_keep.borrow_mut() = Some(MonitorKeep {
+                    _listener: listener,
+                    _stream: stream,
+                });
+            }
+            Err(err) => eprintln!("omamix: monitor stream: {err}"),
+        }
+    }
+}
+
+fn link_engine(shared: &Rc<LoopShared>) {
+    let (filter_node, mix, linked) = {
+        let inner = shared.inner.borrow();
+        (inner.filter_node, inner.mix_mic_node, inner.engine_linked)
+    };
+    let (Some(filter_node), Some(mix)) = (filter_node, mix) else {
+        return;
+    };
+    if linked {
+        let mut inner = shared.inner.borrow_mut();
+        let count = inner
+            .edges
+            .values()
+            .filter(|edge| edge.output_node == filter_node && edge.input_node == mix)
+            .count();
+        if count > 0 {
+            inner.engine_saw_edges = true;
+            return;
+        }
+        if !inner.engine_saw_edges {
+            return;
+        }
+        eprintln!("omamix: Mix Mic engine link went away; linking it again");
+        let keys = std::mem::take(&mut inner.engine_link_keys);
+        for key in keys {
+            inner.links.remove(&key);
+        }
+        inner.engine_linked = false;
+        inner.engine_saw_edges = false;
+    }
+    if shared.inner.borrow().engine_linked {
+        return;
+    }
+    let endpoints = {
+        let inner = shared.inner.borrow();
+        port_endpoints(&inner)
+    };
+    let Some((out_fl, out_fr)) = link::stereo_output_ports(&endpoints, filter_node) else {
+        return;
+    };
+    let Some((in_fl, in_fr)) = link::stereo_input_ports(&endpoints, mix) else {
+        return;
+    };
+    let mut created = Vec::new();
+    for (output_port, input_port) in [(out_fl, in_fl), (out_fr, in_fr)] {
+        match create_link(shared, filter_node, mix, output_port, input_port) {
+            Ok(key) => created.push(key),
+            Err(()) => {
+                let mut inner = shared.inner.borrow_mut();
+                for key in created {
+                    inner.links.remove(&key);
+                }
+                return;
+            }
+        }
+    }
+    let mut inner = shared.inner.borrow_mut();
+    inner.engine_link_keys.extend(created);
+    inner.engine_linked = true;
+}
+
+fn relink_if_edges_gone(shared: &LoopShared, peer: u32) {
+    let mut inner = shared.inner.borrow_mut();
+    let filter_node = inner.filter_node;
+    let count = inner
+        .edges
+        .values()
+        .filter(|edge| edge.output_node == peer && Some(edge.input_node) == filter_node)
+        .count();
+    let keys = {
+        let Some(tap) = inner.taps.get_mut(&peer) else {
+            return;
+        };
+        if !tap.linked {
+            return;
+        }
+        if count > 0 {
+            tap.saw_edges = true;
+            return;
+        }
+        if !tap.saw_edges {
+            return;
+        }
+        eprintln!("omamix: tap link for node {peer} went away; linking it again");
+        tap.linked = false;
+        tap.saw_edges = false;
+        tap.phase = LinkPhase::Linking;
+        std::mem::take(&mut tap.link_keys)
+    };
+    for key in keys {
+        inner.links.remove(&key);
+    }
 }
