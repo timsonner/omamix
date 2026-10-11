@@ -40,9 +40,25 @@ pub const CLOCK_PLAN: ClockPlan = ClockPlan::SingleFilter;
 /// `node.description` shown in source pickers.
 pub const MIX_MIC_DESCRIPTION: &str = "Mix Mic";
 
-/// `media.class` of the public Mix Mic node. An adapter so session managers
-/// register it as a source.
+/// `media.class` of the public Mix Mic node. An adapter so it can be a source
+/// without a session manager configuring its ports.
 pub const MIX_MIC_MEDIA_CLASS: &str = "Audio/Source/Virtual";
+
+/// JSON for `adapter.auto-port-config`. The null-audio-sink follower exposes
+/// an enum format; the adapter applies this at init and creates dsp ports
+/// from `audio.position`. `monitor` is true so a recorder can capture the
+/// source. A session manager is not required.
+pub const ADAPTER_AUTO_PORT_CONFIG: &str =
+    r#"{"mode":"dsp","monitor":true,"control":false,"position":"preserve"}"#;
+
+/// JSON for `node.param.PortConfig`, applied by the node when its
+/// implementation is set. Direction is Input because `support.null-audio-sink`
+/// has an input port. The format makes the dsp ports exist immediately.
+pub const MIX_MIC_PORT_CONFIG: &str = r#"{"direction":"Input","mode":"dsp","monitor":true,"control":false,"format":{"mediaType":"audio","mediaSubtype":"raw","format":"F32P","rate":48000,"channels":2,"position":["FL","FR"]}}"#;
+
+/// JSON for `node.param.Props`. Unity gain on the public adapter, same
+/// channels the filter advertises on connect.
+pub const MIX_MIC_PROPS_PARAM: &str = r#"{"volume":1.0,"mute":false,"channelVolumes":[1.0,1.0],"softMute":false,"softVolumes":[1.0,1.0]}"#;
 
 /// Internal mix engine. Not a source, so it is not a default candidate.
 pub const FILTER_NODE_NAME: &str = "omamix.mix-engine";
@@ -75,6 +91,9 @@ pub fn mix_mic_properties() -> Vec<(&'static str, &'static str)> {
         ("node.autoconnect", "false"),
         ("object.linger", "false"),
         (OMAMIX_OWNED_KEY, "true"),
+        ("adapter.auto-port-config", ADAPTER_AUTO_PORT_CONFIG),
+        ("node.param.PortConfig", MIX_MIC_PORT_CONFIG),
+        ("node.param.Props", MIX_MIC_PROPS_PARAM),
     ]
 }
 
@@ -174,6 +193,15 @@ mod tests {
         assert_eq!(get(&props, "node.autoconnect"), Some("false"));
         assert_eq!(get(&props, "object.linger"), Some("false"));
         assert_eq!(get(&props, OMAMIX_OWNED_KEY), Some("true"));
+        assert_eq!(
+            get(&props, "adapter.auto-port-config"),
+            Some(ADAPTER_AUTO_PORT_CONFIG)
+        );
+        assert_eq!(
+            get(&props, "node.param.PortConfig"),
+            Some(MIX_MIC_PORT_CONFIG)
+        );
+        assert_eq!(get(&props, "node.param.Props"), Some(MIX_MIC_PROPS_PARAM));
         assert!(props.iter().all(|(key, _)| *key != "factory.name"));
         assert_eq!(CLOCK_PLAN, ClockPlan::SingleFilter);
         let filter = filter_properties();

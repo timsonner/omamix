@@ -708,12 +708,6 @@ fn note_global(shared: &Rc<LoopShared>, global: GlobalObject<PropertiesBox>) {
             }
             let identity =
                 NodeIdentity::from_props(props.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-            if identity.node_name == MIX_MIC_NODE_NAME {
-                inner.mix_mic_node = Some(global.id);
-            }
-            if identity.node_name == contract::FILTER_NODE_NAME {
-                inner.filter_node = Some(global.id);
-            }
             inner.nodes.insert(
                 global.id,
                 NodeRec {
@@ -721,6 +715,7 @@ fn note_global(shared: &Rc<LoopShared>, global: GlobalObject<PropertiesBox>) {
                     bound: false,
                 },
             );
+            note_owned_ids(&mut inner);
         }
         pw::types::ObjectType::Port => {
             inner
@@ -739,6 +734,7 @@ fn note_global(shared: &Rc<LoopShared>, global: GlobalObject<PropertiesBox>) {
                     client_id: global.id,
                     pid: std::process::id(),
                 });
+                note_owned_ids(&mut inner);
             }
         }
         pw::types::ObjectType::Metadata if prop(&props, "metadata.name") == Some("default") => {}
@@ -788,20 +784,12 @@ fn note_remove(shared: &LoopShared, id: u32) {
 
 fn note_info(shared: &LoopShared, id: u32, props: &[(String, String)]) {
     let mut inner = shared.inner.borrow_mut();
-    let bound_name = if let Some(node) = inner.nodes.get_mut(&id) {
+    if let Some(node) = inner.nodes.get_mut(&id) {
         let bound = NodeIdentity::from_props(props.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         node.identity.merge_bind(&bound);
         node.bound = true;
-        Some(node.identity.node_name.clone())
-    } else {
-        None
-    };
-    if bound_name.as_deref() == Some(MIX_MIC_NODE_NAME) {
-        inner.mix_mic_node = Some(id);
     }
-    if bound_name.as_deref() == Some(contract::FILTER_NODE_NAME) {
-        inner.filter_node = Some(id);
-    }
+    note_owned_ids(&mut inner);
     if inner.clients.contains_key(&id) {
         remember_client(&mut inner, id, props);
         let instance = inner.instance.clone();
@@ -810,6 +798,7 @@ fn note_info(shared: &LoopShared, id: u32, props: &[(String, String)]) {
                 client_id: id,
                 pid: std::process::id(),
             });
+            note_owned_ids(&mut inner);
         }
     }
     if let Some(port) = inner.ports.get_mut(&id) {
@@ -1398,6 +1387,57 @@ fn edge_from_props(props: &[(String, String)]) -> Option<LinkEdge> {
     })
 }
 
+/// Mix Mic and the mix engine are ours only when the node carries
+/// `omamix.owned` and its `client.id` is the client this process opened.
+/// A foreign node that reuses the name is ignored.
+fn note_owned_ids(inner: &mut LoopInner) {
+    let Some(own_id) = inner.own.map(|own| own.client_id) else {
+        return;
+    };
+    inner.mix_mic_node =
+        select_owned_id(&inner.nodes, inner.mix_mic_node, own_id, MIX_MIC_NODE_NAME);
+    inner.filter_node = select_owned_id(
+        &inner.nodes,
+        inner.filter_node,
+        own_id,
+        contract::FILTER_NODE_NAME,
+    );
+}
+
+/// Keep an id from `pw_filter_get_node_id` until the registry describes that
+/// node. A foreign node that reuses the name does not replace it. An unbound
+/// node that still carries our name waits for bind before it can be dropped.
+fn select_owned_id(
+    nodes: &HashMap<u32, NodeRec>,
+    recorded: Option<u32>,
+    own_id: u32,
+    name: &str,
+) -> Option<u32> {
+    if let Some(id) = nodes
+        .iter()
+        .find_map(|(id, node)| owned_name(node, own_id, name).then_some(*id))
+    {
+        return Some(id);
+    }
+    let id = recorded?;
+    let Some(node) = nodes.get(&id) else {
+        return Some(id);
+    };
+    if !node.bound
+        && node.identity.node_name == name
+        && node.identity.client_id.unwrap_or(own_id) == own_id
+    {
+        return Some(id);
+    }
+    None
+}
+
+fn owned_name(node: &NodeRec, own_id: u32, name: &str) -> bool {
+    node.identity.omamix_owned
+        && node.identity.client_id == Some(own_id)
+        && node.identity.node_name == name
+}
+
 fn interesting_node(props: &[(String, String)]) -> bool {
     match prop(props, "media.class") {
         Some(class) if class.starts_with("Video") || class.starts_with("Midi") => false,
@@ -1519,7 +1559,7 @@ fn note_metadata(shared: &LoopShared, key: &str, value: Option<&str>) {
     if key == "default.audio.source" {
         if name.as_deref() == Some(MIX_MIC_NODE_NAME) {
             eprintln!(
-                "omamix: warning: Mix Mic is the default source; tearing the Mix Mic node down"
+                "omamix: warning: Mix Mic is the default source, so the Mix Mic node is being removed. A stored choice of Mix Mic does this on every start. Pick another source, then start omamix again."
             );
             inner.source_seen = true;
             inner.default_source = name;
@@ -1717,5 +1757,54 @@ fn relink_if_edges_gone(shared: &LoopShared, peer: u32) {
     };
     for key in keys {
         inner.links.remove(&key);
+    }
+}
+
+#[cfg(test)]
+mod owned_id_tests {
+    use super::*;
+
+    fn node(name: &str, client: Option<u32>, owned: bool, bound: bool) -> NodeRec {
+        NodeRec {
+            identity: NodeIdentity {
+                node_name: name.to_string(),
+                client_id: client,
+                omamix_owned: owned,
+                ..NodeIdentity::default()
+            },
+            bound,
+        }
+    }
+
+    #[test]
+    fn foreign_name_does_not_replace_our_filter_id() {
+        let mut nodes = HashMap::new();
+        nodes.insert(9, node(contract::FILTER_NODE_NAME, Some(77), false, true));
+        nodes.insert(4, node(contract::FILTER_NODE_NAME, Some(3), true, true));
+        assert_eq!(
+            select_owned_id(&nodes, Some(4), 3, contract::FILTER_NODE_NAME),
+            Some(4)
+        );
+        let mut foreign_recorded = HashMap::new();
+        foreign_recorded.insert(9, node(MIX_MIC_NODE_NAME, Some(77), true, true));
+        assert_eq!(
+            select_owned_id(&foreign_recorded, Some(9), 3, MIX_MIC_NODE_NAME),
+            None
+        );
+    }
+
+    #[test]
+    fn unbound_filter_id_waits_for_client_and_owned() {
+        let mut nodes = HashMap::new();
+        nodes.insert(4, node(contract::FILTER_NODE_NAME, None, false, false));
+        assert_eq!(
+            select_owned_id(&nodes, Some(4), 3, contract::FILTER_NODE_NAME),
+            Some(4)
+        );
+        nodes.get_mut(&4).unwrap().bound = true;
+        assert_eq!(
+            select_owned_id(&nodes, Some(4), 3, contract::FILTER_NODE_NAME),
+            None
+        );
     }
 }

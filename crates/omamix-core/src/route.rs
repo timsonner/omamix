@@ -165,10 +165,11 @@ pub struct LoopGraph<'a> {
 /// The walk stops on a repeated node, so a cycle that never reaches Mix Mic
 /// does not run forever and does not refuse the node.
 ///
-/// Refusal is per node. A second stream of the same client, with no PipeWire
-/// edge to Mix Mic, stays eligible. A browser tab that captures Mix Mic does
-/// not block a sibling tab. A same-client rebroadcast that has no PipeWire
-/// edge is not visible to this walk.
+/// The walk is per node. [`client_captures_mix_mic`] is the client-level check
+/// used for the automatic "other desktop" strip and for an application strip
+/// that has no `media.name`. An application strip whose route key includes
+/// `media.name` stays on this per-node walk, so one named tab can stay a strip
+/// while another tab of the same client captures Mix Mic.
 pub fn upstream_includes_mix_mic(node_id: u32, graph: &LoopGraph<'_>) -> bool {
     node_id == graph.mix_mic_node || reaches_mix_mic_upstream(node_id, graph)
 }
@@ -191,6 +192,51 @@ fn reaches_mix_mic_upstream(start: u32, graph: &LoopGraph<'_>) -> bool {
         }
     }
     false
+}
+
+/// True when any node of `client_id` is Mix Mic or is fed by Mix Mic.
+///
+/// That is the OBS / browser-studio case: the capture node and the playback
+/// node share a client, and the playback node may have no PipeWire edge of its
+/// own. The automatic strip uses this. A named `media.name` strip does not.
+pub fn client_captures_mix_mic(client_id: u32, graph: &LoopGraph<'_>) -> bool {
+    graph
+        .nodes
+        .iter()
+        .any(|node| node.client_id == Some(client_id) && upstream_includes_mix_mic(node.id, graph))
+}
+
+/// Which strip is asking. Named tabs stay per node. Everything else refuses
+/// the whole client once that client captures Mix Mic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TapScope {
+    NamedStream,
+    SharedClient,
+}
+
+/// A playback node may be tapped for this scope.
+///
+/// [`TapScope::SharedClient`] is the automatic "other desktop" strip and an
+/// application strip with an empty `media.name`. [`TapScope::NamedStream`] is
+/// an application strip whose route key has a `media.name`.
+pub fn tap_allowed(
+    stream: &PlaybackStream,
+    own: Option<&OwnClient>,
+    graph: Option<&LoopGraph<'_>>,
+    scope: TapScope,
+) -> bool {
+    if !feeds_mix_mic(stream, own, graph) {
+        return false;
+    }
+    if scope == TapScope::SharedClient
+        && let Some(graph) = graph
+        && stream
+            .client_id
+            .is_some_and(|client_id| client_captures_mix_mic(client_id, graph))
+    {
+        return false;
+    }
+    true
 }
 
 /// Identity fields copied off a node global and, after bind, its info props.
@@ -301,9 +347,9 @@ pub fn is_our_client(stream: &PlaybackStream, own: &OwnClient) -> bool {
 /// - `client.id` or pid is ours. Headphone sends and the monitor share our
 ///   client, and that id is not a property a playback app can put on itself.
 /// - [`upstream_includes_mix_mic`] when `graph` is present. The walk is per
-///   node. A sibling stream of a client that also captures Mix Mic is still
-///   eligible when that sibling has no edge to Mix Mic. Without a `node_id`
-///   the walk cannot run, and the stream is refused until the registry has one.
+///   node. [`tap_allowed`] with [`TapScope::SharedClient`] also refuses every
+///   stream of a client that captures Mix Mic. Without a `node_id` the walk
+///   cannot run, and the stream is refused until the registry has one.
 pub fn feeds_mix_mic(
     stream: &PlaybackStream,
     own: Option<&OwnClient>,
@@ -342,7 +388,13 @@ pub fn strip_should_attach(
     own: Option<&OwnClient>,
     graph: Option<&LoopGraph<'_>>,
 ) -> bool {
-    if !feeds_mix_mic(stream, own, graph) {
+    let scope = match &strip.source {
+        SourceKind::Application(key) if !key.media_name.is_empty() => TapScope::NamedStream,
+        SourceKind::Application(_) => TapScope::SharedClient,
+        SourceKind::OtherDesktopAudio => return false,
+        SourceKind::CaptureDevice { .. } => return false,
+    };
+    if !tap_allowed(stream, own, graph, scope) {
         return false;
     }
     match &strip.source {
@@ -574,6 +626,72 @@ mod tests {
         mpv.node_id = Some(6);
         mpv.client_id = Some(50);
         assert!(feeds_mix_mic(&mpv, None, Some(&graph)));
+    }
+
+    #[test]
+    fn other_desktop_refuses_a_same_client_rebroadcast() {
+        use crate::graph::{Scene, Strip};
+
+        let nodes = [
+            NodeRef {
+                id: 4,
+                client_id: Some(40),
+            },
+            NodeRef {
+                id: 5,
+                client_id: Some(40),
+            },
+        ];
+        let links = [LinkEdge {
+            output_node: 1,
+            input_node: 4,
+        }];
+        let graph = LoopGraph {
+            mix_mic_node: 1,
+            nodes: &nodes,
+            links: &links,
+        };
+        assert!(client_captures_mix_mic(40, &graph));
+
+        let mut play = PlaybackStream::app("obs", "pw-loopback");
+        play.node_id = Some(5);
+        play.client_id = Some(40);
+        play.media_name = "studio".into();
+        assert!(feeds_mix_mic(&play, None, Some(&graph)));
+        assert!(!tap_allowed(
+            &play,
+            None,
+            Some(&graph),
+            TapScope::SharedClient
+        ));
+        assert!(tap_allowed(
+            &play,
+            None,
+            Some(&graph),
+            TapScope::NamedStream
+        ));
+
+        let mut scene = Scene::empty("t");
+        scene
+            .strips
+            .push(Strip::new(1, "other", SourceKind::OtherDesktopAudio));
+        assert!(
+            scene
+                .other_desktop_streams(&[play.clone()], None, Some(&graph))
+                .is_empty()
+        );
+
+        let mut named_key = RouteKey::new("obs", "pw-loopback");
+        named_key.media_name = "studio".into();
+        let named = Strip::new(2, "tab", SourceKind::Application(named_key));
+        assert!(strip_should_attach(&named, &play, None, Some(&graph)));
+
+        let broad = Strip::new(
+            3,
+            "app",
+            SourceKind::Application(RouteKey::new("obs", "pw-loopback")),
+        );
+        assert!(!strip_should_attach(&broad, &play, None, Some(&graph)));
     }
 
     #[test]

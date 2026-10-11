@@ -207,72 +207,334 @@ mod tests {
 
     #[test]
     fn source_tree_has_no_default_device_writes() {
-        let dash = format!("{}-default", "set");
-        let underscore = format!("{}_default", "set");
-        let property = format!("set_{}", "property");
-        let set_volume = format!("{}-volume", "set");
-        let set_mute = format!("{}-mute", "set");
-        let pw_metadata = format!("{}-{}", "pw", "metadata");
-        let mixer_cmd = format!("{}ixer", "am");
-        let alsa_cmd = format!("{}ctl", "alsa");
-        let command_new = format!("Command::{}", "new");
-        let param_call = format!("set_{}", "param");
-        let set_dash = format!("{}-", "set");
-        let config_wp = format!(".config/{}", "wireplumber");
-        let config_pw = format!(".config/{}", "pipewire");
-        let config_hypr = format!(".config/{}", "hypr");
-        let default_dot = format!("{}{}", "default", ".");
-        let quoted_default = format!("\"{}\"", "default");
-        let default_word = "default";
         let mut hits = Vec::new();
         for path in source_files() {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let mut reasons = Vec::new();
-            if text.contains(&dash) {
-                reasons.push("dash");
-            }
-            if text.contains(&underscore) {
-                reasons.push("underscore");
-            }
-            if text.contains(&set_volume) {
-                reasons.push("volume");
-            }
-            if text.contains(&set_mute) {
-                reasons.push("mute");
-            }
-            if text.contains(&pw_metadata) {
-                reasons.push("metadata-tool");
-            }
-            if text.contains(&mixer_cmd) {
-                reasons.push("mixer");
-            }
-            if text.contains(&alsa_cmd) {
-                reasons.push("alsa-ctl");
-            }
-            if text.contains(&config_wp) || text.contains(&config_pw) || text.contains(&config_hypr)
-            {
-                reasons.push("config-dir");
-            }
-            if name != "build.rs" && text.contains(&command_new) {
-                reasons.push("spawn");
-            }
-            if name != "filter.rs" && text.contains(&param_call) {
-                reasons.push("param");
-            }
-            if property_near_default_key(&text, &property, &default_dot, &quoted_default) {
-                reasons.push("property");
-            }
-            if set_dash_near(&text, &set_dash, default_word) {
-                reasons.push("split");
-            }
+            let reasons = scan_text(name, &text);
             if !reasons.is_empty() {
                 hits.push(format!("{} ({})", path.display(), reasons.join(", ")));
             }
         }
         assert!(hits.is_empty(), "device write in {}", hits.join(", "));
+    }
+
+    #[test]
+    fn scanner_catches_alias_link_join_and_split_format() {
+        let alias = word(&[
+            117, 115, 101, 32, 115, 116, 100, 58, 58, 112, 114, 111, 99, 101, 115, 115, 58, 58, 67,
+            111, 109, 109, 97, 110, 100, 32, 97, 115, 32, 67, 109, 100, 59, 10, 67, 109, 100, 58,
+            58, 110, 101, 119, 40, 34, 112, 119, 45, 108, 105, 110, 107, 34, 41, 59, 10,
+        ]);
+        assert!(scan_text("evil.rs", &alias).contains(&"spawn"));
+        assert!(scan_text("evil.rs", &alias).contains(&"link-tool"));
+
+        let join = word(&[
+            104, 111, 109, 101, 46, 106, 111, 105, 110, 40, 34, 46, 99, 111, 110, 102, 105, 103,
+            34, 41, 46, 106, 111, 105, 110, 40, 34, 119, 105, 114, 101, 112, 108, 117, 109, 98,
+            101, 114, 34, 41, 10,
+        ]);
+        assert!(scan_text("evil.rs", &join).contains(&"config-dir"));
+
+        let split = word(&[
+            102, 111, 114, 109, 97, 116, 33, 40, 34, 123, 125, 45, 123, 125, 34, 44, 32, 34, 115,
+            101, 116, 34, 44, 32, 34, 118, 111, 108, 117, 109, 101, 34, 41, 10,
+        ]);
+        assert!(scan_text("evil.rs", &split).contains(&"volume"));
+
+        let ctl = word(&[115, 121, 115, 116, 101, 109, 99, 116, 108, 10]);
+        assert!(scan_text("evil.rs", &ctl).contains(&"service"));
+
+        let param = word(&[
+            110, 111, 100, 101, 46, 115, 101, 116, 95, 112, 97, 114, 97, 109, 40, 105, 100, 41, 10,
+        ]);
+        assert!(scan_text("filter.rs", &param).contains(&"param"));
+
+        let mut far = "x".repeat(200);
+        far.push_str(&word(&[
+            115, 101, 116, 95, 112, 114, 111, 112, 101, 114, 116, 121,
+        ]));
+        far.push_str(&"y".repeat(200));
+        far.push_str(&word(&[
+            100, 101, 102, 97, 117, 108, 116, 46, 99, 111, 110, 102, 105, 103, 117, 114, 101, 100,
+        ]));
+        assert!(scan_text("evil.rs", &far).contains(&"configured"));
+
+        let build_bad = word(&[
+            67, 111, 109, 109, 97, 110, 100, 58, 58, 110, 101, 119, 40, 34, 115, 121, 115, 116,
+            101, 109, 99, 116, 108, 34, 41, 10,
+        ]);
+        assert!(scan_text("build.rs", &build_bad).contains(&"spawn"));
+        let build_ok = word(&[
+            67, 111, 109, 109, 97, 110, 100, 58, 58, 110, 101, 119, 40, 38, 112, 107, 103, 95, 99,
+            111, 110, 102, 105, 103, 41, 10,
+        ]);
+        assert!(scan_text("build.rs", &build_ok).is_empty());
+    }
+
+    fn scan_text<'a>(name: &str, text: &str) -> Vec<&'a str> {
+        let dash = word(&[115, 101, 116, 45, 100, 101, 102, 97, 117, 108, 116]);
+        let underscore = word(&[115, 101, 116, 95, 100, 101, 102, 97, 117, 108, 116]);
+        let property = word(&[115, 101, 116, 95, 112, 114, 111, 112, 101, 114, 116, 121]);
+        let set_volume = word(&[115, 101, 116, 45, 118, 111, 108, 117, 109, 101]);
+        let set_mute = word(&[115, 101, 116, 45, 109, 117, 116, 101]);
+        let pw_metadata = word(&[112, 119, 45, 109, 101, 116, 97, 100, 97, 116, 97]);
+        let link_tool = word(&[112, 119, 45, 108, 105, 110, 107]);
+        let service = word(&[115, 121, 115, 116, 101, 109, 99, 116, 108]);
+        let mixer_cmd = word(&[97, 109, 105, 120, 101, 114]);
+        let alsa_cmd = word(&[97, 108, 115, 97, 99, 116, 108]);
+        let param_call = word(&[115, 101, 116, 95, 112, 97, 114, 97, 109]);
+        let set_dash = word(&[115, 101, 116, 45]);
+        let config_wp = word(&[
+            46, 99, 111, 110, 102, 105, 103, 47, 119, 105, 114, 101, 112, 108, 117, 109, 98, 101,
+            114,
+        ]);
+        let config_pw = word(&[
+            46, 99, 111, 110, 102, 105, 103, 47, 112, 105, 112, 101, 119, 105, 114, 101,
+        ]);
+        let config_hypr = word(&[46, 99, 111, 110, 102, 105, 103, 47, 104, 121, 112, 114]);
+        let configured = word(&[
+            100, 101, 102, 97, 117, 108, 116, 46, 99, 111, 110, 102, 105, 103, 117, 114, 101, 100,
+        ]);
+        let default_dot = word(&[100, 101, 102, 97, 117, 108, 116, 46]);
+        let quoted_default = word(&[34, 100, 101, 102, 97, 117, 108, 116, 34]);
+        let default_word = word(&[100, 101, 102, 97, 117, 108, 116]);
+        let mut reasons = Vec::new();
+        if text.contains(&dash) || format_assembles(text, &[dash.as_str()]) {
+            reasons.push("dash");
+        }
+        if text.contains(&underscore) || format_assembles(text, &[underscore.as_str()]) {
+            reasons.push("underscore");
+        }
+        if text.contains(&set_volume) || format_assembles(text, &[set_volume.as_str()]) {
+            reasons.push("volume");
+        }
+        if text.contains(&set_mute) || format_assembles(text, &[set_mute.as_str()]) {
+            reasons.push("mute");
+        }
+        if text.contains(&pw_metadata) || format_assembles(text, &[pw_metadata.as_str()]) {
+            reasons.push("metadata-tool");
+        }
+        if text.contains(&link_tool) || format_assembles(text, &[link_tool.as_str()]) {
+            reasons.push("link-tool");
+        }
+        if text.contains(&service) || format_assembles(text, &[service.as_str()]) {
+            reasons.push("service");
+        }
+        if text.contains(&mixer_cmd) || format_assembles(text, &[mixer_cmd.as_str()]) {
+            reasons.push("mixer");
+        }
+        if text.contains(&alsa_cmd) || format_assembles(text, &[alsa_cmd.as_str()]) {
+            reasons.push("alsa-ctl");
+        }
+        if text.contains(&config_wp)
+            || text.contains(&config_pw)
+            || text.contains(&config_hypr)
+            || joined_config(text, &config_wp, &config_pw, &config_hypr)
+            || format_assembles(
+                text,
+                &[config_wp.as_str(), config_pw.as_str(), config_hypr.as_str()],
+            )
+        {
+            reasons.push("config-dir");
+        }
+        if spawn_forbidden(name, text) {
+            reasons.push("spawn");
+        }
+        if text.contains(&param_call) {
+            reasons.push("param");
+        }
+        if property_near_default_key(text, &property, &default_dot, &quoted_default) {
+            reasons.push("property");
+        }
+        if text.contains(&property) && text.contains(&configured) {
+            reasons.push("configured");
+        }
+        if set_dash_near(text, &set_dash, &default_word) {
+            reasons.push("split");
+        }
+        reasons
+    }
+
+    fn word(bytes: &[u8]) -> String {
+        String::from_utf8(bytes.to_vec()).expect("utf8")
+    }
+
+    fn spawn_forbidden(name: &str, text: &str) -> bool {
+        let command = word(&[67, 111, 109, 109, 97, 110, 100]);
+        let mut callers = vec![command.clone()];
+        callers.extend(command_aliases(text, &command));
+        let mut sites = Vec::new();
+        for caller in &callers {
+            let token = format!("{caller}::new");
+            let mut rest = text;
+            while let Some(at) = rest.find(&token) {
+                let after = rest[at + token.len()..].trim_start();
+                sites.push(after.chars().take(48).collect::<String>());
+                rest = &rest[at + token.len()..];
+            }
+        }
+        if sites.is_empty() {
+            return false;
+        }
+        if name == "build.rs" {
+            return !sites.iter().all(|site| {
+                site.starts_with("(&pkg_config)") || site.starts_with("(\"pkg-config\")")
+            });
+        }
+        true
+    }
+
+    fn command_aliases(text: &str, command: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let marker = format!("{command} as ");
+        for line in text.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("type ")
+                && let Some((name, rhs)) = rest.split_once('=')
+                && rhs.contains(command)
+            {
+                let name = name.trim().trim_end_matches(';');
+                if !name.is_empty() {
+                    names.push(name.to_string());
+                }
+            }
+            if let Some(at) = line.find(&marker) {
+                let after = &line[at + marker.len()..];
+                let ident: String = after
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if !ident.is_empty() {
+                    names.push(ident);
+                }
+            }
+        }
+        names
+    }
+
+    fn joined_config(text: &str, config_wp: &str, config_pw: &str, config_hypr: &str) -> bool {
+        let join = word(&[46, 106, 111, 105, 110, 40]);
+        let config = word(&[46, 99, 111, 110, 102, 105, 103]);
+        let prefix_len = word(&[46, 99, 111, 110, 102, 105, 103, 47]).len();
+        let dirs = [
+            &config_wp[prefix_len..],
+            &config_pw[prefix_len..],
+            &config_hypr[prefix_len..],
+        ];
+        let mut start = 0;
+        while let Some(found) = text[start..].find(&join) {
+            let at = start + found;
+            let from = at.saturating_sub(80);
+            let to = (at + 160).min(text.len());
+            let window = &text[from..to];
+            if window.contains(&config) && dirs.iter().any(|dir| window.contains(dir)) {
+                return true;
+            }
+            start = at + join.len();
+        }
+        false
+    }
+
+    fn format_assembles(text: &str, forbidden: &[&str]) -> bool {
+        let mut rest = text;
+        while let Some(at) = rest.find("format!") {
+            let tail = rest[at + "format!".len()..].trim_start();
+            if let Some(body) = paren_body(tail)
+                && let Some(built) = assemble_format(body)
+                && forbidden.iter().any(|item| built.contains(*item))
+            {
+                return true;
+            }
+            rest = &rest[at + "format!".len()..];
+        }
+        false
+    }
+
+    fn paren_body(text: &str) -> Option<&str> {
+        let mut chars = text.char_indices();
+        if chars.next()?.1 != '(' {
+            return None;
+        }
+        let mut depth = 1;
+        let mut in_str = false;
+        let mut escape = false;
+        for (index, ch) in chars {
+            if in_str {
+                if escape {
+                    escape = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escape = true;
+                    continue;
+                }
+                if ch == '"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match ch {
+                '"' => in_str = true,
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&text[1..index]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn assemble_format(body: &str) -> Option<String> {
+        let literals = string_literals(body);
+        let template = literals.first()?;
+        let mut args = literals.iter().skip(1);
+        let mut out = String::new();
+        let mut chars = template.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '{' && chars.peek() == Some(&'}') {
+                chars.next();
+                out.push_str(args.next()?);
+            } else {
+                out.push(ch);
+            }
+        }
+        Some(out)
+    }
+
+    fn string_literals(body: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let bytes = body.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] != b'"' {
+                index += 1;
+                continue;
+            }
+            index += 1;
+            let mut literal = String::new();
+            while index < bytes.len() {
+                let ch = bytes[index] as char;
+                index += 1;
+                if ch == '\\' && index < bytes.len() {
+                    literal.push(bytes[index] as char);
+                    index += 1;
+                    continue;
+                }
+                if ch == '"' {
+                    break;
+                }
+                literal.push(ch);
+            }
+            out.push(literal);
+        }
+        out
     }
 
     fn set_dash_near(text: &str, set_dash: &str, default_word: &str) -> bool {

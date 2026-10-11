@@ -20,6 +20,51 @@ const PW_FILTER_FLAG_RT_PROCESS: u32 = 1 << 2;
 const PW_FILTER_PORT_FLAG_MAP_BUFFERS: u32 = 1 << 0;
 const PW_VERSION_FILTER_EVENTS: u32 = 1;
 
+/// Prefix of `pw_loop`. Only `loop` is read, to reach `spa_loop_invoke`.
+#[repr(C)]
+struct PwLoopHead {
+    _system: *mut c_void,
+    spa_loop: *mut SpaLoopHead,
+}
+
+/// Prefix of `spa_loop` / `spa_interface`.
+#[repr(C)]
+struct SpaLoopHead {
+    _type: *const c_char,
+    _version: u32,
+    funcs: *const SpaLoopMethods,
+    data: *mut c_void,
+}
+
+type InvokeFn = unsafe extern "C" fn(
+    *mut c_void,
+    Option<
+        unsafe extern "C" fn(*mut SpaLoopHead, bool, u32, *const c_void, usize, *mut c_void) -> i32,
+    >,
+    u32,
+    *const c_void,
+    usize,
+    bool,
+    *mut c_void,
+) -> i32;
+
+/// `spa_loop_methods`. `invoke` is the fourth method after `version`.
+#[repr(C)]
+struct SpaLoopMethods {
+    version: u32,
+    _add_source: *const c_void,
+    _update_source: *const c_void,
+    _remove_source: *const c_void,
+    invoke: Option<InvokeFn>,
+}
+
+struct ClearJob {
+    shared: *const ProcessShared,
+    slot: usize,
+    fl: *mut c_void,
+    fr: *mut c_void,
+}
+
 pub const MAX_TAP_PORTS: usize = 64;
 
 #[repr(C)]
@@ -92,6 +137,7 @@ unsafe extern "C" {
     fn pw_filter_get_dsp_buffer(port_data: *mut c_void, n_samples: u32) -> *mut c_void;
     fn pw_filter_remove_port(port_data: *mut c_void) -> i32;
     fn pw_filter_disconnect(filter: *mut c_void) -> i32;
+    fn pw_filter_get_data_loop(filter: *mut c_void) -> *mut PwLoopHead;
 }
 
 /// Shared with `process()`. The loop thread writes params and port pointers.
@@ -252,32 +298,74 @@ impl MixFilter {
     }
 
     /// Drop one tap's ports so a later tap can reuse the slot.
+    ///
+    /// `process` runs on the data loop (`PW_FILTER_FLAG_RT_PROCESS`) and may
+    /// already hold a port pointer inside `pw_filter_get_dsp_buffer`.
+    /// `pw_filter_remove_port` frees that port on the main loop. The slot
+    /// pointers are cleared with a blocking invoke on the data loop first, so
+    /// the free happens only after `process` has dropped the pointer. If that
+    /// invoke is unavailable the ports stay until [`Self::destroy`].
+    ///
+    /// Stress: add and drop taps while `--tone` is running on a private
+    /// PipeWire. A unit test cannot schedule the realtime thread against this
+    /// free. The invoke-then-free order is what keeps the pointer valid.
     pub fn remove_tap_ports(&mut self, slot: usize) {
         if slot >= MAX_TAP_PORTS {
             return;
         }
-        let fl = self.shared.inputs_fl[slot].swap(ptr::null_mut(), Ordering::AcqRel);
-        let fr = self.shared.inputs_fr[slot].swap(ptr::null_mut(), Ordering::AcqRel);
+        let mut job = ClearJob {
+            shared: Arc::as_ptr(&self.shared),
+            slot,
+            fl: ptr::null_mut(),
+            fr: ptr::null_mut(),
+        };
+        let cleared = self.clear_slot_on_data_loop(&mut job);
+        if !cleared {
+            eprintln!(
+                "omamix: tap slot {slot} stays until the filter is destroyed; the data loop did not clear it"
+            );
+            return;
+        }
         unsafe {
-            if !fl.is_null() {
-                let _ = pw_filter_remove_port(fl);
+            if !job.fl.is_null() {
+                let _ = pw_filter_remove_port(job.fl);
             }
-            if !fr.is_null() {
-                let _ = pw_filter_remove_port(fr);
+            if !job.fr.is_null() {
+                let _ = pw_filter_remove_port(job.fr);
             }
         }
-        let mut count = self.shared.input_count.load(Ordering::Acquire);
-        while count > 0
-            && self.shared.inputs_fl[count - 1]
-                .load(Ordering::Acquire)
-                .is_null()
-            && self.shared.inputs_fr[count - 1]
-                .load(Ordering::Acquire)
-                .is_null()
-        {
-            count -= 1;
+    }
+
+    /// Returns true only after the data loop has published null slot pointers.
+    fn clear_slot_on_data_loop(&self, job: &mut ClearJob) -> bool {
+        let data_loop = unsafe { pw_filter_get_data_loop(self.raw.as_ptr()) };
+        if data_loop.is_null() {
+            return false;
         }
-        self.shared.input_count.store(count, Ordering::Release);
+        let spa_loop = unsafe { (*data_loop).spa_loop };
+        if spa_loop.is_null() {
+            return false;
+        }
+        let funcs = unsafe { (*spa_loop).funcs };
+        if funcs.is_null() {
+            return false;
+        }
+        let Some(invoke) = (unsafe { (*funcs).invoke }) else {
+            return false;
+        };
+        let data = unsafe { (*spa_loop).data };
+        let rc = unsafe {
+            invoke(
+                data,
+                Some(clear_tap_slot),
+                0,
+                ptr::null(),
+                0,
+                true,
+                job as *mut ClearJob as *mut c_void,
+            )
+        };
+        rc == 0
     }
 
     fn add_output_ports(&mut self) -> Result<(), pw::Error> {
@@ -337,6 +425,40 @@ impl Drop for MixFilter {
     fn drop(&mut self) {
         self.destroy();
     }
+}
+
+unsafe extern "C" fn clear_tap_slot(
+    _loop: *mut SpaLoopHead,
+    _async: bool,
+    _seq: u32,
+    _data: *const c_void,
+    _size: usize,
+    user: *mut c_void,
+) -> i32 {
+    if user.is_null() {
+        return -1;
+    }
+    let job = unsafe { &mut *(user as *mut ClearJob) };
+    if job.shared.is_null() || job.slot >= MAX_TAP_PORTS {
+        return -1;
+    }
+    let shared = unsafe { &*job.shared };
+    let slot = job.slot;
+    job.fl = shared.inputs_fl[slot].swap(ptr::null_mut(), Ordering::AcqRel);
+    job.fr = shared.inputs_fr[slot].swap(ptr::null_mut(), Ordering::AcqRel);
+    let mut count = shared.input_count.load(Ordering::Acquire);
+    while count > 0
+        && shared.inputs_fl[count - 1]
+            .load(Ordering::Acquire)
+            .is_null()
+        && shared.inputs_fr[count - 1]
+            .load(Ordering::Acquire)
+            .is_null()
+    {
+        count -= 1;
+    }
+    shared.input_count.store(count, Ordering::Release);
+    0
 }
 
 unsafe extern "C" fn on_state(data: *mut c_void, _old: i32, state: i32, _error: *const c_char) {
@@ -632,6 +754,45 @@ mod tests {
         // The rise at t=0 is the starting sample, and the 440th rise is the
         // first sample of the next second, outside this loop.
         assert_eq!(rises, 439);
+    }
+
+    #[test]
+    fn clear_tap_slot_nulls_pointers_before_the_port_is_freed() {
+        let shared = ProcessShared::new();
+        let keep = std::ptr::without_provenance_mut::<c_void>(0x10);
+        shared.inputs_fl[0].store(keep, Ordering::Release);
+        shared.inputs_fr[0].store(keep, Ordering::Release);
+        shared.inputs_fl[1].store(keep, Ordering::Release);
+        shared.inputs_fr[1].store(keep, Ordering::Release);
+        let fl = std::ptr::without_provenance_mut::<c_void>(0x1000);
+        let fr = std::ptr::without_provenance_mut::<c_void>(0x2000);
+        shared.inputs_fl[2].store(fl, Ordering::Release);
+        shared.inputs_fr[2].store(fr, Ordering::Release);
+        shared.input_count.store(3, Ordering::Release);
+        let mut job = ClearJob {
+            shared: &shared,
+            slot: 2,
+            fl: ptr::null_mut(),
+            fr: ptr::null_mut(),
+        };
+        let rc = unsafe {
+            clear_tap_slot(
+                ptr::null_mut(),
+                false,
+                0,
+                ptr::null(),
+                0,
+                (&mut job as *mut ClearJob).cast(),
+            )
+        };
+        assert_eq!(rc, 0);
+        assert!(shared.inputs_fl[2].load(Ordering::Acquire).is_null());
+        assert!(shared.inputs_fr[2].load(Ordering::Acquire).is_null());
+        assert_eq!(job.fl, fl);
+        assert_eq!(job.fr, fr);
+        assert_eq!(shared.inputs_fl[0].load(Ordering::Acquire), keep);
+        assert_eq!(shared.inputs_fr[1].load(Ordering::Acquire), keep);
+        assert_eq!(shared.input_count.load(Ordering::Acquire), 2);
     }
 
     #[test]

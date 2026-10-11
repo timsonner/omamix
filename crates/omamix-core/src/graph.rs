@@ -165,7 +165,9 @@ impl Scene {
         own: Option<&OwnClient>,
         graph: Option<&route::LoopGraph<'_>>,
     ) -> bool {
-        if !self.has_other_desktop() || !route::feeds_mix_mic(stream, own, graph) {
+        if !self.has_other_desktop()
+            || !route::tap_allowed(stream, own, graph, route::TapScope::SharedClient)
+        {
             return false;
         }
         !self.strips.iter().any(|strip| {
@@ -175,7 +177,7 @@ impl Scene {
 
     /// Nodes this scene will create. Each one carries [`OMAMIX_OWNED_KEY`].
     ///
-    /// Mix Mic is the `pw_filter` node. There is not a second node for it.
+    /// Mix Mic is the public adapter. The mix engine is a separate filter.
     /// Headphone sends and the monitor are separate playback streams.
     pub fn owned_outputs(&self) -> Vec<OwnedOutput> {
         let mut outputs = vec![OwnedOutput {

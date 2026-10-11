@@ -12,7 +12,8 @@
 # Arch installs depends before the build.
 # glibc covers libc, libm, and the dynamic linker.
 # libgcc_s is implicit through the toolchain. gcc-libs and libgcc are omitted.
-# The pipewire daemon package is not a library the binary loads.
+# pipewire is the daemon. readelf NEEDED does not list it. It stays in
+# depends because Mix Mic cannot run without that daemon.
 # eframe dlopens Wayland, xkbcommon, and EGL even though readelf NEEDED
 # omits them, so those packages stay:
 #   wayland       libwayland-client.so.0 and libwayland-egl.so.1
@@ -28,6 +29,7 @@ arch=('x86_64')
 url='https://origin.cursor.com/timsonner/omamix'
 license=('MIT')
 depends=(
+  'pipewire'
   'libpipewire'
   'glibc'
   'wayland'
