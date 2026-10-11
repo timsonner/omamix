@@ -2,7 +2,7 @@
 
 PipeWire live mixer for Omarchy. It will take a mic and per-app playback, set levels and processing, and publish one virtual microphone other apps can record.
 
-**Status: pre-alpha.** The window is a placeholder strip and does not publish a virtual mic. With `--features pipewire`, `omamix --headless --mix-mic` publishes Mix Mic (`Audio/Source`, `node.name` `omamix.mix-mic`, `priority.session` 1) and removes it on exit. `--headless` without `--mix-mic` does not open a client. The default master gain is unity. Levels, routing keys, and the fader wheel rule have unit tests. Those tests do not connect to PipeWire.
+**Status: pre-alpha.** The window is a placeholder strip and does not publish a virtual mic. With `--features pipewire`, `omamix --headless --mix-mic` publishes Mix Mic (`Audio/Source`, `node.name` `omamix.mix-mic`, `priority.session` 1) and removes it on exit. It reads the default source and sink and leaves them in place; if Mix Mic is that source, it destroys the Mix Mic node. `--headless` without `--mix-mic` does not open a client. The default master gain is unity. Levels, routing keys, and the fader wheel rule have unit tests. Those tests do not connect to PipeWire.
 
 ## Build
 

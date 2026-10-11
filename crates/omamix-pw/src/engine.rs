@@ -18,6 +18,11 @@
 //! put the mic in the headphones. Neither stream sets `target.object` or
 //! `AUTOCONNECT`, so neither attaches itself to a sink.
 //!
+//! The control thread reads the default source and sink and logs when either
+//! name changes. It does not write them. If the default source is Mix Mic,
+//! it shuts the loop down, which destroys the Mix Mic node and leaves the
+//! session default where the session manager put it.
+//!
 //! Unit tests do not call [`run_headless`].
 
 use std::cell::RefCell;
@@ -30,6 +35,7 @@ use std::time::{Duration, Instant};
 
 use omamix_core::graph::Scene;
 use omamix_core::link::{self, LinkPhase, PortEndpoint};
+use omamix_core::metadata::{self, DefaultDeviceObservation};
 use omamix_core::route::{
     self, LinkEdge, LoopGraph, MIX_MIC_NODE_NAME, NodeIdentity, NodeRef, OwnClient, PlaybackStream,
     SourceKind,
@@ -53,14 +59,15 @@ pub struct HeadlessOptions {
     pub scene: Scene,
     pub duration: Option<Duration>,
     pub publish_mix_mic: bool,
+    /// 440 Hz sine written by Mix Mic's `process`. Opt-in, so a recorder can
+    /// measure this node. Off leaves the mix as the sum of the taps.
+    pub tone: bool,
 }
 
 /// Identifiers printed once the filter node is in the graph.
 pub struct HeadlessReport {
     pub node_id: u32,
     pub client_id: u32,
-    pub default_source_restored: bool,
-    pub default_sink_restored: bool,
 }
 
 enum LoopMsg {
@@ -86,19 +93,15 @@ pub fn run_headless(options: HeadlessOptions) -> Result<HeadlessReport, EngineEr
         return Ok(HeadlessReport {
             node_id: 0,
             client_id: 0,
-            default_source_restored: false,
-            default_sink_restored: false,
         });
     }
-
-    let saved_source = pactl_default("source");
-    let saved_sink = pactl_default("sink");
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Ready>();
     let (pw_tx, pw_rx) = pw::channel::channel::<LoopMsg>();
     arm_signals();
 
     let duration = options.duration;
+    let tone = options.tone;
     let thread = std::thread::Builder::new()
         .name("omamix-pw".into())
         .spawn(move || {
@@ -122,9 +125,12 @@ pub fn run_headless(options: HeadlessOptions) -> Result<HeadlessReport, EngineEr
         "omamix: Mix Mic node id {} client id {} priority.session=1 priority.driver=1",
         ready.node_id, ready.client_id
     );
+    if tone {
+        println!("omamix: Mix Mic tone is 440 Hz at amplitude 0.2");
+    }
 
-    let mut source_changed = false;
-    let mut sink_changed = false;
+    let mut seen_source = pactl_default("source");
+    let mut seen_sink = pactl_default("sink");
     let deadline = duration.map(|d| Instant::now() + d);
     loop {
         if STOP.swap(false, Ordering::SeqCst) {
@@ -133,13 +139,26 @@ pub fn run_headless(options: HeadlessOptions) -> Result<HeadlessReport, EngineEr
         if deadline.is_some_and(|at| Instant::now() >= at) {
             break;
         }
-        if defaults_drifted(&saved_source, "source") {
-            source_changed = true;
-            break;
+        let source_now = pactl_default("source");
+        match metadata::observe_default_source(seen_source.as_deref(), source_now.as_deref()) {
+            DefaultDeviceObservation::MixMicIsDefault => {
+                eprintln!(
+                    "omamix: warning: Mix Mic is the default source; tearing the Mix Mic node down"
+                );
+                break;
+            }
+            DefaultDeviceObservation::Changed { now } => {
+                eprintln!("omamix: default source is now {now}");
+                seen_source = Some(now);
+            }
+            DefaultDeviceObservation::Steady => {}
         }
-        if defaults_drifted(&saved_sink, "sink") {
-            sink_changed = true;
-            break;
+        let sink_now = pactl_default("sink");
+        if let DefaultDeviceObservation::Changed { now } =
+            metadata::observe_default_sink(seen_sink.as_deref(), sink_now.as_deref())
+        {
+            eprintln!("omamix: default sink is now {now}");
+            seen_sink = Some(now);
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -147,49 +166,13 @@ pub fn run_headless(options: HeadlessOptions) -> Result<HeadlessReport, EngineEr
     let _ = pw_tx.send(LoopMsg::Shutdown);
     let _ = thread.join();
 
-    let default_source_restored =
-        restore_default(source_changed, "source", saved_source.as_deref());
-    let default_sink_restored = restore_default(sink_changed, "sink", saved_sink.as_deref());
-
     Ok(HeadlessReport {
         node_id: ready.node_id,
         client_id: ready.client_id,
-        default_source_restored,
-        default_sink_restored,
     })
 }
 
-fn defaults_drifted(saved: &Option<String>, kind: &str) -> bool {
-    match (saved, pactl_default(kind)) {
-        (Some(saved), Some(now)) => saved != &now,
-        _ => false,
-    }
-}
-
-fn restore_default(changed: bool, kind: &str, saved: Option<&str>) -> bool {
-    let Some(saved) = saved else {
-        return false;
-    };
-    if !changed {
-        return false;
-    }
-    let now = pactl_default(kind);
-    if now.as_deref() == Some(saved) {
-        return false;
-    }
-    let arg = format!("set-default-{kind}");
-    let status = std::process::Command::new("pactl")
-        .args([arg.as_str(), saved])
-        .status();
-    let restored = status.map(|s| s.success()).unwrap_or(false);
-    if restored {
-        eprintln!("omamix: restored default {kind} to {saved}");
-    } else {
-        eprintln!("omamix: default {kind} changed and could not be restored to {saved}");
-    }
-    restored
-}
-
+/// Read the session default name. The result is logged, never written back.
 fn pactl_default(kind: &str) -> Option<String> {
     let output = std::process::Command::new("pactl")
         .arg(format!("get-default-{kind}"))
@@ -273,7 +256,7 @@ fn pw_thread(
     for (key, value) in contract::filter_properties() {
         filter_props.insert(key, value);
     }
-    let filter = match MixFilter::create(&core, filter_props) {
+    let filter = match MixFilter::create(&core, filter_props, options.tone) {
         Ok(filter) => filter,
         Err(err) => {
             eprintln!("omamix: filter: {err}");

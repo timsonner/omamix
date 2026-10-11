@@ -24,7 +24,7 @@ Headless publish, on this machine only, not from CI:
 cargo run -p omamix --features pipewire -- --headless --mix-mic
 ```
 
-`--duration SECS` exits on its own. Before and after, `wpctl status`, `pactl get-default-source`, `pactl get-default-sink`, and a `pw-dump` node/link list should match. `scripts/unplug-watch.sh` appends those three commands once a second to a log. It does not set a default, a volume, or a config file. It is there for a later physical unplug of the X2u, which this change does not perform.
+`--duration SECS` exits on its own. `--tone` writes a 440 Hz sine on Mix Mic so `pw-record --target omamix.mix-mic` can measure that node. It leaves the default source and every other device's volume alone. While Mix Mic is up, omamix logs a default-name change and keeps running. If that source name is `omamix.mix-mic`, it destroys the Mix Mic node. Before and after, `wpctl status`, `pactl get-default-source`, `pactl get-default-sink`, and a `pw-dump` node/link list should match. `scripts/unplug-watch.sh` appends those three commands once a second to a log. It does not set a default, a volume, or a config file. It is there for a later physical unplug of the X2u, which this change does not perform.
 
 ## Definition of done (v1)
 

@@ -32,8 +32,15 @@ fn main() -> ExitCode {
     if cli.headless {
         return run_headless(cli);
     }
-    if cli.mix_mic || cli.monitor_mix || cli.duration.is_some() || !cli.strips.is_empty() {
-        eprintln!("omamix: --mix-mic, --strips, --monitor-mix, and --duration need --headless");
+    if cli.mix_mic
+        || cli.monitor_mix
+        || cli.tone
+        || cli.duration.is_some()
+        || !cli.strips.is_empty()
+    {
+        eprintln!(
+            "omamix: --mix-mic, --strips, --monitor-mix, --tone, and --duration need --headless"
+        );
         return ExitCode::from(2);
     }
     match run_gui() {
@@ -48,7 +55,7 @@ fn main() -> ExitCode {
 fn print_help() {
     println!(
         "\
-omamix [--headless] [--mix-mic] [--duration SECS] [--monitor-mix]
+omamix [--headless] [--mix-mic] [--duration SECS] [--monitor-mix] [--tone]
        [--strips other] [--strips device:NODE] [--strips app:NAME:BINARY]
 
 --headless does not open a window.
@@ -56,6 +63,8 @@ omamix [--headless] [--mix-mic] [--duration SECS] [--monitor-mix]
 connects to nothing.
 --duration stops the process after that many seconds (headless only).
 --monitor-mix also publishes the monitor playback stream.
+--tone writes a 440 Hz sine on Mix Mic so a recorder aimed at that node
+can measure it. It does not retarget the default source or another device.
 --strips may be repeated. device: is an ALSA node.name. app: is
 application.name and application.process.binary."
     );
@@ -65,6 +74,7 @@ struct Cli {
     headless: bool,
     mix_mic: bool,
     monitor_mix: bool,
+    tone: bool,
     duration: Option<Duration>,
     strips: Vec<StripArg>,
 }
@@ -80,6 +90,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         headless: false,
         mix_mic: false,
         monitor_mix: false,
+        tone: false,
         duration: None,
         strips: Vec::new(),
     };
@@ -90,6 +101,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
             "--headless" => cli.headless = true,
             "--mix-mic" => cli.mix_mic = true,
             "--monitor-mix" => cli.monitor_mix = true,
+            "--tone" => cli.tone = true,
             "--duration" => {
                 index += 1;
                 let value = args
@@ -171,14 +183,10 @@ fn run_headless(cli: Cli) -> ExitCode {
         scene: scene_from_cli(&cli),
         duration: cli.duration,
         publish_mix_mic: cli.mix_mic,
+        tone: cli.tone,
     };
     match omamix_pw::run_headless(options) {
-        Ok(report) => {
-            if report.default_source_restored || report.default_sink_restored {
-                eprintln!("omamix: a default device changed while Mix Mic was up and was restored");
-            }
-            ExitCode::SUCCESS
-        }
+        Ok(_report) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("omamix: {err}");
             ExitCode::FAILURE
@@ -283,9 +291,11 @@ mod cli_tests {
             "--strips",
             "app:mpv:mpv",
             "--monitor-mix",
+            "--tone",
         ]))
         .unwrap();
         assert!(cli.mix_mic);
+        assert!(cli.tone);
         assert_eq!(cli.duration, Some(Duration::from_secs(2)));
         assert!(cli.monitor_mix);
         let scene = scene_from_cli(&cli);

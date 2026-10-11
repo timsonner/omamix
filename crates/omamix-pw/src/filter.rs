@@ -7,7 +7,7 @@
 use std::ffi::{CString, c_char, c_void};
 use std::ptr::{self, NonNull};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
 use pipewire as pw;
 use pw::properties::PropertiesBox;
@@ -106,6 +106,8 @@ pub struct ProcessShared {
     pub inputs_fl: [AtomicPtr<c_void>; MAX_TAP_PORTS],
     pub inputs_fr: [AtomicPtr<c_void>; MAX_TAP_PORTS],
     pub input_count: AtomicUsize,
+    /// Opt-in 440 Hz sine. The loop thread sets it before connect.
+    pub tone: AtomicBool,
 }
 
 impl ProcessShared {
@@ -122,6 +124,7 @@ impl ProcessShared {
             inputs_fl: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
             inputs_fr: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
             input_count: AtomicUsize::new(0),
+            tone: AtomicBool::new(false),
         }
     }
 }
@@ -135,9 +138,14 @@ pub struct MixFilter {
 }
 
 impl MixFilter {
-    pub fn create(core: &pw::core::Core, props: PropertiesBox) -> Result<Self, pw::Error> {
+    pub fn create(
+        core: &pw::core::Core,
+        props: PropertiesBox,
+        tone: bool,
+    ) -> Result<Self, pw::Error> {
         let name = CString::new("Mix Mic").expect("name");
         let shared = Arc::new(ProcessShared::new());
+        shared.tone.store(tone, Ordering::Release);
         let raw = unsafe { pw_filter_new(core.as_raw_ptr(), name.as_ptr(), props.into_raw()) };
         let raw = NonNull::new(raw).ok_or(pw::Error::CreationFailed)?;
         shared.filter.store(raw.as_ptr(), Ordering::Release);
@@ -172,12 +180,19 @@ impl MixFilter {
             destroyed: false,
         };
         filter.add_output_ports()?;
+        // Advertised Props. `process` writes the samples directly and does not
+        // multiply by this gain; 1.0 is what `wpctl` reads for the node.
+        // `pw_filter_connect` copies the pod.
+        let props_bytes = unity_props_pod();
+        let props_pod =
+            pw::spa::pod::Pod::from_bytes(&props_bytes).ok_or(pw::Error::CreationFailed)?;
+        let params = [props_pod.as_raw_ptr() as *const c_void];
         let rc = unsafe {
             pw_filter_connect(
                 filter.raw.as_ptr(),
                 PW_FILTER_FLAG_RT_PROCESS,
-                ptr::null(),
-                0,
+                params.as_ptr(),
+                1,
             )
         };
         if rc < 0 {
@@ -345,6 +360,17 @@ fn render(shared: &ProcessShared, position: &SpaIoPosition) {
         }
     }
 
+    if shared.tone.load(Ordering::Acquire) {
+        let rate = position.clock.rate.num.max(1);
+        let origin = position.clock.position;
+        for index in 0..n as usize {
+            let t = (origin + index as u64) as f32 / rate as f32;
+            let sample = (t * 440.0 * std::f32::consts::TAU).sin() * 0.2;
+            out_l[index] += sample;
+            out_r[index] += sample;
+        }
+    }
+
     // Unity unless the loop thread published a fader. No hidden mic boost.
     let gain = shared.params.master_linear();
     if gain != 1.0 {
@@ -401,5 +427,93 @@ fn peak_rms(left: &[f32], right: &[f32]) -> (f32, f32) {
 impl MixFilter {
     pub fn events_version(&self) -> u32 {
         self.events.version
+    }
+}
+
+/// SPA Props for Mix Mic: linear 1.0 on both channels, unmuted.
+///
+/// The filter publishes this on connect. `process` does not apply it again.
+fn unity_props_pod() -> Vec<u8> {
+    use pw::spa::pod::serialize::PodSerializer;
+    use pw::spa::pod::{Object, Property, PropertyFlags, Value, ValueArray};
+    use pw::spa::utils::Id;
+
+    let object = Value::Object(Object {
+        type_: pw::spa::sys::SPA_TYPE_OBJECT_Props,
+        id: pw::spa::sys::SPA_PARAM_Props,
+        properties: vec![
+            Property {
+                key: pw::spa::sys::SPA_PROP_volume,
+                flags: PropertyFlags::empty(),
+                value: Value::Float(1.0),
+            },
+            Property {
+                key: pw::spa::sys::SPA_PROP_mute,
+                flags: PropertyFlags::empty(),
+                value: Value::Bool(false),
+            },
+            Property {
+                key: pw::spa::sys::SPA_PROP_channelVolumes,
+                flags: PropertyFlags::empty(),
+                value: Value::ValueArray(ValueArray::Float(vec![1.0, 1.0])),
+            },
+            Property {
+                key: pw::spa::sys::SPA_PROP_channelMap,
+                flags: PropertyFlags::empty(),
+                value: Value::ValueArray(ValueArray::Id(vec![
+                    Id(pw::spa::sys::SPA_AUDIO_CHANNEL_FL),
+                    Id(pw::spa::sys::SPA_AUDIO_CHANNEL_FR),
+                ])),
+            },
+            Property {
+                key: pw::spa::sys::SPA_PROP_softMute,
+                flags: PropertyFlags::empty(),
+                value: Value::Bool(false),
+            },
+            Property {
+                key: pw::spa::sys::SPA_PROP_softVolumes,
+                flags: PropertyFlags::empty(),
+                value: Value::ValueArray(ValueArray::Float(vec![1.0, 1.0])),
+            },
+        ],
+    });
+    PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &object)
+        .expect("Mix Mic unity Props pod")
+        .0
+        .into_inner()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unity_props_advertise_full_scale_and_unmuted() {
+        let bytes = unity_props_pod();
+        let (_, value) =
+            pw::spa::pod::deserialize::PodDeserializer::deserialize_any_from(&bytes).unwrap();
+        let pw::spa::pod::Value::Object(object) = value else {
+            panic!("Props pod is an object");
+        };
+        assert_eq!(object.id, pw::spa::sys::SPA_PARAM_Props);
+        let mut volumes = false;
+        let mut mute = false;
+        for prop in &object.properties {
+            if prop.key == pw::spa::sys::SPA_PROP_channelVolumes {
+                match &prop.value {
+                    pw::spa::pod::Value::ValueArray(pw::spa::pod::ValueArray::Float(samples)) => {
+                        assert_eq!(samples.len(), 2);
+                        assert!(samples.iter().all(|sample| (*sample - 1.0).abs() < 1e-6));
+                    }
+                    other => panic!("channelVolumes {other:?}"),
+                }
+                volumes = true;
+            }
+            if prop.key == pw::spa::sys::SPA_PROP_mute {
+                assert_eq!(prop.value, pw::spa::pod::Value::Bool(false));
+                mute = true;
+            }
+        }
+        assert!(volumes && mute);
     }
 }
