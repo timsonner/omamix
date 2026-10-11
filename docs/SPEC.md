@@ -40,7 +40,7 @@ Tim records screen videos and streams (YouTube, X, Rumble browser studio) with h
 
 Decided in [ARCHITECTURE.md](ARCHITECTURE.md): Rust, egui/eframe, pipewire-rs with an in-process DSP chain. Mix Mic is an app-owned `Audio/Source/Virtual` adapter. The mix itself is one `pw_filter` (`omamix.mix-engine`) whose outputs feed that adapter. DSP stages sit behind a trait; RNNoise (library is installed) and optional LV2 come later. PipeWire filter-chain / a full LV2 host is not the v1 engine.
 
-Package: plain cargo build for dev; an Arch `PKGBUILD` stub is in the repo (no AUR dependency).
+Package: plain cargo build for dev. The Arch package is `omamix-git` (`PKGBUILD` in the repo): unpinned Origin git source, `cargo fetch --locked`, `cargo build --frozen --release -p omamix --features pipewire`, and an install of `/usr/bin/omamix`. Arch repository packages only, no AUR dependency. Runtime depends are `libpipewire`, `glibc`, `wayland`, `libxkbcommon`, and `mesa`.
 
 ## Definition of done for v1
 

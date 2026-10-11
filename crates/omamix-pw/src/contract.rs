@@ -55,6 +55,10 @@ pub const FILTER_MEDIA_CLASS: &str = "Audio/DSP";
 pub const APP_CAPTURE_MEDIA_CLASS: &str = "Stream/Input/Audio";
 
 /// Property bag as `(key, value)` pairs.
+///
+/// This bag does not write `node.driver` or `node.want-driver`. The
+/// `support.null-audio-sink` factory marks the adapter `node.driver`.
+/// `priority.driver` stays 1 so Mix Mic loses a driver election against ALSA.
 pub fn mix_mic_properties() -> Vec<(&'static str, &'static str)> {
     vec![
         ("node.name", MIX_MIC_NODE_NAME),
@@ -99,6 +103,10 @@ pub fn app_capture_properties(node_name: &str) -> Vec<(String, String)> {
 }
 
 /// The internal `pw_filter`. One process callback. Not the public Mix Mic node.
+///
+/// This bag does not write `node.driver` or `node.want-driver`.
+/// `PW_FILTER_FLAG_DRIVER` is not passed to `pw_filter_connect`, so PipeWire
+/// marks the filter `node.want-driver` and points `node.driver-id` at Mix Mic.
 pub fn filter_properties() -> Vec<(&'static str, &'static str)> {
     vec![
         ("node.name", FILTER_NODE_NAME),
@@ -176,6 +184,12 @@ mod tests {
         assert_eq!(get(&filter, "object.linger"), Some("false"));
         assert_eq!(get(&filter, "priority.session"), Some("1"));
         assert_eq!(get(&filter, "node.autoconnect"), Some("false"));
+        for bag in [&props, &filter] {
+            assert!(
+                bag.iter()
+                    .all(|(key, _)| { *key != "node.driver" && *key != "node.want-driver" })
+            );
+        }
     }
 
     #[test]

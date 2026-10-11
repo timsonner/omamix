@@ -52,8 +52,4 @@ XPS15-OMARCHY: Arch-based Omarchy, Hyprland/Wayland, PipeWire 1.6.8 + WirePlumbe
 - [docs/TESTING.md](docs/TESTING.md) — v1 definition of done
 - [docs/AUDIO-BASELINE.md](docs/AUDIO-BASELINE.md) — read-only measurement of this laptop's audio graph
 
-Packaging is a `PKGBUILD` in the repo. It lists Arch repo packages only, no AUR dependencies. It is a dev stub: `source` is the Origin git URL, `prepare` runs `cargo fetch --locked`, and `build` runs `cargo build --frozen`.
-
-## License
-
-omamix is MIT-licensed. See [LICENSE](LICENSE).
+Packaging is `omamix-git` (`PKGBUILD` in the repo). It `provides` and `conflicts` with `omamix`. It lists Arch repository packages only, no AUR dependencies. `source` is the unpinned Origin git URL (`sha256sums` is `SKIP`, and `pkgver()` follows HEAD). A clean chroot clone of that URL needs credentials. `prepare` runs `cargo fetch --locked`. `build` runs `cargo build --frozen --release -p omamix --features pipewire`. `check` runs `cargo test --frozen --workspace`. `package` installs `/usr/bin/omamix`. Runtime `depends` are `libpipewire`, `glibc`, `wayland`, `libxkbcommon`, and `mesa`. `libpipewire` is the library `readelf` lists as `NEEDED` (`libpipewire-0.3.so.0`); it is not also a `makedepend`, because Arch installs `depends` before the build. `glibc` covers `libc`, `libm`, and the dynamic linker. `libgcc_s` is implicit, so `gcc-libs` and `libgcc` are not listed. The `pipewire` daemon package is not a library the binary loads. `wayland`, `libxkbcommon`, and `mesa` stay because eframe dlopens them (`libwayland-client.so.0`, `libwayland-egl.so.1`, `libxkbcommon.so.0`, `libEGL.so.1`) even though they are absent from `NEEDED`. wgpu also dlopens `libvulkan.so.1` when a loader is present; that loader is not a package dependency. The binary does not call `pactl`, so `libpulse` is not a dependency.
