@@ -45,3 +45,7 @@ XPS15-OMARCHY: Arch-based Omarchy, Hyprland/Wayland, PipeWire 1.6.8 + WirePlumbe
 - [docs/AUDIO-BASELINE.md](docs/AUDIO-BASELINE.md) — read-only measurement of this laptop's audio graph
 
 Packaging is a `PKGBUILD` in the repo. It lists Arch repo packages only, no AUR dependencies. It is a dev stub: `source` is the Origin git URL, `prepare` runs `cargo fetch --locked`, and `build` runs `cargo build --frozen`.
+
+## License
+
+omamix is MIT-licensed. See [LICENSE](LICENSE).
