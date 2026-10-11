@@ -152,11 +152,15 @@ Level commands: `ffmpeg -i /tmp/omamix-x2u-baseline.wav -af astats=metadata=1:re
 | RMS | **−114.63 dBFS** | **−115.21 dBFS** | mean_volume **−91.0 dB** |
 | nonzero samples | 888 / 240000 | 776 / 240000 | n_samples 480000 |
 
-The take is digital silence (peak −90.3 dBFS, one 16-bit count) plus a few 1-LSB samples. The cause is unknown. Nobody was asked to speak, and this node is a capture device, so the file is not a speech-level measurement. It needs a retest with Tim speaking. It does not support "the X2u comes in about 20 dB low." Software volume was 0 dB (`pw-dump` / `pactl`), so the silence is not a PipeWire or ALSA fader turned down.
+The take is digital silence (peak −90.3 dBFS, one 16-bit count) plus a few 1-LSB samples. Software volume was 0 dB (`pw-dump` / `pactl`), so the silence was not a PipeWire or ALSA fader turned down.
+
+## Speech level, 11:51 AM MT
+
+Tim raised the X2u hardware gain dial and spoke. Speech peaked at **−14.4 dBFS** with no clipping. That measurement resolves the earlier silence and the "20 dB low" note: the dial was down, not a missing software boost. Mix Mic is designed for unity mic gain. The default master linear gain is 1.0. There is no built-in boost. Input trim still spans ±24 dB when a scene needs it.
 
 ## What could not be verified
 
-- **Speech level versus mastered browser music.** The 5 s capture was digital silence (peak −90.3 dBFS) and the cause is unknown. The −20 dB claim stays unverified until a retest with Tim speaking, plus a separate capture of the playback he compares it to.
+- **Speech versus mastered browser music, as a mix balance.** The hardware-dial silence is resolved (see above). A separate capture of the playback he compares the voice to was not made in this pass.
 - **Hardware knob position.** Tim reported a hardware headphone knob. `amixer -c 0 contents` shows no headphone or capture control, so the position cannot be read from software.
 - **Whether a microphone is electrically present.** Silence is consistent with several causes (gain at minimum, unplugged capsule, idle preamp below 16-bit). The USB device was present (`/proc/asound/cards`) and the source node was running at 48 kHz (`pw-dump` `Format`).
 - **PipeWire quantum and latency.** Not read. `pw-metadata` and the node `Latency` / `ProcessLatency` params were not recorded.

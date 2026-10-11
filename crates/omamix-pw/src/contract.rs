@@ -1,15 +1,20 @@
-//! Node properties the PipeWire backend will set.
+//! Node properties the PipeWire backend sets.
 //!
 //! These are the PipeWire key strings (`PW_KEY_*`), kept here so the contract
-//! can be tested with no libpipewire. See docs/ARCHITECTURE.md for why the
-//! master is an app-owned `Audio/Source` stream.
+//! can be tested with no libpipewire. The `pw_filter` node is Mix Mic: one
+//! bag, `media.class` Audio/Source. See docs/ARCHITECTURE.md.
 
 pub use omamix_core::graph::OMAMIX_OWNED_KEY;
 pub use omamix_core::route::MIX_MIC_NODE_NAME;
 
 /// `priority.session` and `priority.driver` for Mix Mic.
-/// Below WirePlumber's fallback (500) and every ALSA device (typically >= 1000),
-/// so Mix Mic still loses when the ALSA sources are unplugged and only the fallback remains.
+///
+/// Below every ALSA device (typically >= 1000). A figure of 500 is sometimes
+/// cited for a WirePlumber fallback source that would still beat this value
+/// after every ALSA source is unplugged. That fallback source is UNVERIFIED
+/// on WirePlumber 0.5.17 (the stock fallback is a sink). If Mix Mic is the
+/// only Audio/Source, priority does not keep it from becoming the default.
+/// The unplug check is `scripts/unplug-watch.sh`, not this constant.
 pub const MIX_MIC_SESSION_PRIORITY: i32 = 1;
 
 /// True when Mix Mic's priority is strictly above every other candidate.
@@ -50,7 +55,7 @@ pub fn mix_mic_properties() -> Vec<(&'static str, &'static str)> {
         ("media.role", "Production"),
         ("audio.channels", "2"),
         ("audio.position", "FL,FR"),
-        // 1, not 100: a fallback node at 500 still wins after every ALSA source is gone.
+        // 1, below ALSA. Whether a priority-500 fallback source exists is UNVERIFIED.
         ("priority.session", "1"),
         ("priority.driver", "1"),
         ("node.latency", MIX_MIC_NODE_LATENCY),
@@ -85,17 +90,10 @@ pub fn app_capture_properties(node_name: &str) -> Vec<(String, String)> {
     ]
 }
 
-/// The single `pw_filter`. Mix Mic is its source port, not a second clock.
+/// The single `pw_filter`. That node is Mix Mic, so this is the same bag as
+/// [`mix_mic_properties`]. There is no second node and no second clock.
 pub fn filter_properties() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("node.description", "omamix"),
-        ("node.virtual", "true"),
-        ("priority.session", "1"),
-        ("priority.driver", "1"),
-        ("node.autoconnect", "false"),
-        ("object.linger", "false"),
-        (OMAMIX_OWNED_KEY, "true"),
-    ]
+    mix_mic_properties()
 }
 
 /// Headphone send. Same client as Mix Mic, so the loop guard excludes it.
@@ -151,6 +149,45 @@ mod tests {
         assert_eq!(get(&props, OMAMIX_OWNED_KEY), Some("true"));
         assert!(props.iter().all(|(key, _)| *key != "factory.name"));
         assert_eq!(CLOCK_PLAN, ClockPlan::SingleFilter);
+        assert_eq!(filter_properties(), mix_mic_properties());
+    }
+
+    #[test]
+    fn contract_bags_include_every_core_owned_key() {
+        use omamix_core::graph::{Scene, Strip, owned_output_properties};
+        use omamix_core::route::SourceKind;
+
+        let mut scene = Scene::empty("t");
+        scene.strips.push(Strip::new(
+            1,
+            "mic",
+            SourceKind::CaptureDevice {
+                node_name: "x2u".into(),
+            },
+        ));
+        scene.strips[0].monitor_headphones = true;
+        scene.master.monitor_mix = true;
+
+        for output in scene.owned_outputs() {
+            let core = owned_output_properties(&output);
+            let contract = contract_bag(&output);
+            for (key, value) in core {
+                let found = contract.iter().find(|(k, _)| k == key);
+                assert_eq!(found.map(|(_, v)| v.as_str()), Some(value), "{key}");
+            }
+        }
+    }
+
+    fn contract_bag(output: &omamix_core::graph::OwnedOutput) -> Vec<(String, String)> {
+        use omamix_core::graph::OwnedRole;
+        match output.role {
+            OwnedRole::MixMic => mix_mic_properties()
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            OwnedRole::HeadphoneSend(_) => headphone_send_properties("omamix.headphone.1"),
+            OwnedRole::MonitorFinalMix => monitor_mix_properties("omamix.monitor"),
+        }
     }
 
     #[test]
@@ -193,10 +230,12 @@ mod tests {
     }
 
     #[test]
-    fn unplugging_alsa_sources_does_not_select_mix_mic() {
+    fn priority_one_loses_to_a_higher_candidate_including_an_unverified_500() {
         let x2u = 1000;
         assert!(!mix_mic_selected_as_default(&[x2u]));
-        // ALSA capture is gone. WirePlumber's fallback remains at 500.
+        // UNVERIFIED: a WirePlumber fallback *source* at 500. The comparison
+        // is what priority 1 would do if that node exists. It is not evidence
+        // that the node exists. An empty candidate list selects Mix Mic.
         let fallback = 500;
         assert!(!mix_mic_selected_as_default(&[fallback]));
         assert!(!mix_mic_selected_as_default(&[x2u, fallback]));

@@ -5,10 +5,12 @@
 //! Pid and object serial only separate two streams that are live at the same
 //! time; a restart gets a new pid and a new serial and still matches.
 //!
-//! A registry `global` does not carry binary, `media.name`, pid, or
-//! `omamix.owned`. Those show up after the node is bound. Whether a node is
-//! ours is our PipeWire `client.id` (other clients cannot set it) and, when
-//! both sides have it, the process pid.
+//! A node global does carry `client.id`, `object.serial`, `node.name`, and
+//! `media.class`. It does not carry `application.process.binary`, `media.name`,
+//! `application.process.id`, or `omamix.owned`. Those show up after the node
+//! is bound. Whether a node is ours is our PipeWire `client.id` (the daemon
+//! assigns it; another client cannot stamp it) and, when both sides have it,
+//! the process pid.
 
 use crate::graph::Strip;
 
@@ -84,11 +86,13 @@ pub struct PlaybackStream {
     pub media_name: String,
     pub pid: Option<u32>,
     pub object_serial: Option<u64>,
-    /// PipeWire client id, once the node is bound. Globals omit it.
+    /// PipeWire client id. Present on the node global; bind is not required.
     pub client_id: Option<u32>,
+    /// Object id of this node, once the registry has seen it.
+    pub node_id: Option<u32>,
     /// The `omamix.owned` property, once bound. Globals omit it.
     /// The loop guard does not trust this on a playback node; it compares
-    /// [`OwnClient`].
+    /// [`OwnClient`] and walks links.
     pub omamix_owned: bool,
 }
 
@@ -101,7 +105,173 @@ impl PlaybackStream {
             pid: None,
             object_serial: None,
             client_id: None,
+            node_id: None,
             omamix_owned: false,
+        }
+    }
+}
+
+/// One directed PipeWire link. Samples flow from `output_node` to `input_node`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkEdge {
+    pub output_node: u32,
+    pub input_node: u32,
+}
+
+/// A node id plus the client that owns it, for the Mix Mic loop walk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeRef {
+    pub id: u32,
+    pub client_id: Option<u32>,
+}
+
+/// The link graph the loop guard walks. Built from registry globals.
+#[derive(Clone, Copy, Debug)]
+pub struct LoopGraph<'a> {
+    pub mix_mic_node: u32,
+    pub nodes: &'a [NodeRef],
+    pub links: &'a [LinkEdge],
+}
+
+/// True when tapping `node_id` would put Mix Mic back into Mix Mic.
+///
+/// Two walks:
+///
+/// 1. Follow links upstream from `node_id`. A hit on Mix Mic means this node
+///    is already fed by it (a loopback or a monitor node).
+/// 2. Follow links downstream from Mix Mic and collect `client.id`. If
+///    `client_id` is in that set, the same client is capturing Mix Mic and
+///    this playback node is its rebroadcast (OBS monitor, a browser studio).
+///    That loop is inside the client, so the playback node has no PipeWire
+///    edge of its own back to Mix Mic.
+pub fn upstream_includes_mix_mic(
+    node_id: u32,
+    client_id: Option<u32>,
+    graph: &LoopGraph<'_>,
+) -> bool {
+    if node_id == graph.mix_mic_node || reaches_mix_mic_upstream(node_id, graph) {
+        return true;
+    }
+    match client_id {
+        Some(client_id) => clients_downstream_of_mix_mic(graph).contains(&client_id),
+        None => false,
+    }
+}
+
+fn reaches_mix_mic_upstream(start: u32, graph: &LoopGraph<'_>) -> bool {
+    let mut seen = vec![start];
+    let mut queue = vec![start];
+    while let Some(node) = queue.pop() {
+        for link in graph.links {
+            if link.input_node != node {
+                continue;
+            }
+            if link.output_node == graph.mix_mic_node {
+                return true;
+            }
+            if !seen.contains(&link.output_node) {
+                seen.push(link.output_node);
+                queue.push(link.output_node);
+            }
+        }
+    }
+    false
+}
+
+fn clients_downstream_of_mix_mic(graph: &LoopGraph<'_>) -> Vec<u32> {
+    let mut seen = vec![graph.mix_mic_node];
+    let mut queue = vec![graph.mix_mic_node];
+    let mut clients = Vec::new();
+    while let Some(node) = queue.pop() {
+        for link in graph.links {
+            if link.output_node != node || seen.contains(&link.input_node) {
+                continue;
+            }
+            seen.push(link.input_node);
+            queue.push(link.input_node);
+            if let Some(found) = graph.nodes.iter().find(|item| item.id == link.input_node)
+                && let Some(client_id) = found.client_id
+            {
+                clients.push(client_id);
+            }
+        }
+    }
+    clients
+}
+
+/// Identity fields copied off a node global and, after bind, its info props.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NodeIdentity {
+    pub node_name: String,
+    pub media_class: String,
+    pub application_name: String,
+    pub binary: String,
+    pub media_name: String,
+    pub client_id: Option<u32>,
+    pub pid: Option<u32>,
+    pub object_serial: Option<u64>,
+    pub omamix_owned: bool,
+}
+
+impl NodeIdentity {
+    pub fn from_props<'a>(props: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        let mut identity = Self::default();
+        for (key, value) in props {
+            match key {
+                "node.name" => identity.node_name = value.to_string(),
+                "media.class" => identity.media_class = value.to_string(),
+                "application.name" => identity.application_name = value.to_string(),
+                "application.process.binary" => identity.binary = value.to_string(),
+                "media.name" => identity.media_name = value.to_string(),
+                "client.id" => identity.client_id = value.parse().ok(),
+                "application.process.id" => identity.pid = value.parse().ok(),
+                "object.serial" => identity.object_serial = value.parse().ok(),
+                "omamix.owned" => identity.omamix_owned = value == "true",
+                _ => {}
+            }
+        }
+        identity
+    }
+
+    /// Fill holes from a later bind. A bound prop does not erase a global one.
+    pub fn merge_bind(&mut self, bound: &Self) {
+        if self.node_name.is_empty() {
+            self.node_name.clone_from(&bound.node_name);
+        }
+        if self.media_class.is_empty() {
+            self.media_class.clone_from(&bound.media_class);
+        }
+        if self.application_name.is_empty() {
+            self.application_name.clone_from(&bound.application_name);
+        }
+        if self.binary.is_empty() {
+            self.binary.clone_from(&bound.binary);
+        }
+        if self.media_name.is_empty() {
+            self.media_name.clone_from(&bound.media_name);
+        }
+        if self.client_id.is_none() {
+            self.client_id = bound.client_id;
+        }
+        if self.pid.is_none() {
+            self.pid = bound.pid;
+        }
+        if self.object_serial.is_none() {
+            self.object_serial = bound.object_serial;
+        }
+        self.omamix_owned |= bound.omamix_owned;
+    }
+
+    pub fn playback_stream(&self, node_id: u32) -> PlaybackStream {
+        PlaybackStream {
+            application_name: self.application_name.clone(),
+            binary: self.binary.clone(),
+            media_name: self.media_name.clone(),
+            pid: self.pid,
+            object_serial: self.object_serial,
+            client_id: self.client_id,
+            node_id: Some(node_id),
+            omamix_owned: self.omamix_owned,
         }
     }
 }
@@ -128,11 +298,21 @@ pub fn is_our_client(stream: &PlaybackStream, own: &OwnClient) -> bool {
 
 /// A node may contribute to Mix Mic only when it is someone else's playback.
 ///
-/// Nodes with `omamix.owned` set are refused. So is any node whose `client.id`
-/// or pid is ours: headphone sends and the monitor share our client, and that
-/// id is not a property a playback app can put on itself. Matching does not
-/// look at a `captures_mix_mic` flag on the playback node.
-pub fn feeds_mix_mic(stream: &PlaybackStream, own: Option<&OwnClient>) -> bool {
+/// Refused:
+///
+/// - `omamix.owned` is set (after bind).
+/// - `client.id` or pid is ours. Headphone sends and the monitor share our
+///   client, and that id is not a property a playback app can put on itself.
+/// - [`upstream_includes_mix_mic`] when `graph` is present. That walk is how
+///   an OBS monitor or a browser studio is kept out: the playback node is a
+///   different object from the capture, so a flag on the playback node cannot
+///   see the loop. Without a `node_id` the walk cannot run, and the stream is
+///   refused until the registry has one.
+pub fn feeds_mix_mic(
+    stream: &PlaybackStream,
+    own: Option<&OwnClient>,
+    graph: Option<&LoopGraph<'_>>,
+) -> bool {
     if stream.omamix_owned {
         return false;
     }
@@ -140,6 +320,14 @@ pub fn feeds_mix_mic(stream: &PlaybackStream, own: Option<&OwnClient>) -> bool {
         && is_our_client(stream, own)
     {
         return false;
+    }
+    if let Some(graph) = graph {
+        let Some(node_id) = stream.node_id else {
+            return false;
+        };
+        if upstream_includes_mix_mic(node_id, stream.client_id, graph) {
+            return false;
+        }
     }
     !stream.application_name.is_empty() && !stream.binary.is_empty()
 }
@@ -153,8 +341,9 @@ pub fn strip_should_attach(
     strip: &Strip,
     stream: &PlaybackStream,
     own: Option<&OwnClient>,
+    graph: Option<&LoopGraph<'_>>,
 ) -> bool {
-    if !feeds_mix_mic(stream, own) {
+    if !feeds_mix_mic(stream, own, graph) {
         return false;
     }
     match &strip.source {
@@ -189,11 +378,13 @@ mod tests {
         assert!(strip_should_attach(
             &strip,
             &PlaybackStream::app("mpv", "mpv"),
+            None,
             None
         ));
         assert!(!strip_should_attach(
             &strip,
             &PlaybackStream::app("mpv", "mpv.bin"),
+            None,
             None
         ));
     }
@@ -251,6 +442,7 @@ mod tests {
         assert!(!strip_should_attach(
             &strip,
             &PlaybackStream::app("mpv", "mpv"),
+            None,
             None
         ));
     }
@@ -265,20 +457,119 @@ mod tests {
         by_client.client_id = Some(7);
         by_client.pid = Some(9999);
         assert!(is_our_client(&by_client, &own));
-        assert!(!feeds_mix_mic(&by_client, Some(&own)));
+        assert!(!feeds_mix_mic(&by_client, Some(&own), None));
 
         let mut by_pid = PlaybackStream::app("firefox", "firefox");
         by_pid.pid = Some(4242);
         by_pid.client_id = Some(8);
-        assert!(!feeds_mix_mic(&by_pid, Some(&own)));
+        assert!(!feeds_mix_mic(&by_pid, Some(&own), None));
 
         let mut someone_else = PlaybackStream::app(MIX_MIC_NODE_NAME, "firefox");
         someone_else.client_id = Some(3);
         someone_else.pid = Some(50);
-        assert!(feeds_mix_mic(&someone_else, Some(&own)));
+        assert!(feeds_mix_mic(&someone_else, Some(&own), None));
 
         let mut marked = PlaybackStream::app("firefox", "firefox");
         marked.omamix_owned = true;
-        assert!(!feeds_mix_mic(&marked, None));
+        assert!(!feeds_mix_mic(&marked, None, None));
+    }
+
+    #[test]
+    fn bind_fills_identity_the_global_does_not_carry() {
+        let global = NodeIdentity::from_props([
+            ("node.name", "mpv"),
+            ("media.class", "Stream/Output/Audio"),
+            ("application.name", "mpv"),
+            ("client.id", "12"),
+            ("object.serial", "99"),
+        ]);
+        assert!(global.binary.is_empty());
+        assert!(global.media_name.is_empty());
+        assert!(global.pid.is_none());
+        assert!(!global.omamix_owned);
+        assert_eq!(global.client_id, Some(12));
+
+        let bound = NodeIdentity::from_props([
+            ("application.process.binary", "mpv"),
+            ("media.name", "song"),
+            ("application.process.id", "440"),
+            ("omamix.owned", "true"),
+        ]);
+        let mut merged = global;
+        merged.merge_bind(&bound);
+        assert_eq!(merged.binary, "mpv");
+        assert_eq!(merged.media_name, "song");
+        assert_eq!(merged.pid, Some(440));
+        assert!(merged.omamix_owned);
+        assert_eq!(merged.client_id, Some(12));
+        assert_eq!(merged.object_serial, Some(99));
+    }
+
+    #[test]
+    fn upstream_walk_refuses_a_node_fed_by_mix_mic() {
+        let nodes = [NodeRef {
+            id: 2,
+            client_id: Some(20),
+        }];
+        let links = [LinkEdge {
+            output_node: 1,
+            input_node: 2,
+        }];
+        let graph = LoopGraph {
+            mix_mic_node: 1,
+            nodes: &nodes,
+            links: &links,
+        };
+        assert!(upstream_includes_mix_mic(2, Some(20), &graph));
+        let mut stream = PlaybackStream::app("loopback", "pw-loopback");
+        stream.node_id = Some(2);
+        stream.client_id = Some(20);
+        assert!(!feeds_mix_mic(&stream, None, Some(&graph)));
+    }
+
+    #[test]
+    fn same_client_capture_of_mix_mic_refuses_its_playback() {
+        // Browser studio / OBS: capture node 4 reads Mix Mic, playback node 5
+        // is a different object with the same client and no link of its own.
+        let nodes = [
+            NodeRef {
+                id: 4,
+                client_id: Some(40),
+            },
+            NodeRef {
+                id: 5,
+                client_id: Some(40),
+            },
+            NodeRef {
+                id: 6,
+                client_id: Some(50),
+            },
+        ];
+        let links = [LinkEdge {
+            output_node: 1,
+            input_node: 4,
+        }];
+        let graph = LoopGraph {
+            mix_mic_node: 1,
+            nodes: &nodes,
+            links: &links,
+        };
+        assert!(upstream_includes_mix_mic(5, Some(40), &graph));
+        assert!(!upstream_includes_mix_mic(6, Some(50), &graph));
+
+        let mut studio = PlaybackStream::app("Chromium", "chromium");
+        studio.node_id = Some(5);
+        studio.client_id = Some(40);
+        studio.media_name = "studio".into();
+        assert!(!feeds_mix_mic(&studio, None, Some(&graph)));
+
+        let mut mpv = PlaybackStream::app("mpv", "mpv");
+        mpv.node_id = Some(6);
+        mpv.client_id = Some(50);
+        assert!(feeds_mix_mic(&mpv, None, Some(&graph)));
+
+        let mut unbound = PlaybackStream::app("mpv", "mpv");
+        unbound.client_id = Some(50);
+        assert!(!feeds_mix_mic(&unbound, None, Some(&graph)));
     }
 }

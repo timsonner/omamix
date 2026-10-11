@@ -1,5 +1,7 @@
 # Maintainer: timsonner
-pkgname=omamix
+# The Origin git URL is not anonymous. A clean chroot clone needs credentials.
+# `makepkg --nobuild` failed here without them.
+pkgname=omamix-git
 pkgver=0.1.0
 pkgrel=1
 pkgdesc='PipeWire live mixer that publishes one virtual microphone'
@@ -8,42 +10,49 @@ url='https://origin.cursor.com/timsonner/omamix'
 license=('MIT')
 depends=(
   'pipewire'
-  'libpipewire'
-  'gcc-libs'
+  'libgcc'
   'glibc'
   'wayland'
   'libxkbcommon'
   'mesa'
 )
+# libpipewire is the build dependency. The pipewire package already depends
+# on it at runtime, so it is not listed twice.
 makedepends=('git' 'cargo' 'clang' 'pkgconf' 'libpipewire')
+provides=('omamix')
+conflicts=('omamix')
 # Arch repository packages only. Do not add AUR dependencies.
 # libpipewire must be >= 1.2. The pipewire feature's build.rs rejects older headers.
-# Dev stub: source is the Origin git repo. There is no release tarball yet.
 options=('!lto' '!debug')
 
-source=("git+https://origin.cursor.com/timsonner/omamix.git")
+source=("omamix::git+https://origin.cursor.com/timsonner/omamix.git")
 sha256sums=('SKIP')
 
 pkgver() {
-  cd "$srcdir/$pkgname"
+  cd "$srcdir/omamix"
   printf "0.1.0.r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
 }
 
 prepare() {
-  cd "$srcdir/$pkgname"
+  cd "$srcdir/omamix"
   cargo fetch --locked --manifest-path Cargo.toml
 }
 
 build() {
-  cd "$srcdir/$pkgname"
+  cd "$srcdir/omamix"
   cargo build --frozen --release \
     --manifest-path Cargo.toml \
     -p omamix --features pipewire \
     --target-dir "$srcdir/target"
 }
 
+check() {
+  cd "$srcdir/omamix"
+  cargo test --frozen --workspace
+}
+
 package() {
-  cd "$srcdir/$pkgname"
+  cd "$srcdir/omamix"
   install -Dm755 "$srcdir/target/release/omamix" "$pkgdir/usr/bin/omamix"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

@@ -11,7 +11,7 @@ Tim records screen videos and streams (YouTube, X, Rumble browser studio) with h
 
 ## What we learned (hard requirements fall out of these)
 
-- **UNVERIFIED — mic level.** An early note said the Shure X2u comes in about 20 dB low and that browser music is mastered hot. A read-only check on 2026-10-11 did not confirm that. PipeWire channel volume on the X2u source was unity (linear 1.0, cubic 1.0, 0.00 dB, unmuted) and ALSA exposes no capture-gain control. A 5 s capture from that node was digital silence (peak −90.3 dBFS). The cause is unknown. It needs a retest with Tim speaking. See [AUDIO-BASELINE.md](AUDIO-BASELINE.md). v1 still has per-channel input gain with headroom (±24 dB) so a quiet mic can be raised if a later voiced measurement shows it is needed. The cubic-to-dB conversion itself is specified: a PipeWire slider at 40% is about −24 dB (`linear = cubic³`).
+- **Mic level, resolved.** An early note said the Shure X2u comes in about 20 dB low. The silent capture was the hardware gain dial. After Tim raised it, speech peaked at −14.4 dBFS with no clipping (11:51 AM MT, 2026-10-11). See [AUDIO-BASELINE.md](AUDIO-BASELINE.md). Mix Mic is designed for unity mic gain. There is no built-in boost. Per-channel input trim (±24 dB) is still there if a scene needs it. The cubic-to-dB conversion itself is specified: a PipeWire slider at 40% is about −24 dB (`linear = cubic³`).
 - **Tim reported** that headphone volume is a hardware knob on the X2u, so what he hears is not what's recorded. ALSA on this adapter exposes PCM playback only (no headphone element), which is consistent with that report. The knob position was not read. The app must show true output meters and offer a "hear the final mix" monitor.
 - **Tim reported** that gpu-screen-recorder's `default_input` captured silence when the default source was a pactl module-remap-source virtual mic, and that it worked when that source was named explicitly. This session did not re-test that. The virtual mic must be a real PipeWire Audio/Source node (media.class Audio/Source, owned by the app), and must be tested as the system default source with gpu-screen-recorder, Chromium/Firefox getUserMedia, and OBS.
 - PipeWire volume sliders are cubic (40% is about −24 dB). Show dB everywhere, not just percent.
@@ -38,7 +38,7 @@ Tim records screen videos and streams (YouTube, X, Rumble browser studio) with h
 
 ## Tech direction
 
-Decided in [ARCHITECTURE.md](ARCHITECTURE.md): Rust, egui/eframe, pipewire-rs with an in-process DSP chain. The master is an app-owned `pw_stream` with `media.class = Audio/Source`. DSP stages sit behind a trait; RNNoise (library is installed) and optional LV2 come later. PipeWire filter-chain / a full LV2 host is not the v1 engine.
+Decided in [ARCHITECTURE.md](ARCHITECTURE.md): Rust, egui/eframe, pipewire-rs with an in-process DSP chain. The master is one app-owned `pw_filter` node with `media.class = Audio/Source` (that node is Mix Mic). DSP stages sit behind a trait; RNNoise (library is installed) and optional LV2 come later. PipeWire filter-chain / a full LV2 host is not the v1 engine.
 
 Package: plain cargo build for dev; an Arch `PKGBUILD` stub is in the repo (no AUR dependency).
 

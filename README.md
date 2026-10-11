@@ -2,7 +2,7 @@
 
 PipeWire live mixer for Omarchy. It will take a mic and per-app playback, set levels and processing, and publish one virtual microphone other apps can record.
 
-**Status: pre-alpha.** This tree is a scaffold. The window is a placeholder strip, the DSP chain is a trait plus a gain stage, and the process does not connect to PipeWire unless a later change calls the backend. Levels, routing keys, and the fader wheel rule have unit tests. There is no virtual mic yet.
+**Status: pre-alpha.** The window is a placeholder strip and does not publish a virtual mic. With `--features pipewire`, `omamix --headless --mix-mic` publishes Mix Mic (`Audio/Source`, `node.name` `omamix.mix-mic`, `priority.session` 1) and removes it on exit. `--headless` without `--mix-mic` does not open a client. The default master gain is unity. Levels, routing keys, and the fader wheel rule have unit tests. Those tests do not connect to PipeWire.
 
 ## Build
 
@@ -31,7 +31,15 @@ Arch example: `sudo pacman -S rustup clang pkgconf pipewire libpipewire wayland 
 
 Debian/Ubuntu example: `sudo apt install clang libclang-dev pkg-config libpipewire-0.3-dev libwayland-dev libxkbcommon-dev libgl1-mesa-dev`
 
-Run the window locally with `cargo run -p omamix`. UI checks are Tim's; this scaffold was not launched from the agent.
+Run the window locally with `cargo run -p omamix`. That path does not publish Mix Mic.
+
+Headless, on a machine with libpipewire >= 1.2, until SIGINT or SIGTERM:
+
+```sh
+cargo run -p omamix --features pipewire -- --headless --mix-mic
+```
+
+`--duration 2` stops it after two seconds. `--strips other`, `--strips device:<node.name>`, `--strips app:<application.name>:<binary>`, and `--monitor-mix` are optional. UI checks are Tim's; the agent does not launch the window.
 
 ## Dev machine
 

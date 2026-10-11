@@ -16,7 +16,15 @@ cargo build -p omamix
 cargo build -p omamix --features pipewire
 ```
 
-Those cover cubic-to-dB conversion (0.40 → about −24 dB), ±20 dB amplitude, NaN/+∞/−∞ gain (mute or the max boost, never a non-finite amplitude), solo/mute, the ±24 dB input-trim clamp, the effect order, the wheel rule (positive Y raises, one mouse `Line` is 0.5 dB, trackpad points accumulate to a notch, hovered and focused, −∞ one step below −60 dB, a focus click does not move the fader), route keys (stable `application.name` + binary + `media.name` re-attach after a restart; pid and serial only split live duplicates), the "other desktop" graph (a stream with its own strip is excluded; our `client.id` and `omamix.owned` nodes never feed Mix Mic), and the Mix Mic property contract (`media.class = Audio/Source`, `priority.session` 1, `priority.driver` 1, `node.latency`, `node.dont-reconnect`, `object.linger=false`). The PipeWire feature tests build a local `pw_properties` object. They do not connect to the daemon and do not create nodes. CI on Ubuntu runs the default-feature commands only: Ubuntu 24.04 apt ships libpipewire 1.0.5.
+Those cover cubic-to-dB conversion (0.40 → about −24 dB), ±20 dB amplitude, NaN/+∞/−∞ gain (mute or the max boost, never a non-finite amplitude), solo/mute, the ±24 dB input-trim clamp, the effect order, the wheel rule (positive Y raises, one mouse `Line` is 0.5 dB, trackpad points accumulate to a notch, hovered and focused, −∞ one step below −60 dB, a focus click does not move the fader, a direction change or 0.2 s of idle drops the wheel remainder), route keys (stable `application.name` + binary + `media.name` re-attach after a restart; pid and serial only split live duplicates), the "other desktop" graph (a stream with its own strip is excluded; our `client.id`, `omamix.owned`, and any node upstream of Mix Mic never feed Mix Mic), and the Mix Mic property contract (`media.class = Audio/Source`, `priority.session` 1, `priority.driver` 1, `node.latency`, `node.dont-reconnect`, `object.linger=false`). The PipeWire feature tests build a local `pw_properties` object. They do not connect to the daemon and do not create nodes. CI on Ubuntu runs the default-feature commands only: Ubuntu 24.04 apt ships libpipewire 1.0.5.
+
+Headless publish, on this machine only, not from CI:
+
+```sh
+cargo run -p omamix --features pipewire -- --headless --mix-mic
+```
+
+`--duration SECS` exits on its own. Before and after, `wpctl status`, `pactl get-default-source`, `pactl get-default-sink`, and a `pw-dump` node/link list should match. `scripts/unplug-watch.sh` appends those three commands once a second to a log. It does not set a default, a volume, or a config file. It is there for a later physical unplug of the X2u, which this change does not perform.
 
 ## Definition of done (v1)
 
