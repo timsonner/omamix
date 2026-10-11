@@ -108,6 +108,8 @@ pub struct ProcessShared {
     pub input_count: AtomicUsize,
     /// Opt-in 440 Hz sine. The loop thread sets it before connect.
     pub tone: AtomicBool,
+    /// Oscillator phase in cycles, `0.0..1.0`, stored as bits.
+    pub tone_phase: AtomicU32,
 }
 
 impl ProcessShared {
@@ -125,6 +127,7 @@ impl ProcessShared {
             inputs_fr: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
             input_count: AtomicUsize::new(0),
             tone: AtomicBool::new(false),
+            tone_phase: AtomicU32::new(0),
         }
     }
 }
@@ -361,14 +364,7 @@ fn render(shared: &ProcessShared, position: &SpaIoPosition) {
     }
 
     if shared.tone.load(Ordering::Acquire) {
-        let rate = position.clock.rate.num.max(1);
-        let origin = position.clock.position;
-        for index in 0..n as usize {
-            let t = (origin + index as u64) as f32 / rate as f32;
-            let sample = (t * 440.0 * std::f32::consts::TAU).sin() * 0.2;
-            out_l[index] += sample;
-            out_r[index] += sample;
-        }
+        write_tone(shared, n, position.clock.rate.num, out_l, out_r);
     }
 
     // Unity unless the loop thread published a fader. No hidden mic boost.
@@ -384,6 +380,39 @@ fn render(shared: &ProcessShared, position: &SpaIoPosition) {
 
     let (peak, rms) = peak_rms(out_l, out_r);
     shared.meter.store(peak, rms);
+}
+
+/// One 440 Hz sample at amplitude 0.2, and the next phase in `0.0..1.0`.
+///
+/// Phase advances by one cycle increment per sample. It does not use the
+/// graph clock position: that counter does not fit in `f32`, and casting it
+/// turns the sine into a different pitch.
+fn advance_tone(phase: f32, rate: u32) -> (f32, f32) {
+    let rate = if (8_000..384_000).contains(&rate) {
+        rate
+    } else {
+        48_000
+    };
+    let sample = (phase * std::f32::consts::TAU).sin() * 0.2;
+    let mut next = phase + (440.0 / rate as f32);
+    if next >= 1.0 {
+        next -= 1.0;
+    }
+    (sample, next)
+}
+
+fn write_tone(shared: &ProcessShared, n: u32, rate: u32, out_l: &mut [f32], out_r: &mut [f32]) {
+    let mut phase = f32::from_bits(shared.tone_phase.load(Ordering::Relaxed));
+    if !phase.is_finite() || !(0.0..1.0).contains(&phase) {
+        phase = 0.0;
+    }
+    for index in 0..n as usize {
+        let (sample, next) = advance_tone(phase, rate);
+        out_l[index] += sample;
+        out_r[index] += sample;
+        phase = next;
+    }
+    shared.tone_phase.store(phase.to_bits(), Ordering::Relaxed);
 }
 
 fn dsp_samples<'a>(port: *mut c_void, n: u32) -> Option<&'a mut [f32]> {
@@ -515,5 +544,25 @@ mod tests {
             }
         }
         assert!(volumes && mute);
+    }
+
+    #[test]
+    fn tone_phase_returns_to_zero_after_one_second_at_48k() {
+        let mut phase = 0.0f32;
+        let mut prev = 0.0f32;
+        let mut rises = 0u32;
+        for _ in 0..48_000 {
+            let (sample, next) = super::advance_tone(phase, 48_000);
+            if prev < 0.0 && sample >= 0.0 {
+                rises += 1;
+            }
+            prev = sample;
+            phase = next;
+        }
+        let away_from_zero = phase.min(1.0 - phase);
+        assert!(away_from_zero < 0.02, "phase {phase}");
+        // The rise at t=0 is the starting sample, and the 440th rise is the
+        // first sample of the next second, outside this loop.
+        assert_eq!(rises, 439);
     }
 }
