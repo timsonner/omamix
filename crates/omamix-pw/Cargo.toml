@@ -1,0 +1,17 @@
+[package]
+name = "omamix-pw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "PipeWire backend for omamix, gated behind the pipewire feature"
+
+[features]
+default = []
+# Links libpipewire and compiles the stream setup. Unit tests do not connect.
+pipewire = ["dep:pipewire"]
+
+[dependencies]
+omamix-core = { workspace = true }
+pipewire = { version = "0.10.1", optional = true, features = ["v1_2_0"] }

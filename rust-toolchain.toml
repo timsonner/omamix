@@ -1,0 +1,8 @@
+# Floor for this repo. Edition 2024 needs rustc >= 1.85. eframe 0.36 sets
+# rust-version = 1.95, and that is the crate's real minimum (Cargo.toml).
+# Channel 1.95 is any 1.95.x, which matches the README's "1.95 or newer"
+# within that line. A newer stable (this machine tracks 1.99) still builds
+# when rustup's override points at it.
+[toolchain]
+channel = "1.95"
+components = ["clippy", "rustfmt"]

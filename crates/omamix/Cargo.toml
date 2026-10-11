@@ -1,0 +1,22 @@
+[package]
+name = "omamix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "PipeWire live mixer with one virtual microphone"
+
+[[bin]]
+name = "omamix"
+path = "src/main.rs"
+
+[features]
+default = []
+pipewire = ["omamix-pw/pipewire"]
+
+[dependencies]
+eframe = "0.36.2"
+egui = "0.36.2"
+omamix-core = { workspace = true }
+omamix-pw = { workspace = true }

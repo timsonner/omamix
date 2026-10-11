@@ -1,0 +1,10 @@
+[package]
+name = "omamix-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "Graph model, dB math, and DSP chain for omamix"
+
+[dependencies]

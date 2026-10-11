@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/omamix-core",
+    "crates/omamix-pw",
+    "crates/omamix",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+rust-version = "1.95"
+
+[workspace.dependencies]
+omamix-core = { path = "crates/omamix-core" }
+omamix-pw = { path = "crates/omamix-pw" }
