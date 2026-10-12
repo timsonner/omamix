@@ -1,14 +1,21 @@
 //! PipeWire boundary.
 //!
 //! The default build has no libpipewire dependency. `--features pipewire`
-//! compiles the stream setup in [`backend`]. Nothing in this crate connects
-//! to the daemon from a unit test.
+//! compiles the filter backend in [`backend`] and [`engine`]. Unit tests do
+//! not connect to the daemon. [`run_headless`] is what opens a client.
 
 pub mod contract;
 pub mod rt;
 
 #[cfg(feature = "pipewire")]
 pub mod backend;
+#[cfg(feature = "pipewire")]
+mod engine;
+#[cfg(feature = "pipewire")]
+mod filter;
+
+#[cfg(feature = "pipewire")]
+pub use engine::{HeadlessOptions, run_headless};
 
 use std::fmt;
 
@@ -17,8 +24,8 @@ pub use rt::{CommandSender, EngineCommand};
 /// What the UI thread is allowed to hold.
 ///
 /// [`AudioEngine::command_sender`] is the only UI entry. Applying commands is
-/// [`NullEngine::drive`], which the UI does not call. The PipeWire thread will
-/// own that side later.
+/// the loop thread ([`NullEngine::drive`] in tests, the PipeWire timer when
+/// the headless backend is running). `process()` does not drain the channel.
 pub trait AudioEngine: Send {
     fn name(&self) -> &'static str;
     fn command_sender(&self) -> CommandSender;
@@ -43,6 +50,7 @@ impl NullEngine {
         while let Some(command) = self.queue.try_recv() {
             match command {
                 EngineCommand::Shutdown => self.shut_down = true,
+                EngineCommand::SetMasterFaderDb(_) | EngineCommand::SetMonitorMix(_) => {}
             }
         }
         Ok(())

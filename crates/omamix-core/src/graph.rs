@@ -61,7 +61,7 @@ impl Strip {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MasterBus {
-    pub fader_db: f32,
+    fader_db: f32,
     pub eq_enabled: bool,
     pub compressor_enabled: bool,
     /// On by default. Ceiling is [`LIMITER_CEILING_DBTP`].
@@ -71,6 +71,10 @@ pub struct MasterBus {
 }
 
 impl MasterBus {
+    pub fn fader_db(&self) -> f32 {
+        self.fader_db
+    }
+
     /// Same finite range as a channel fader. NaN mutes. +∞ clamps to the max boost.
     pub fn set_fader_db(&mut self, db: f32) {
         self.fader_db = fader::sanitize_fader_db(db);
@@ -147,15 +151,23 @@ impl Scene {
         &self,
         streams: &'a [PlaybackStream],
         own: Option<&OwnClient>,
+        graph: Option<&route::LoopGraph<'_>>,
     ) -> Vec<&'a PlaybackStream> {
         streams
             .iter()
-            .filter(|stream| self.is_in_other_desktop(stream, own))
+            .filter(|stream| self.is_in_other_desktop(stream, own, graph))
             .collect()
     }
 
-    pub fn is_in_other_desktop(&self, stream: &PlaybackStream, own: Option<&OwnClient>) -> bool {
-        if !self.has_other_desktop() || !route::feeds_mix_mic(stream, own) {
+    pub fn is_in_other_desktop(
+        &self,
+        stream: &PlaybackStream,
+        own: Option<&OwnClient>,
+        graph: Option<&route::LoopGraph<'_>>,
+    ) -> bool {
+        if !self.has_other_desktop()
+            || !route::tap_allowed(stream, own, graph, route::TapScope::SharedClient)
+        {
             return false;
         }
         !self.strips.iter().any(|strip| {
@@ -164,16 +176,13 @@ impl Scene {
     }
 
     /// Nodes this scene will create. Each one carries [`OMAMIX_OWNED_KEY`].
-    /// The filter is the single process callback. Mix Mic is its source port.
+    ///
+    /// Mix Mic is the public adapter. The mix engine is a separate filter.
+    /// Headphone sends and the monitor are separate playback streams.
     pub fn owned_outputs(&self) -> Vec<OwnedOutput> {
-        let mut outputs = vec![
-            OwnedOutput {
-                role: OwnedRole::Filter,
-            },
-            OwnedOutput {
-                role: OwnedRole::MixMic,
-            },
-        ];
+        let mut outputs = vec![OwnedOutput {
+            role: OwnedRole::MixMic,
+        }];
         if self.master.monitor_mix {
             outputs.push(OwnedOutput {
                 role: OwnedRole::MonitorFinalMix,
@@ -198,8 +207,9 @@ pub struct OwnedOutput {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OwnedRole {
-    /// The one `pw_filter`. Strips are its input ports.
-    Filter,
+    /// The public Mix Mic source: `media.class` Audio/Source/Virtual,
+    /// `node.name` [`route::MIX_MIC_NODE_NAME`]. The mix engine is a separate
+    /// filter node. Strip taps are input ports on that filter.
     MixMic,
     HeadphoneSend(StripId),
     MonitorFinalMix,
@@ -215,13 +225,11 @@ pub const OMAMIX_OWNED_KEY: &str = "omamix.owned";
 pub fn owned_output_properties(output: &OwnedOutput) -> Vec<(&'static str, &'static str)> {
     let mut props = vec![(OMAMIX_OWNED_KEY, "true"), ("object.linger", "false")];
     match output.role {
-        OwnedRole::Filter => {
-            props.push(("node.description", "omamix"));
-            props.push(("node.virtual", "true"));
-        }
         OwnedRole::MixMic => {
             props.push(("node.name", route::MIX_MIC_NODE_NAME));
             props.push(("node.description", "Mix Mic"));
+            props.push(("media.class", "Audio/Source/Virtual"));
+            props.push(("node.virtual", "true"));
         }
         OwnedRole::HeadphoneSend(_) => {
             props.push(("node.description", "omamix headphones"));
@@ -292,7 +300,7 @@ mod tests {
             1,
             "mic",
             SourceKind::CaptureDevice {
-                node_name: "x2u".into(),
+                node_name: "ExampleMic".into(),
             },
         );
         strip.set_input_gain_db(48.0);
@@ -307,7 +315,7 @@ mod tests {
             1,
             "mic",
             SourceKind::CaptureDevice {
-                node_name: "x2u".into(),
+                node_name: "ExampleMic".into(),
             },
         );
         strip.set_input_gain_db(f32::NAN);
@@ -343,11 +351,11 @@ mod tests {
             PlaybackStream::app("mpv", "mpv"),
             PlaybackStream::app("firefox", "firefox"),
         ];
-        let other = scene.other_desktop_streams(&streams, None);
+        let other = scene.other_desktop_streams(&streams, None, None);
         assert_eq!(other.len(), 1);
         assert_eq!(other[0].application_name, "firefox");
-        assert!(!scene.is_in_other_desktop(&streams[0], None));
-        assert!(route::feeds_mix_mic(&streams[0], None));
+        assert!(!scene.is_in_other_desktop(&streams[0], None, None));
+        assert!(route::feeds_mix_mic(&streams[0], None, None));
     }
 
     #[test]
@@ -360,16 +368,24 @@ mod tests {
         let mut named_like_us = PlaybackStream::app("omamix", "omamix");
         named_like_us.omamix_owned = false;
         let streams = [headphone, monitor, named_like_us];
-        let other = scene.other_desktop_streams(&streams, None);
+        let other = scene.other_desktop_streams(&streams, None, None);
         assert_eq!(other.len(), 1);
         assert_eq!(other[0].application_name, "omamix");
-        assert!(!route::feeds_mix_mic(&streams[0], None));
-        assert!(!route::feeds_mix_mic(&streams[1], None));
+        assert!(!route::feeds_mix_mic(&streams[0], None, None));
+        assert!(!route::feeds_mix_mic(&streams[1], None, None));
         assert!(
             scene
                 .owned_outputs()
                 .iter()
-                .any(|output| output.role == OwnedRole::Filter)
+                .any(|output| output.role == OwnedRole::MixMic)
+        );
+        assert_eq!(
+            scene
+                .owned_outputs()
+                .iter()
+                .filter(|output| output.role == OwnedRole::MixMic)
+                .count(),
+            1
         );
         for output in scene.owned_outputs() {
             let props = owned_output_properties(&output);
@@ -405,10 +421,10 @@ mod tests {
         };
         let mut headphone = PlaybackStream::app("firefox", "firefox");
         headphone.client_id = Some(own.client_id);
-        assert!(!route::feeds_mix_mic(&headphone, Some(&own)));
+        assert!(!route::feeds_mix_mic(&headphone, Some(&own), None));
         assert!(
             scene
-                .other_desktop_streams(&[headphone], Some(&own))
+                .other_desktop_streams(&[headphone], Some(&own), None)
                 .is_empty()
         );
     }
@@ -417,14 +433,14 @@ mod tests {
     fn master_fader_sanitizes_non_finite_values() {
         let mut master = MasterBus::default();
         master.set_fader_db(f32::NAN);
-        assert!(master.fader_db.is_infinite() && master.fader_db.is_sign_negative());
-        assert_eq!(db::db_to_linear(master.fader_db), 0.0);
+        assert!(master.fader_db().is_infinite() && master.fader_db().is_sign_negative());
+        assert_eq!(db::db_to_linear(master.fader_db()), 0.0);
         master.set_fader_db(f32::INFINITY);
-        assert_eq!(master.fader_db, fader::FADER_MAX_DB);
-        assert!(db::db_to_linear(master.fader_db).is_finite());
+        assert_eq!(master.fader_db(), fader::FADER_MAX_DB);
+        assert!(db::db_to_linear(master.fader_db()).is_finite());
         master.set_fader_db(f32::NEG_INFINITY);
-        assert_eq!(master.fader_db, f32::NEG_INFINITY);
-        assert_eq!(db::db_to_linear(master.fader_db), 0.0);
+        assert_eq!(master.fader_db(), f32::NEG_INFINITY);
+        assert_eq!(db::db_to_linear(master.fader_db()), 0.0);
     }
 
     #[test]

@@ -1,15 +1,21 @@
-//! Node properties the PipeWire backend will set.
+//! Node properties the PipeWire backend sets.
 //!
 //! These are the PipeWire key strings (`PW_KEY_*`), kept here so the contract
-//! can be tested with no libpipewire. See docs/ARCHITECTURE.md for why the
-//! master is an app-owned `Audio/Source` stream.
+//! can be tested with no libpipewire. Mix Mic is an adapter-backed
+//! `Audio/Source/Virtual` node. The `pw_filter` is a separate internal node.
+//! See docs/ARCHITECTURE.md.
 
 pub use omamix_core::graph::OMAMIX_OWNED_KEY;
 pub use omamix_core::route::MIX_MIC_NODE_NAME;
 
 /// `priority.session` and `priority.driver` for Mix Mic.
-/// Below WirePlumber's fallback (500) and every ALSA device (typically >= 1000),
-/// so Mix Mic still loses when the ALSA sources are unplugged and only the fallback remains.
+///
+/// WirePlumber ranks candidates by `priority.session`, then `priority.driver`,
+/// otherwise 0. A higher candidate always wins. There is no fallback source
+/// at another priority. If Mix Mic is the only `Audio/Source`,
+/// `Audio/Source/Virtual`, or `Audio/Duplex`, it becomes the default, and
+/// omamix then destroys that node. `default.configured.*` is never written.
+/// The unplug check is `scripts/unplug-watch.sh`, not this constant.
 pub const MIX_MIC_SESSION_PRIORITY: i32 = 1;
 
 /// True when Mix Mic's priority is strictly above every other candidate.
@@ -34,13 +40,41 @@ pub const CLOCK_PLAN: ClockPlan = ClockPlan::SingleFilter;
 /// `node.description` shown in source pickers.
 pub const MIX_MIC_DESCRIPTION: &str = "Mix Mic";
 
-/// `media.class` of the master. A real source node, owned by this process.
-pub const MIX_MIC_MEDIA_CLASS: &str = "Audio/Source";
+/// `media.class` of the public Mix Mic node. An adapter so it can be a source
+/// without a session manager configuring its ports.
+pub const MIX_MIC_MEDIA_CLASS: &str = "Audio/Source/Virtual";
+
+/// JSON for `adapter.auto-port-config`. The null-audio-sink follower exposes
+/// an enum format; the adapter applies this at init and creates dsp ports
+/// from `audio.position`. `monitor` is true so a recorder can capture the
+/// source. A session manager is not required.
+pub const ADAPTER_AUTO_PORT_CONFIG: &str =
+    r#"{"mode":"dsp","monitor":true,"control":false,"position":"preserve"}"#;
+
+/// JSON for `node.param.PortConfig`, applied by the node when its
+/// implementation is set. Direction is Input because `support.null-audio-sink`
+/// has an input port. The format makes the dsp ports exist immediately.
+pub const MIX_MIC_PORT_CONFIG: &str = r#"{"direction":"Input","mode":"dsp","monitor":true,"control":false,"format":{"mediaType":"audio","mediaSubtype":"raw","format":"F32P","rate":48000,"channels":2,"position":["FL","FR"]}}"#;
+
+/// JSON for `node.param.Props`. Unity gain on the public adapter, same
+/// channels the filter advertises on connect.
+pub const MIX_MIC_PROPS_PARAM: &str = r#"{"volume":1.0,"mute":false,"channelVolumes":[1.0,1.0],"softMute":false,"softVolumes":[1.0,1.0]}"#;
+
+/// Internal mix engine. Not a source, so it is not a default candidate.
+pub const FILTER_NODE_NAME: &str = "omamix.mix-engine";
+
+/// `media.class` of the internal filter. Not `Audio/Source`,
+/// `Audio/Source/Virtual`, `Audio/Duplex`, or `Stream/Output/Audio`.
+pub const FILTER_MEDIA_CLASS: &str = "Audio/DSP";
 
 /// Playback-app taps use this class. They are not sources.
 pub const APP_CAPTURE_MEDIA_CLASS: &str = "Stream/Input/Audio";
 
 /// Property bag as `(key, value)` pairs.
+///
+/// This bag does not write `node.driver` or `node.want-driver`. The
+/// `support.null-audio-sink` factory marks the adapter `node.driver`.
+/// `priority.driver` stays 1 so Mix Mic loses a driver election against ALSA.
 pub fn mix_mic_properties() -> Vec<(&'static str, &'static str)> {
     vec![
         ("node.name", MIX_MIC_NODE_NAME),
@@ -50,7 +84,6 @@ pub fn mix_mic_properties() -> Vec<(&'static str, &'static str)> {
         ("media.role", "Production"),
         ("audio.channels", "2"),
         ("audio.position", "FL,FR"),
-        // 1, not 100: a fallback node at 500 still wins after every ALSA source is gone.
         ("priority.session", "1"),
         ("priority.driver", "1"),
         ("node.latency", MIX_MIC_NODE_LATENCY),
@@ -58,6 +91,9 @@ pub fn mix_mic_properties() -> Vec<(&'static str, &'static str)> {
         ("node.autoconnect", "false"),
         ("object.linger", "false"),
         (OMAMIX_OWNED_KEY, "true"),
+        ("adapter.auto-port-config", ADAPTER_AUTO_PORT_CONFIG),
+        ("node.param.PortConfig", MIX_MIC_PORT_CONFIG),
+        ("node.param.Props", MIX_MIC_PROPS_PARAM),
     ]
 }
 
@@ -85,13 +121,21 @@ pub fn app_capture_properties(node_name: &str) -> Vec<(String, String)> {
     ]
 }
 
-/// The single `pw_filter`. Mix Mic is its source port, not a second clock.
+/// The internal `pw_filter`. One process callback. Not the public Mix Mic node.
+///
+/// This bag does not write `node.driver` or `node.want-driver`.
+/// `PW_FILTER_FLAG_DRIVER` is not passed to `pw_filter_connect`, so PipeWire
+/// marks the filter `node.want-driver` and points `node.driver-id` at Mix Mic.
 pub fn filter_properties() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("node.description", "omamix"),
+        ("node.name", FILTER_NODE_NAME),
+        ("node.description", "omamix mix engine"),
+        ("media.class", FILTER_MEDIA_CLASS),
         ("node.virtual", "true"),
         ("priority.session", "1"),
         ("priority.driver", "1"),
+        ("node.latency", MIX_MIC_NODE_LATENCY),
+        ("node.dont-reconnect", "true"),
         ("node.autoconnect", "false"),
         ("object.linger", "false"),
         (OMAMIX_OWNED_KEY, "true"),
@@ -149,8 +193,69 @@ mod tests {
         assert_eq!(get(&props, "node.autoconnect"), Some("false"));
         assert_eq!(get(&props, "object.linger"), Some("false"));
         assert_eq!(get(&props, OMAMIX_OWNED_KEY), Some("true"));
+        assert_eq!(
+            get(&props, "adapter.auto-port-config"),
+            Some(ADAPTER_AUTO_PORT_CONFIG)
+        );
+        assert_eq!(
+            get(&props, "node.param.PortConfig"),
+            Some(MIX_MIC_PORT_CONFIG)
+        );
+        assert_eq!(get(&props, "node.param.Props"), Some(MIX_MIC_PROPS_PARAM));
         assert!(props.iter().all(|(key, _)| *key != "factory.name"));
         assert_eq!(CLOCK_PLAN, ClockPlan::SingleFilter);
+        let filter = filter_properties();
+        assert_ne!(filter, mix_mic_properties());
+        assert_eq!(get(&filter, "node.name"), Some(FILTER_NODE_NAME));
+        assert_eq!(get(&filter, "media.class"), Some(FILTER_MEDIA_CLASS));
+        assert_eq!(get(&filter, OMAMIX_OWNED_KEY), Some("true"));
+        assert_eq!(get(&filter, "object.linger"), Some("false"));
+        assert_eq!(get(&filter, "priority.session"), Some("1"));
+        assert_eq!(get(&filter, "node.autoconnect"), Some("false"));
+        for bag in [&props, &filter] {
+            assert!(
+                bag.iter()
+                    .all(|(key, _)| { *key != "node.driver" && *key != "node.want-driver" })
+            );
+        }
+    }
+
+    #[test]
+    fn contract_bags_include_every_core_owned_key() {
+        use omamix_core::graph::{Scene, Strip, owned_output_properties};
+        use omamix_core::route::SourceKind;
+
+        let mut scene = Scene::empty("t");
+        scene.strips.push(Strip::new(
+            1,
+            "mic",
+            SourceKind::CaptureDevice {
+                node_name: "ExampleMic".into(),
+            },
+        ));
+        scene.strips[0].monitor_headphones = true;
+        scene.master.monitor_mix = true;
+
+        for output in scene.owned_outputs() {
+            let core = owned_output_properties(&output);
+            let contract = contract_bag(&output);
+            for (key, value) in core {
+                let found = contract.iter().find(|(k, _)| k == key);
+                assert_eq!(found.map(|(_, v)| v.as_str()), Some(value), "{key}");
+            }
+        }
+    }
+
+    fn contract_bag(output: &omamix_core::graph::OwnedOutput) -> Vec<(String, String)> {
+        use omamix_core::graph::OwnedRole;
+        match output.role {
+            OwnedRole::MixMic => mix_mic_properties()
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            OwnedRole::HeadphoneSend(_) => headphone_send_properties("omamix.headphone.1"),
+            OwnedRole::MonitorFinalMix => monitor_mix_properties("omamix.monitor"),
+        }
     }
 
     #[test]
@@ -193,13 +298,9 @@ mod tests {
     }
 
     #[test]
-    fn unplugging_alsa_sources_does_not_select_mix_mic() {
-        let x2u = 1000;
-        assert!(!mix_mic_selected_as_default(&[x2u]));
-        // ALSA capture is gone. WirePlumber's fallback remains at 500.
-        let fallback = 500;
-        assert!(!mix_mic_selected_as_default(&[fallback]));
-        assert!(!mix_mic_selected_as_default(&[x2u, fallback]));
+    fn priority_one_loses_to_a_higher_candidate_and_an_empty_list_selects_mix_mic() {
+        assert!(!mix_mic_selected_as_default(&[1000]));
+        assert!(!mix_mic_selected_as_default(&[2]));
         assert!(mix_mic_selected_as_default(&[]));
     }
 

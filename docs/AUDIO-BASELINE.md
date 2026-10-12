@@ -1,6 +1,6 @@
-# Audio baseline — XPS15-OMARCHY
+# Audio baseline: XPS15-OMARCHY
 
-Read-only inspection on 2026-10-11, about 01:23–01:30 America/Denver (MDT). Host `XPS15-OMARCHY`. Defaults, volumes, mutes, and config files were not changed. There was no persistent graph change (`pw-record` briefly linked to the Shure X2u capture ports; that link ended when the process exited).
+Read-only inspection on 2026-10-11, about 01:23–01:30 America/Denver (MDT). Host `XPS15-OMARCHY`. This file is that machine's baseline, an example. Other systems may have none of these devices. omamix does not assume these names or these levels. Defaults, volumes, mutes, and config files were not changed. There was no persistent graph change (`pw-record` briefly linked to that machine's capture ports; that link ended when the process exited).
 
 Each fact below names the command that produced it.
 
@@ -96,7 +96,7 @@ Commands: `amixer -c 0 scontents` and `amixer -c 0 contents`. Read only.
 | 2 | Capture Channel Map | read-only, values 3,4 (FL, FR) |
 | 1 | Playback Channel Map | read-only, values 3,4 (FL, FR) |
 
-There is no capture volume, capture switch, mic boost, or headphone element. Software capture gain is PipeWire's channel volume (unity). Tim reported that headphone level is a hardware knob on the X2u. ALSA exposing no headphone control is consistent with that report. The knob position was not read.
+There is no capture volume, capture switch, mic boost, or headphone element. Software capture gain is PipeWire's channel volume (unity). UNVERIFIED: Tim reported that headphone level is a hardware knob on the X2u. ALSA exposing no headphone control is consistent with that report. The knob position was not read.
 
 ## What sat in the mic and output paths
 
@@ -152,15 +152,21 @@ Level commands: `ffmpeg -i /tmp/omamix-x2u-baseline.wav -af astats=metadata=1:re
 | RMS | **−114.63 dBFS** | **−115.21 dBFS** | mean_volume **−91.0 dB** |
 | nonzero samples | 888 / 240000 | 776 / 240000 | n_samples 480000 |
 
-The take is digital silence (peak −90.3 dBFS, one 16-bit count) plus a few 1-LSB samples. The cause is unknown. Nobody was asked to speak, and this node is a capture device, so the file is not a speech-level measurement. It needs a retest with Tim speaking. It does not support "the X2u comes in about 20 dB low." Software volume was 0 dB (`pw-dump` / `pactl`), so the silence is not a PipeWire or ALSA fader turned down.
+The take is digital silence (peak −90.3 dBFS, one 16-bit count) plus a few 1-LSB samples. Software volume was 0 dB (`pw-dump` / `pactl`), so the silence was not a PipeWire or ALSA fader turned down.
+
+## Speech level, example on XPS15-OMARCHY
+
+MEASURED by Tim on XPS15-OMARCHY, 2026-10-11 (live mic test attended by Tim; exact command not recorded). Example from one machine only, not a default or target gain. Speech peaked at **−14.4 dBFS** with no clipping. No code uses it as a gain. Each input fader starts at 0 dB so the user sets the level. The master linear gain starts at 1.0, which is 0 dB. Input trim still spans ±24 dB when a scene needs it.
+
+UNVERIFIED: the earlier silent take may have been the hardware dial turned down; the knob position cannot be read. The command for that silent take is in the section above.
 
 ## What could not be verified
 
-- **Speech level versus mastered browser music.** The 5 s capture was digital silence (peak −90.3 dBFS) and the cause is unknown. The −20 dB claim stays unverified until a retest with Tim speaking, plus a separate capture of the playback he compares it to.
-- **Hardware knob position.** Tim reported a hardware headphone knob. `amixer -c 0 contents` shows no headphone or capture control, so the position cannot be read from software.
+- **Speech versus mastered browser music, as a mix balance.** UNVERIFIED: the earlier silent take may have been the hardware dial turned down; the knob position cannot be read. A separate capture of the playback he compares the voice to was not made in this pass.
+- **Hardware knob position.** UNVERIFIED: Tim reported a hardware headphone knob. `amixer -c 0 contents` shows no headphone or capture control, so the position cannot be read from software.
 - **Whether a microphone is electrically present.** Silence is consistent with several causes (gain at minimum, unplugged capsule, idle preamp below 16-bit). The USB device was present (`/proc/asound/cards`) and the source node was running at 48 kHz (`pw-dump` `Format`).
 - **PipeWire quantum and latency.** Not read. `pw-metadata` and the node `Latency` / `ProcessLatency` params were not recorded.
 - **Easy Effects plugin parameters** (RNNoise strength, compressor makeup, limiter ceiling). Node names and links were in `pw-dump`. The plugin control values live in Easy Effects' own config, which was not opened. The package was then removed, so those nodes cannot be re-read without reinstalling.
-- **gpu-screen-recorder against this source.** Not run. Tim reported silence from `module-remap-source` as the default source. The default source was left alone.
+- **gpu-screen-recorder against this source.** Not run. UNVERIFIED: Tim reported silence from `module-remap-source` as the default source. The default source was left alone.
 - **Wiremix's earlier capture streams.** Seen in one `wpctl status`, absent from the later `pw-dump`. Not reconstructed.
 - **Built-in mic and Plugable levels as a musical comparison.** Recorded only as node facts above. They were not captured to a file.

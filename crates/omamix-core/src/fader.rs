@@ -43,16 +43,51 @@ pub fn fractional_notches(unit: WheelUnit, delta_y: f32) -> f32 {
     }
 }
 
+/// Seconds of silence after which a leftover fraction is dropped.
+///
+/// A trackpad remainder otherwise sits until the next event in the same
+/// direction, which swallows the first detent of a later gesture.
+pub const WHEEL_IDLE_SECS: f64 = 0.2;
+
 /// Leftover scroll that has not yet reached a whole notch.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct WheelAccum {
     pending: f32,
+    last_secs: Option<f64>,
 }
 
 impl WheelAccum {
     /// Add one event. Returns the whole notches to apply. The fraction stays here.
+    ///
+    /// A delta whose sign differs from the leftover resets that leftover first,
+    /// so one detent the other way is a step and not absorbed by the fraction.
     pub fn push(&mut self, unit: WheelUnit, delta_y: f32) -> i32 {
-        self.pending += fractional_notches(unit, delta_y);
+        let frac = fractional_notches(unit, delta_y);
+        if frac != 0.0 && self.pending != 0.0 && frac.signum() != self.pending.signum() {
+            self.pending = 0.0;
+        }
+        self.pending += frac;
+        self.take_whole()
+    }
+
+    /// [`Self::push`], after dropping the leftover when `now_secs` is more than
+    /// [`WHEEL_IDLE_SECS`] past the previous event.
+    pub fn push_at(&mut self, unit: WheelUnit, delta_y: f32, now_secs: f64) -> i32 {
+        if let Some(last) = self.last_secs
+            && now_secs.is_finite()
+            && last.is_finite()
+            && now_secs - last > WHEEL_IDLE_SECS
+        {
+            self.pending = 0.0;
+        }
+        let notches = self.push(unit, delta_y);
+        if fractional_notches(unit, delta_y) != 0.0 && now_secs.is_finite() {
+            self.last_secs = Some(now_secs);
+        }
+        notches
+    }
+
+    fn take_whole(&mut self) -> i32 {
         if !self.pending.is_finite() {
             self.pending = 0.0;
             return 0;
@@ -220,6 +255,26 @@ mod tests {
         let db = apply_wheel(0.0, true, true, total);
         assert!((db - total as f32 * WHEEL_STEP_DB).abs() < 1e-4);
         assert!(db < 10.0);
+    }
+
+    #[test]
+    fn direction_change_drops_the_remainder() {
+        let mut accum = WheelAccum::default();
+        assert_eq!(accum.push(WheelUnit::Point, 30.0), 0);
+        assert!((accum.pending() - 0.75).abs() < 1e-3);
+        // +0.75 pending must not swallow the first notch the other way.
+        assert_eq!(accum.push(WheelUnit::Line, -1.0), -1);
+        assert_eq!(accum.pending(), 0.0);
+    }
+
+    #[test]
+    fn idle_drops_the_remainder() {
+        let mut accum = WheelAccum::default();
+        assert_eq!(accum.push_at(WheelUnit::Point, 30.0, 1.0), 0);
+        assert!(accum.pending() > 0.0);
+        let notches = accum.push_at(WheelUnit::Point, 4.0, 1.0 + WHEEL_IDLE_SECS + 0.05);
+        assert_eq!(notches, 0);
+        assert!((accum.pending() - 4.0 / POINTS_PER_NOTCH).abs() < 1e-4);
     }
 
     #[test]

@@ -61,23 +61,28 @@ fn db_fader(ui: &mut egui::Ui, db: &mut f32) {
             .collect()
     });
     if hovered && focused {
+        let now = ui.input(|input| input.time);
         let mut notches = 0;
         ui.ctx().data_mut(|data| {
             let accum = data.get_temp_mut_or_default::<fader::WheelAccum>(response.id);
             for (unit, delta_y) in &wheel {
-                notches += accum.push(*unit, *delta_y);
+                notches += accum.push_at(*unit, *delta_y, now);
             }
         });
         if notches != 0 {
             *db = fader::apply_wheel(*db, true, true, notches);
         }
-        if !wheel.is_empty() {
-            // This fader owns the wheel, including a fraction that has not stepped yet.
-            ui.input_mut(|input| {
+        // This fader owns the wheel for every hovered, focused frame. egui
+        // keeps a smoothed delta for a few frames after the raw events stop.
+        // smooth_scroll_delta is what a parent ScrollArea reads. egui 0.36 has
+        // no raw_scroll_delta field; the raw events above are the wheel.
+        ui.input_mut(|input| {
+            if !wheel.is_empty() {
                 input.raw.events.retain(|event| !is_mouse_wheel(event));
                 input.events.retain(|event| !is_mouse_wheel(event));
-            });
-        }
+            }
+            input.smooth_scroll_delta = egui::Vec2::ZERO;
+        });
     } else {
         ui.ctx().data_mut(|data| {
             data.remove_temp::<fader::WheelAccum>(response.id);

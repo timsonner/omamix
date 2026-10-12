@@ -10,8 +10,9 @@ description = "PipeWire backend for omamix, gated behind the pipewire feature"
 [features]
 default = []
 # Links libpipewire and compiles the stream setup. Unit tests do not connect.
-pipewire = ["dep:pipewire"]
+pipewire = ["dep:pipewire", "dep:libc"]
 
 [dependencies]
 omamix-core = { workspace = true }
+libc = { version = "0.2.190", optional = true }
 pipewire = { version = "0.10.1", optional = true, features = ["v1_2_0"] }

@@ -1,4 +1,4 @@
-# omamix — PipeWire live mixer with a virtual mic
+# omamix: PipeWire live mixer with a virtual mic
 
 Requested by Tim, 2026-10-11 ~1:08 AM MT, via Kit. Owner: Coda (Software Dev). Language: Rust (Tim's pick).
 Target: Tim's XPS15-OMARCHY (Arch-based Omarchy, Hyprland/Wayland, PipeWire + WirePlumber, pipewire-pulse). Local dev and test on that laptop.
@@ -11,9 +11,9 @@ Tim records screen videos and streams (YouTube, X, Rumble browser studio) with h
 
 ## What we learned (hard requirements fall out of these)
 
-- **UNVERIFIED — mic level.** An early note said the Shure X2u comes in about 20 dB low and that browser music is mastered hot. A read-only check on 2026-10-11 did not confirm that. PipeWire channel volume on the X2u source was unity (linear 1.0, cubic 1.0, 0.00 dB, unmuted) and ALSA exposes no capture-gain control. A 5 s capture from that node was digital silence (peak −90.3 dBFS). The cause is unknown. It needs a retest with Tim speaking. See [AUDIO-BASELINE.md](AUDIO-BASELINE.md). v1 still has per-channel input gain with headroom (±24 dB) so a quiet mic can be raised if a later voiced measurement shows it is needed. The cubic-to-dB conversion itself is specified: a PipeWire slider at 40% is about −24 dB (`linear = cubic³`).
-- **Tim reported** that headphone volume is a hardware knob on the X2u, so what he hears is not what's recorded. ALSA on this adapter exposes PCM playback only (no headphone element), which is consistent with that report. The knob position was not read. The app must show true output meters and offer a "hear the final mix" monitor.
-- **Tim reported** that gpu-screen-recorder's `default_input` captured silence when the default source was a pactl module-remap-source virtual mic, and that it worked when that source was named explicitly. This session did not re-test that. The virtual mic must be a real PipeWire Audio/Source node (media.class Audio/Source, owned by the app), and must be tested as the system default source with gpu-screen-recorder, Chromium/Firefox getUserMedia, and OBS.
+- **Mic level is per machine, not a default.** Gain differs from one system to another. omamix does not assume a level and does not bake one in. Each input fader starts at 0 dB, and the user sets it. MEASURED by Tim on XPS15-OMARCHY, 2026-10-11 (live mic test attended by Tim; exact command not recorded). Example from one machine only, not a default or target gain. Speech peaked at −14.4 dBFS with no clipping (see [AUDIO-BASELINE.md](AUDIO-BASELINE.md)). No code uses it as a gain. Per-channel input trim (±24 dB) is there when a scene needs it. The cubic-to-dB conversion itself is specified: a PipeWire slider at 40% is about −24 dB (`linear = cubic³`).
+- UNVERIFIED: **Tim reported**, on XPS15-OMARCHY, that headphone volume is a hardware knob on that machine's interface, so what he hears is not what's recorded. ALSA on that adapter exposes PCM playback only (no headphone element), which is consistent with that report. The knob position was not read. Another system may have no such device. The app must show true output meters and offer a "hear the final mix" monitor.
+- UNVERIFIED: **Tim reported** that gpu-screen-recorder's `default_input` captured silence when the default source was a pactl module-remap-source virtual mic, and that it worked when that source was named explicitly. This session did not re-test that. The virtual mic must be a real PipeWire Audio/Source/Virtual node (media.class Audio/Source/Virtual, owned by the app), and must be tested as the system default source with gpu-screen-recorder, Chromium/Firefox getUserMedia, and OBS.
 - PipeWire volume sliders are cubic (40% is about −24 dB). Show dB everywhere, not just percent.
 - Tim hates mouse-wheel-over-slider changing volume by accident. No scroll-to-change unless a fader is focused/clicked first.
 - Apps appear/disappear as they start and stop playing; routing must persist per app (by application.name / binary) and re-attach automatically.
@@ -38,13 +38,13 @@ Tim records screen videos and streams (YouTube, X, Rumble browser studio) with h
 
 ## Tech direction
 
-Decided in [ARCHITECTURE.md](ARCHITECTURE.md): Rust, egui/eframe, pipewire-rs with an in-process DSP chain. The master is an app-owned `pw_stream` with `media.class = Audio/Source`. DSP stages sit behind a trait; RNNoise (library is installed) and optional LV2 come later. PipeWire filter-chain / a full LV2 host is not the v1 engine.
+Decided in [ARCHITECTURE.md](ARCHITECTURE.md): Rust, egui/eframe, pipewire-rs with an in-process DSP chain. Mix Mic is an app-owned `Audio/Source/Virtual` adapter. The mix itself is one `pw_filter` (`omamix.mix-engine`) whose outputs feed that adapter. DSP stages sit behind a trait; RNNoise (library is installed) and optional LV2 come later. PipeWire filter-chain / a full LV2 host is not the v1 engine.
 
-Package: plain cargo build for dev; an Arch `PKGBUILD` stub is in the repo (no AUR dependency).
+Package: plain cargo build for dev. The Arch package is `omamix-git` (`PKGBUILD` in the repo): unpinned Origin git source, `cargo fetch --locked`, `cargo build --frozen --release -p omamix --features pipewire`, and an install of `/usr/bin/omamix`. Arch repository packages only, no AUR dependency. Runtime depends are `pipewire`, `libpipewire`, `glibc`, `wayland`, `libxkbcommon`, and `mesa`. `pipewire` is the daemon. `readelf` NEEDED does not list it.
 
 ## Definition of done for v1
 
-- On XPS15-OMARCHY: add the Shure X2u + mpv OST + a Chromium tab as strips; set levels; master limiter on.
+- On any machine: add a capture device, a music player, and a browser tab as strips; set each input's level; master limiter on. XPS15-OMARCHY is only an example of one such setup.
 - Pick the virtual mic in (a) Chromium getUserMedia (webrtc mic test page), (b) Firefox getUserMedia, (c) Omarchy screen recording via gpu-screen-recorder with the virtual mic as default source, (d) OBS. All four capture voice + music at the set balance, no silence, no doubling.
 - Meters match what's measured in the recorded file (ffmpeg ebur128) within ~1 dB.
 - Quit leaves PipeWire as it was (pw-dump diff clean).

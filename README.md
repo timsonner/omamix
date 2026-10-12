@@ -2,11 +2,11 @@
 
 PipeWire live mixer for Omarchy. It will take a mic and per-app playback, set levels and processing, and publish one virtual microphone other apps can record.
 
-**Status: pre-alpha.** This tree is a scaffold. The window is a placeholder strip, the DSP chain is a trait plus a gain stage, and the process does not connect to PipeWire unless a later change calls the backend. Levels, routing keys, and the fader wheel rule have unit tests. There is no virtual mic yet.
+**Status: pre-alpha.** The window is a placeholder strip and does not publish a virtual mic. With `--features pipewire`, `omamix --headless --mix-mic` publishes Mix Mic (`Audio/Source/Virtual`, `node.name` `omamix.mix-mic`, `priority.session` 1) and removes it on exit. It watches the default metadata and leaves it in place; if Mix Mic is that source, including when that choice is already stored at startup, it destroys the Mix Mic node right away. If the default source cannot be read, Mix Mic is not published. `--headless` without `--mix-mic` does not open a client. The master fader starts at unity (0 dB). That is not a guess about the microphone. The user sets each input. Levels, routing keys, and the fader wheel rule have unit tests. Those tests do not connect to PipeWire.
 
 ## Build
 
-Rust **1.95 or newer** (`rust-toolchain.toml` selects the 1.95 channel, any 1.95.x; edition 2024 itself needs 1.85, and eframe 0.36 requires 1.95). This machine is on 1.99, which still builds. libpipewire **>= 1.2** is required for `--features pipewire`. pipewire-rs 0.10 with feature `v1_2_0` fails on 1.0.x with E0425 (`spa_meta_sync_timeline`). Ubuntu 24.04's apt package is libpipewire 1.0.5, which is too old. `crates/omamix-pw/build.rs` runs `$PKG_CONFIG` (or `pkg-config`) `--atleast-version=1.2 libpipewire-0.3` and stops with that explanation. CI (`.github/workflows/ci.yml`) runs fmt, clippy, and tests with the default features only, for that Ubuntu package reason.
+Rust **1.95 or newer** (`rust-toolchain.toml` selects the 1.95 channel, any 1.95.x; edition 2024 itself needs 1.85, and eframe 0.36 requires 1.95). This machine is on 1.99.0 (MEASURED: `rustc --version`), which still builds. libpipewire **>= 1.2** is required for `--features pipewire`. pipewire-rs 0.10 with feature `v1_2_0` fails on 1.0.x with E0425 (`spa_meta_sync_timeline`). Ubuntu 24.04's apt package is libpipewire 1.0.5, which is too old. `crates/omamix-pw/build.rs` runs `$PKG_CONFIG` (or `pkg-config`) `--atleast-version=1.2 libpipewire-0.3` and stops with that explanation. CI (`.github/workflows/ci.yml`) runs fmt, clippy, and tests with the default features only, for that Ubuntu package reason.
 
 From the repo root:
 
@@ -31,7 +31,15 @@ Arch example: `sudo pacman -S rustup clang pkgconf pipewire libpipewire wayland 
 
 Debian/Ubuntu example: `sudo apt install clang libclang-dev pkg-config libpipewire-0.3-dev libwayland-dev libxkbcommon-dev libgl1-mesa-dev`
 
-Run the window locally with `cargo run -p omamix`. UI checks are Tim's; this scaffold was not launched from the agent.
+Run the window locally with `cargo run -p omamix`. That path does not publish Mix Mic.
+
+Headless, on a machine with libpipewire >= 1.2, until SIGINT or SIGTERM:
+
+```sh
+cargo run -p omamix --features pipewire -- --headless --mix-mic
+```
+
+`--duration 2` stops it after two seconds. `--strips other`, `--strips device:<node.name>`, `--strips app:<application.name>:<binary>`, and `--monitor-mix` are optional. UI checks are Tim's; the agent does not launch the window.
 
 ## Dev machine
 
@@ -39,12 +47,12 @@ XPS15-OMARCHY: Arch-based Omarchy, Hyprland/Wayland, PipeWire 1.6.8 + WirePlumbe
 
 ## Docs
 
-- [docs/SPEC.md](docs/SPEC.md) — product spec
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — UI toolkit, PipeWire approach, what this machine has installed
-- [docs/TESTING.md](docs/TESTING.md) — v1 definition of done
-- [docs/AUDIO-BASELINE.md](docs/AUDIO-BASELINE.md) — read-only measurement of this laptop's audio graph
+- [docs/SPEC.md](docs/SPEC.md): product spec
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): UI toolkit, PipeWire approach, what this machine has installed
+- [docs/TESTING.md](docs/TESTING.md): v1 definition of done
+- [docs/AUDIO-BASELINE.md](docs/AUDIO-BASELINE.md): read-only measurement of this laptop's audio graph
 
-Packaging is a `PKGBUILD` in the repo. It lists Arch repo packages only, no AUR dependencies. It is a dev stub: `source` is the Origin git URL, `prepare` runs `cargo fetch --locked`, and `build` runs `cargo build --frozen`.
+Packaging is `omamix-git` (`PKGBUILD` in the repo). It `provides` and `conflicts` with `omamix`. It lists Arch repository packages only, no AUR dependencies. `source` is the unpinned Origin git URL (`sha256sums` is `SKIP`, and `pkgver()` follows HEAD). A clean chroot clone of that URL needs credentials. `prepare` runs `cargo fetch --locked`. `build` runs `cargo build --frozen --release -p omamix --features pipewire`. `check` runs `cargo test --frozen --workspace`. `package` installs `/usr/bin/omamix`. Runtime `depends` are `pipewire`, `libpipewire`, `glibc`, `wayland`, `libxkbcommon`, and `mesa`. `libpipewire` is the library `readelf` lists as `NEEDED` (`libpipewire-0.3.so.0`); it is not also a `makedepend`, because Arch installs `depends` before the build. `glibc` covers `libc`, `libm`, and the dynamic linker. `libgcc_s` is implicit, so `gcc-libs` and `libgcc` are not listed. `pipewire` stays in `depends` because the daemon has to be running; `readelf` NEEDED does not list it. `wayland`, `libxkbcommon`, and `mesa` stay because eframe dlopens them (`libwayland-client.so.0`, `libwayland-egl.so.1`, `libxkbcommon.so.0`, `libEGL.so.1`) even though they are absent from `NEEDED`. wgpu also dlopens `libvulkan.so.1` when a loader is present; that loader is not a package dependency. The binary does not call `pactl`, so `libpulse` is not a dependency.
 
 ## License
 
