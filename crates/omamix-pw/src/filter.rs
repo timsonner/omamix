@@ -11,7 +11,7 @@ use std::ptr::{self, NonNull};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
-use omamix_core::params::{StripBlockInput, StripMixer, StripParamBank};
+use omamix_core::params::{StripBlockInput, StripMeterBank, StripMixer, StripParamBank};
 use pipewire as pw;
 use pw::properties::PropertiesBox;
 use pw::sys as pw_sys;
@@ -162,14 +162,17 @@ impl RtMixer {
 unsafe impl Sync for RtMixer {}
 
 /// Shared with `process()`. The loop thread writes params and port pointers.
-/// `process()` writes the meter and the monitor slot. No channel receive.
+/// `process()` writes the meters and the monitor slot. No channel receive.
 pub struct ProcessShared {
     pub params: AtomicParams,
     /// Per-strip trim, fader, pan, mute, solo, and enable. The loop thread writes.
     pub strips: StripParamBank,
     /// Smoother state. Only the data loop (`process` and `clear_tap_slot`) touches it.
     mixer: RtMixer,
+    /// Master block peak and RMS, after the master fader.
     pub meter: AtomicMeter,
+    /// Per-strip block peak and RMS, post-fader, before the master fader.
+    pub strip_meters: StripMeterBank,
     pub slot: MixSlot,
     pub filter: AtomicPtr<c_void>,
     pub node_id: AtomicU32,
@@ -192,6 +195,7 @@ impl ProcessShared {
             strips: StripParamBank::new(),
             mixer: RtMixer::new(48_000),
             meter: AtomicMeter::new(),
+            strip_meters: StripMeterBank::new(),
             slot: MixSlot::new(),
             filter: AtomicPtr::new(ptr::null_mut()),
             node_id: AtomicU32::new(u32::MAX),
@@ -213,6 +217,10 @@ pub struct MixFilter {
     hook: Box<pw::spa::sys::spa_hook>,
     shared: Arc<ProcessShared>,
     destroyed: bool,
+    /// Unit tests set this so [`Self::add_tap_ports`] can run without a filter.
+    /// A real connect leaves it false and adds the port.
+    #[cfg(test)]
+    reject_ports: bool,
 }
 
 impl MixFilter {
@@ -256,6 +264,8 @@ impl MixFilter {
             hook,
             shared,
             destroyed: false,
+            #[cfg(test)]
+            reject_ports: false,
         };
         filter.add_output_ports()?;
         // Advertised Props. `process` writes the samples directly and does not
@@ -420,12 +430,45 @@ impl MixFilter {
         Ok(())
     }
 
+    /// No PipeWire filter. `add_tap_ports` resets the claimed slot, then the
+    /// port add fails before any C call. Drop does not touch the daemon:
+    /// `destroyed` is already set.
+    #[cfg(test)]
+    fn without_filter() -> Self {
+        Self {
+            raw: NonNull::dangling(),
+            events: Box::new(PwFilterEvents {
+                version: 0,
+                destroy: None,
+                state_changed: None,
+                io_changed: None,
+                param_changed: None,
+                add_buffer: None,
+                remove_buffer: None,
+                process: None,
+                drained: None,
+                command: None,
+            }),
+            // SAFETY: `spa_hook` is a C struct of pointers. Zero is an empty
+            // hook. This value is never registered, and Drop returns before
+            // any PipeWire call because `destroyed` is already true.
+            hook: Box::new(unsafe { std::mem::zeroed() }),
+            shared: Arc::new(ProcessShared::new()),
+            destroyed: true,
+            reject_ports: true,
+        }
+    }
+
     fn add_port(
         &mut self,
         direction: pw::spa::utils::Direction,
         name: &str,
         channel: &str,
     ) -> Result<*mut c_void, ()> {
+        #[cfg(test)]
+        if self.reject_ports {
+            return Err(());
+        }
         let mut props = PropertiesBox::new();
         props.insert("port.name", name);
         props.insert("audio.channel", channel);
@@ -505,12 +548,14 @@ unsafe extern "C" fn clear_tap_slot(
     0
 }
 
-/// Neutral strip parameters for a slot that is about to be claimed or was just freed.
+/// Neutral strip parameters and a silent meter for a slot that is about to
+/// be claimed or was just freed.
 ///
 /// Atomics only. The smoother reset stays in `clear_tap_slot`, which runs on
 /// the data loop. `add_tap_ports` calls this before either port pointer is stored.
 fn prepare_tap_slot(shared: &ProcessShared, slot: usize) {
     shared.strips.reset_slot(slot);
+    shared.strip_meters.reset_slot(slot);
 }
 
 unsafe extern "C" fn on_state(data: *mut c_void, _old: i32, state: i32, _error: *const c_char) {
@@ -588,16 +633,14 @@ fn render(shared: &ProcessShared, position: &SpaIoPosition) {
 
     let frames = (n as usize).min(MIX_SLOT_CAP);
     shared.slot.write(&out_l[..frames], &out_r[..frames]);
-
-    let (peak, rms) = peak_rms(out_l, out_r);
-    shared.meter.store(peak, rms);
 }
 
-/// Strip mix, optional tone, then the master fader.
+/// Strip mix, optional tone, then the master fader, then the master meter.
 ///
 /// `render` calls this after the port pointers are resolved. A default bank
 /// (tone off, master gain 1, neutral strips) leaves a finite stereo block
-/// unchanged. The mixer cell is the data loop's, or a single-threaded test's.
+/// unchanged, except a -0.0 sample, which is written as +0.0 because the sum
+/// starts at +0.0. The mixer cell is the data loop's, or a single-threaded test's.
 fn mix_resolved_strips(
     shared: &ProcessShared,
     inputs: &[Option<StripBlockInput<'_>>],
@@ -611,7 +654,14 @@ fn mix_resolved_strips(
     // Safety: `RtMixer`'s Sync bound is the data-loop mutator. This call is
     // that mutator, or a test that does not share the cell.
     let mixer = unsafe { &mut *shared.mixer.get() };
-    mixer.process(&shared.strips, inputs, out_l, out_r, rate);
+    mixer.process(
+        &shared.strips,
+        &shared.strip_meters,
+        inputs,
+        out_l,
+        out_r,
+        rate,
+    );
 
     if shared.tone.load(Ordering::Acquire) {
         write_tone(shared, n, num, denom, out_l, out_r);
@@ -624,6 +674,9 @@ fn mix_resolved_strips(
             *sample *= gain;
         }
     }
+
+    let (peak, rms) = omamix_core::meter::block_peak_rms(out_l, out_r);
+    shared.meter.store(peak, rms);
 }
 
 /// One 440 Hz sample at amplitude 0.2, and the next phase in `0.0..1.0`.
@@ -708,32 +761,6 @@ fn dsp_samples<'a>(port: *mut c_void, n: u32) -> Option<&'a mut [f32]> {
     } else {
         Some(unsafe { std::slice::from_raw_parts_mut(ptr as *mut f32, n as usize) })
     }
-}
-
-fn peak_rms(left: &[f32], right: &[f32]) -> (f32, f32) {
-    let mut peak = 0.0f32;
-    let mut sum = 0.0f32;
-    let mut count = 0.0f32;
-    for sample in left.iter().chain(right.iter()) {
-        if !sample.is_finite() {
-            continue;
-        }
-        let abs = sample.abs();
-        if abs > peak {
-            peak = abs;
-        }
-        sum += sample * sample;
-        count += 1.0;
-    }
-    let rms = if count == 0.0 {
-        0.0
-    } else {
-        (sum / count).sqrt()
-    };
-    (
-        omamix_core::linear_to_db(peak),
-        omamix_core::linear_to_db(rms),
-    )
 }
 
 impl MixFilter {
@@ -922,8 +949,10 @@ mod tests {
         let shared = ProcessShared::new();
         assert!(!shared.tone.load(Ordering::Acquire));
         assert_eq!(shared.params.master_linear(), 1.0);
-        let samples_l = [0.1f32, -0.25, 0.5, 1.0, -1.0, 0.0, 0.70710677, -0.003];
+        // Index 5 is -0.0. The sum starts at +0.0, so it is stored as +0.0.
+        let samples_l = [0.1f32, -0.25, 0.5, 1.0, -1.0, -0.0, 0.70710677, -0.003];
         let samples_r = [-0.1f32, 0.25, -0.5, 0.125, 0.5, -1.0, 0.0, 0.003];
+        assert_eq!(samples_l[5].to_bits(), (-0.0f32).to_bits());
         let inputs = [Some(StripBlockInput {
             left: &samples_l,
             right: &samples_r,
@@ -934,9 +963,11 @@ mod tests {
             mix_resolved_strips(&shared, &inputs, &mut left, &mut right, 8, rate, 1);
             assert_eq!(left, samples_l);
             assert_eq!(right, samples_r);
+            assert_eq!(left[5].to_bits(), 0.0f32.to_bits());
             mix_resolved_strips(&shared, &inputs, &mut left, &mut right, 8, rate, 1);
             assert_eq!(left, samples_l);
             assert_eq!(right, samples_r);
+            assert_eq!(left[5].to_bits(), 0.0f32.to_bits());
         }
     }
 
@@ -971,6 +1002,7 @@ mod tests {
         shared.input_count.store(2, Ordering::Release);
         assert!(shared.strips.apply(1, StripParamUpdate::Mute(true)));
         assert!(shared.strips.apply(1, StripParamUpdate::Pan(-0.2)));
+        shared.strip_meters.store(1, -6.0, -12.0);
         let mut job = ClearJob {
             shared: &shared,
             slot: 1,
@@ -992,6 +1024,155 @@ mod tests {
         assert!(!shared.strips.mute(1));
         assert_eq!(shared.strips.pan(1), 0.0);
         assert!(shared.strips.enabled(1));
+        let (peak, rms) = shared.strip_meters.load(1);
+        assert!(peak.is_infinite() && peak.is_sign_negative());
+        assert!(rms.is_infinite() && rms.is_sign_negative());
+    }
+
+    #[test]
+    fn add_tap_ports_resets_the_claimed_slot_to_neutral() {
+        use omamix_core::params::StripParamUpdate;
+        let mut filter = MixFilter::without_filter();
+        let occupied = std::ptr::without_provenance_mut::<c_void>(0x51);
+        filter.shared.inputs_fl[0].store(occupied, Ordering::Release);
+        filter.shared.inputs_fr[0].store(occupied, Ordering::Release);
+        assert!(filter.shared.strips.apply(0, StripParamUpdate::Mute(true)));
+        filter.shared.strip_meters.store(0, -6.0, -12.0);
+        assert!(filter.shared.strips.apply(1, StripParamUpdate::Mute(true)));
+        assert!(filter.shared.strips.apply(1, StripParamUpdate::Solo(true)));
+        assert!(
+            filter
+                .shared
+                .strips
+                .apply(1, StripParamUpdate::Enabled(false))
+        );
+        assert!(filter.shared.strips.apply(1, StripParamUpdate::Pan(0.4)));
+        assert!(
+            filter
+                .shared
+                .strips
+                .apply(1, StripParamUpdate::FaderDb(-12.0))
+        );
+        assert!(filter.shared.strips.apply(1, StripParamUpdate::TrimDb(6.0)));
+        filter.shared.strip_meters.store(1, -6.0, -12.0);
+
+        assert!(filter.add_tap_ports(9).is_err());
+
+        assert_eq!(filter.shared.inputs_fl[0].load(Ordering::Acquire), occupied);
+        assert!(filter.shared.strips.mute(0));
+        let (kept_peak, _) = filter.shared.strip_meters.load(0);
+        assert!((kept_peak - (-6.0)).abs() < 1.0e-4);
+        assert!(filter.shared.inputs_fl[1].load(Ordering::Acquire).is_null());
+        assert!(filter.shared.inputs_fr[1].load(Ordering::Acquire).is_null());
+        assert!(!filter.shared.strips.mute(1));
+        assert!(!filter.shared.strips.solo(1));
+        assert!(filter.shared.strips.enabled(1));
+        assert_eq!(filter.shared.strips.pan(1), 0.0);
+        assert_eq!(filter.shared.strips.fader_db(1), 0.0);
+        assert_eq!(filter.shared.strips.trim_db(1), 0.0);
+        let (peak, rms) = filter.shared.strip_meters.load(1);
+        assert!(peak.is_infinite() && peak.is_sign_negative());
+        assert!(rms.is_infinite() && rms.is_sign_negative());
+    }
+
+    fn assert_minus_20_sine(peak: f32, rms: f32) {
+        assert!((peak - (-20.0)).abs() <= 0.1, "peak {peak}");
+        let analytic = -20.0 - 10.0 * 2.0f32.log10();
+        assert!(
+            (rms - analytic).abs() <= 0.1,
+            "rms {rms} analytic {analytic}"
+        );
+        assert!((rms - (-23.0)).abs() <= 0.1, "rms {rms}");
+    }
+
+    fn minus_20_sine(frames: usize) -> Vec<f32> {
+        let amp = omamix_core::db_to_linear(-20.0);
+        (0..frames)
+            .map(|index| {
+                let phase = 10.0 * index as f32 / frames as f32;
+                (phase * std::f32::consts::TAU).sin() * amp
+            })
+            .collect()
+    }
+
+    #[test]
+    fn master_and_strip_meters_read_a_minus_20_dbfs_sine() {
+        let shared = ProcessShared::new();
+        assert!(!shared.tone.load(Ordering::Acquire));
+        assert_eq!(shared.params.master_linear(), 1.0);
+        let frames = 480;
+        let sine = minus_20_sine(frames);
+        let inputs = [Some(StripBlockInput {
+            left: sine.as_slice(),
+            right: sine.as_slice(),
+        })];
+        let mut left = vec![0.0f32; frames];
+        let mut right = vec![0.0f32; frames];
+        mix_resolved_strips(
+            &shared,
+            &inputs,
+            &mut left,
+            &mut right,
+            frames as u32,
+            48_000,
+            1,
+        );
+        let (strip_peak, strip_rms) = shared.strip_meters.load(0);
+        assert_minus_20_sine(strip_peak, strip_rms);
+        let (peak, rms) = shared.meter.load();
+        assert_minus_20_sine(peak, rms);
+
+        shared.params.set_master_db(-6.0);
+        mix_resolved_strips(
+            &shared,
+            &inputs,
+            &mut left,
+            &mut right,
+            frames as u32,
+            48_000,
+            1,
+        );
+        let (strip_peak, strip_rms) = shared.strip_meters.load(0);
+        assert_minus_20_sine(strip_peak, strip_rms);
+        let (peak, rms) = shared.meter.load();
+        assert!((peak - (-26.0)).abs() <= 0.1, "master peak {peak}");
+        assert!((rms - (-29.0)).abs() <= 0.1, "master rms {rms}");
+    }
+
+    #[test]
+    fn tone_is_on_the_master_meter_and_not_on_the_strip() {
+        let shared = ProcessShared::new();
+        shared.tone.store(true, Ordering::Release);
+        let frames = 2048;
+        let zeros = vec![0.0f32; frames];
+        let inputs = [Some(StripBlockInput {
+            left: zeros.as_slice(),
+            right: zeros.as_slice(),
+        })];
+        let mut left = vec![0.0f32; frames];
+        let mut right = vec![0.0f32; frames];
+        mix_resolved_strips(
+            &shared,
+            &inputs,
+            &mut left,
+            &mut right,
+            frames as u32,
+            48_000,
+            1,
+        );
+        let (strip_peak, strip_rms) = shared.strip_meters.load(0);
+        assert!(strip_peak.is_infinite() && strip_peak.is_sign_negative());
+        assert!(strip_rms.is_infinite() && strip_rms.is_sign_negative());
+        let (peak, rms) = shared.meter.load();
+        let tone_peak = omamix_core::linear_to_db(0.2);
+        assert!(
+            (peak - tone_peak).abs() <= 0.1,
+            "tone peak {peak} expected {tone_peak}"
+        );
+        assert!(
+            (rms - (tone_peak - 10.0 * 2.0f32.log10())).abs() <= 0.1,
+            "tone rms {rms}"
+        );
     }
 
     #[test]
