@@ -297,6 +297,33 @@ mod tests {
         ]);
         assert!(scan_text("evil.rs", &exec_call).contains(&"exec"));
 
+        let short_exec = word(&[
+            108, 105, 98, 99, 58, 58, 101, 120, 101, 99, 118, 40, 112, 97, 116, 104, 44, 32, 97,
+            114, 103, 118, 41, 10,
+        ]);
+        assert!(scan_text("evil.rs", &short_exec).contains(&"exec"));
+
+        let posix = word(&[
+            112, 111, 115, 105, 120, 95, 115, 112, 97, 119, 110, 40, 112, 97, 116, 104, 41, 10,
+        ]);
+        assert!(scan_text("evil.rs", &posix).contains(&"posix"));
+
+        let system_call = word(&[
+            108, 105, 98, 99, 58, 58, 115, 121, 115, 116, 101, 109, 40, 99, 109, 100, 41, 10,
+        ]);
+        assert!(scan_text("evil.rs", &system_call).contains(&"system"));
+
+        let cli = word(&[
+            112, 119, 45, 99, 108, 105, 32, 100, 101, 115, 116, 114, 111, 121, 10,
+        ]);
+        assert!(scan_text("evil.rs", &cli).contains(&"cli"));
+
+        let bare = word(&[
+            46, 106, 111, 105, 110, 40, 34, 119, 105, 114, 101, 112, 108, 117, 109, 98, 101, 114,
+            34, 41, 10,
+        ]);
+        assert!(scan_text("evil.rs", &bare).contains(&"config-dir"));
+
         let property_only = word(&[
             110, 111, 100, 101, 46, 115, 101, 116, 95, 112, 114, 111, 112, 101, 114, 116, 121, 40,
             105, 100, 41, 10,
@@ -312,6 +339,7 @@ mod tests {
         let set_mute = word(&[115, 101, 116, 45, 109, 117, 116, 101]);
         let pw_metadata = word(&[112, 119, 45, 109, 101, 116, 97, 100, 97, 116, 97]);
         let link_tool = word(&[112, 119, 45, 108, 105, 110, 107]);
+        let cli_tool = word(&[112, 119, 45, 99, 108, 105]);
         let service = word(&[115, 121, 115, 116, 101, 109, 99, 116, 108]);
         let mixer_cmd = word(&[97, 109, 105, 120, 101, 114]);
         let alsa_cmd = word(&[97, 108, 115, 97, 99, 116, 108]);
@@ -329,7 +357,9 @@ mod tests {
             100, 101, 102, 97, 117, 108, 116, 46, 99, 111, 110, 102, 105, 103, 117, 114, 101, 100,
         ]);
         let default_word = word(&[100, 101, 102, 97, 117, 108, 116]);
-        let exec = word(&[101, 120, 101, 99, 118, 112]);
+        let exec = word(&[101, 120, 101, 99, 118]);
+        let posix = word(&[112, 111, 115, 105, 120, 95, 115, 112, 97, 119, 110]);
+        let libc_system = word(&[108, 105, 98, 99, 58, 58, 115, 121, 115, 116, 101, 109]);
         let mut reasons = Vec::new();
         if mentions(text, &dash) {
             reasons.push("dash");
@@ -349,6 +379,9 @@ mod tests {
         if mentions(text, &link_tool) {
             reasons.push("link-tool");
         }
+        if mentions(text, &cli_tool) {
+            reasons.push("cli");
+        }
         if mentions(text, &service) {
             reasons.push("service");
         }
@@ -362,6 +395,7 @@ mod tests {
             || mentions(text, &config_pw)
             || mentions(text, &config_hypr)
             || joined_config(text, &config_wp, &config_pw, &config_hypr)
+            || bare_join(text, &config_wp, &config_pw, &config_hypr)
         {
             reasons.push("config-dir");
         }
@@ -370,6 +404,12 @@ mod tests {
         }
         if mentions(text, &exec) {
             reasons.push("exec");
+        }
+        if mentions(text, &posix) {
+            reasons.push("posix");
+        }
+        if mentions(text, &libc_system) {
+            reasons.push("system");
         }
         if mentions(text, &param_call) {
             reasons.push("param");
@@ -465,6 +505,18 @@ mod tests {
             start = at + join.len();
         }
         false
+    }
+
+    fn bare_join(text: &str, config_wp: &str, config_pw: &str, config_hypr: &str) -> bool {
+        let join_quote = word(&[46, 106, 111, 105, 110, 40, 34]);
+        let prefix_len = word(&[46, 99, 111, 110, 102, 105, 103, 47]).len();
+        let dirs = [
+            &config_wp[prefix_len..],
+            &config_pw[prefix_len..],
+            &config_hypr[prefix_len..],
+        ];
+        dirs.iter()
+            .any(|dir| text.contains(&format!("{join_quote}{dir}")))
     }
 
     fn mentions(text: &str, needle: &str) -> bool {

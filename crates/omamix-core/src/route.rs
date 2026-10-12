@@ -200,6 +200,11 @@ pub fn claim_client_once(logged: &mut std::collections::HashSet<u32>, client_id:
     logged.insert(client_id)
 }
 
+/// Drop a client from the once-per-client log when that client goes away.
+pub fn forget_client(logged: &mut std::collections::HashSet<u32>, client_id: u32) {
+    logged.remove(&client_id);
+}
+
 /// True when any node of `client_id` is Mix Mic or is fed by Mix Mic.
 ///
 /// That is the OBS / browser-studio case: the capture node and the playback
@@ -662,6 +667,8 @@ mod tests {
         assert!(claim_client_once(&mut logged, 40));
         assert!(!claim_client_once(&mut logged, 40));
         assert!(claim_client_once(&mut logged, 50));
+        forget_client(&mut logged, 40);
+        assert!(claim_client_once(&mut logged, 40));
 
         let mut play = PlaybackStream::app("obs", "pw-loopback");
         play.node_id = Some(5);

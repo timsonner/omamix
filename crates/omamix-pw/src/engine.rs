@@ -291,6 +291,7 @@ fn pw_thread(
             engine_up: [false, false],
             engine_tries: 0,
             engine_wait: 0,
+            graph_changed: false,
             retired_slots: Vec::new(),
             quit: false,
             nodes: HashMap::new(),
@@ -553,6 +554,8 @@ struct LoopInner {
     engine_up: [bool; 2],
     engine_tries: u8,
     engine_wait: u8,
+    /// A node, port, or link was added or removed since the last reconcile.
+    graph_changed: bool,
     retired_slots: Vec<usize>,
     quit: bool,
     nodes: HashMap<u32, NodeRec>,
@@ -725,16 +728,19 @@ fn note_global(shared: &Rc<LoopShared>, global: GlobalObject<PropertiesBox>) {
                     bound: false,
                 },
             );
+            inner.graph_changed = true;
             note_owned_ids(&mut inner);
         }
         pw::types::ObjectType::Port => {
             inner
                 .ports
                 .insert(global.id, port_from_props(global.id, &props));
+            inner.graph_changed = true;
         }
         pw::types::ObjectType::Link => {
             if let Some(edge) = edge_from_props(&props) {
                 inner.edges.insert(global.id, edge);
+                inner.graph_changed = true;
             }
         }
         pw::types::ObjectType::Client => {
@@ -767,20 +773,27 @@ fn note_global(shared: &Rc<LoopShared>, global: GlobalObject<PropertiesBox>) {
 
 fn note_remove(shared: &LoopShared, id: u32) {
     let mut inner = shared.inner.borrow_mut();
-    inner.nodes.remove(&id);
+    let had_node = inner.nodes.remove(&id).is_some();
+    let ports_before = inner.ports.len();
     inner
         .ports
         .retain(|gid, port| *gid != id && port.node_id != id);
+    let edges_before = inner.edges.len();
     inner
         .edges
         .retain(|gid, edge| *gid != id && edge.output_node != id && edge.input_node != id);
+    if had_node || inner.ports.len() != ports_before || inner.edges.len() != edges_before {
+        inner.graph_changed = true;
+    }
     if inner.mix_mic_node == Some(id) {
         inner.mix_mic_node = None;
     }
     if inner.filter_node == Some(id) {
         inner.filter_node = None;
     }
-    inner.clients.remove(&id);
+    if inner.clients.remove(&id).is_some() {
+        route::forget_client(&mut inner.unlinked_clients, id);
+    }
     if let Some(tap) = inner.taps.remove(&id) {
         if let Some(slot) = tap.slot {
             inner.retired_slots.push(slot);
@@ -794,6 +807,7 @@ fn note_remove(shared: &LoopShared, id: u32) {
 
 fn note_info(shared: &LoopShared, id: u32, props: &[(String, String)]) {
     let mut inner = shared.inner.borrow_mut();
+    let mut graph = false;
     if let Some(node) = inner.nodes.get_mut(&id) {
         let bound = NodeIdentity::from_props(props.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         node.identity.merge_bind(&bound);
@@ -815,33 +829,51 @@ fn note_info(shared: &LoopShared, id: u32, props: &[(String, String)]) {
         let parsed = port_from_props(id, props);
         if port.node_id == 0 {
             port.node_id = parsed.node_id;
+            if parsed.node_id != 0 {
+                graph = true;
+            }
         }
         if port.port_id.is_none() {
             port.port_id = parsed.port_id;
+            if parsed.port_id.is_some() {
+                graph = true;
+            }
         }
         if port.direction.is_empty() {
             port.direction = parsed.direction;
+            if !port.direction.is_empty() {
+                graph = true;
+            }
         }
         if port.name.is_empty() {
             port.name = parsed.name;
         }
         if port.channel.is_empty() {
             port.channel = parsed.channel;
+            if !port.channel.is_empty() {
+                graph = true;
+            }
         }
     }
-    if let Some(edge) = edge_from_props(props) {
-        inner.edges.entry(id).or_insert(edge);
+    if let Some(edge) = edge_from_props(props)
+        && let std::collections::hash_map::Entry::Vacant(slot) = inner.edges.entry(id)
+    {
+        slot.insert(edge);
+        graph = true;
+    }
+    if graph {
+        inner.graph_changed = true;
     }
 }
 
 fn fail_tap(tap: &mut Tap, peer: u32) {
-    tap.phase = link::link_failed(tap.phase);
-    tap.linked = false;
-    let before = tap.tries;
-    if before < link::RETRY_LIMIT {
-        link::arm_retry(&mut tap.tries, &mut tap.wait);
-    }
-    if before < link::RETRY_LIMIT && tap.tries >= link::RETRY_LIMIT {
+    if link::fail_budget(
+        &mut tap.phase,
+        &mut tap.linked,
+        &mut tap.saw_edges,
+        &mut tap.tries,
+        &mut tap.wait,
+    ) {
         eprintln!("omamix: tap for node {peer} stopped retrying");
     }
 }
@@ -908,6 +940,7 @@ fn note_link_state(shared: &LoopShared, key: u64, active: bool, error: bool) {
             std::mem::take(&mut tap.link_keys)
         } else if active && tap.phase == LinkPhase::Linking {
             tap.phase = link::advance_link(LinkPhase::Linking, true);
+            link::note_tap_success(&mut tap.tries, &mut tap.wait);
             Vec::new()
         } else {
             Vec::new()
@@ -1064,6 +1097,13 @@ fn bind_one(shared: &Rc<LoopShared>, global: &GlobalObject<PropertiesBox>) {
 }
 
 fn reconcile(shared: &Rc<LoopShared>, filter: &Rc<RefCell<Option<MixFilter>>>) {
+    {
+        let mut inner = shared.inner.borrow_mut();
+        if inner.graph_changed {
+            inner.graph_changed = false;
+            revive_exhausted_taps(&mut inner);
+        }
+    }
     let peers = {
         let inner = shared.inner.borrow();
         if inner.own.is_none() || inner.mix_mic_node.is_none() || inner.filter_node.is_none() {
@@ -1092,7 +1132,10 @@ fn reconcile(shared: &Rc<LoopShared>, filter: &Rc<RefCell<Option<MixFilter>>>) {
                 links: &edges,
             };
             let looped = mix != 0 && route::upstream_includes_mix_mic(peer, &graph);
-            let client_id = inner.nodes.get(&peer).and_then(|node| node.identity.client_id);
+            let client_id = inner
+                .nodes
+                .get(&peer)
+                .and_then(|node| node.identity.client_id);
             let own_id = inner.own.map(|own| own.client_id);
             let had_tap = inner.taps.contains_key(&peer);
             let shared_client = had_tap
@@ -1239,17 +1282,16 @@ fn ensure_tap(shared: &Rc<LoopShared>, filter: &Rc<RefCell<Option<MixFilter>>>, 
 
     let (phase, slotted, peer_ports, our_ports) = {
         let mut inner = shared.inner.borrow_mut();
-        if let Some(tap) = inner.taps.get_mut(&peer) {
-            if tap.phase == LinkPhase::PeerVanished {
-                return;
-            }
-            if tap.phase == LinkPhase::Failed && !link::retry_due(tap.tries, &mut tap.wait) {
-                return;
-            }
-            if tap.phase == LinkPhase::Failed {
-                tap.phase = LinkPhase::WaitingForPorts;
-                tap.linked = false;
-            }
+        if let Some(tap) = inner.taps.get_mut(&peer)
+            && !link::allow_attempt(
+                &mut tap.phase,
+                &mut tap.linked,
+                &mut tap.saw_edges,
+                tap.tries,
+                &mut tap.wait,
+            )
+        {
+            return;
         }
         let slotted = inner.taps.get(&peer).is_some_and(|tap| tap.slot.is_some());
         let phase = inner
@@ -1627,12 +1669,25 @@ fn drop_tap(inner: &mut LoopInner, peer: u32) {
 
 fn retire_ports(shared: &LoopShared, filter: &RefCell<Option<MixFilter>>) {
     let slots = std::mem::take(&mut shared.inner.borrow_mut().retired_slots);
-    let mut filter = filter.borrow_mut();
-    let Some(engine) = filter.as_mut() else {
+    if slots.is_empty() {
         return;
-    };
-    for slot in slots {
-        engine.remove_tap_ports(slot);
+    }
+    {
+        let mut filter = filter.borrow_mut();
+        let Some(engine) = filter.as_mut() else {
+            return;
+        };
+        for slot in slots {
+            engine.remove_tap_ports(slot);
+        }
+    }
+    revive_exhausted_taps(&mut shared.inner.borrow_mut());
+}
+
+fn revive_exhausted_taps(inner: &mut LoopInner) {
+    for tap in inner.taps.values_mut() {
+        let _ =
+            link::revive_exhausted(tap.phase, &mut tap.tries, &mut tap.wait, &mut tap.saw_edges);
     }
 }
 
@@ -1837,20 +1892,10 @@ fn relink_if_edges_gone(shared: &LoopShared, peer: u32) {
         let Some(tap) = inner.taps.get_mut(&peer) else {
             return;
         };
-        if !tap.linked {
-            return;
-        }
-        if count > 0 {
-            tap.saw_edges = true;
-            return;
-        }
-        if !tap.saw_edges {
+        if !link::observe_edges(&mut tap.linked, &mut tap.saw_edges, &mut tap.phase, count) {
             return;
         }
         eprintln!("omamix: tap link for node {peer} went away; linking it again");
-        tap.linked = false;
-        tap.saw_edges = false;
-        tap.phase = LinkPhase::Linking;
         std::mem::take(&mut tap.link_keys)
     };
     for key in keys {

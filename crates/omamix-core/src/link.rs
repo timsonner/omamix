@@ -108,6 +108,107 @@ pub fn arm_retry(tries: &mut u8, wait: &mut u8) {
     *wait = 1_u8 << shift;
 }
 
+/// A link that reached active or paused spends the failure budget.
+pub fn note_tap_success(tries: &mut u8, wait: &mut u8) {
+    *tries = 0;
+    *wait = 0;
+}
+
+/// Record a failed link call.
+///
+/// `saw_edges` is cleared so a later retry is not treated as already gone
+/// before the registry shows the new edges. The bool is true when this
+/// failure used the last attempt.
+pub fn fail_budget(
+    phase: &mut LinkPhase,
+    linked: &mut bool,
+    saw_edges: &mut bool,
+    tries: &mut u8,
+    wait: &mut u8,
+) -> bool {
+    *phase = link_failed(*phase);
+    *linked = false;
+    *saw_edges = false;
+    let before = *tries;
+    if before < RETRY_LIMIT {
+        arm_retry(tries, wait);
+    }
+    before < RETRY_LIMIT && *tries >= RETRY_LIMIT
+}
+
+/// Whether this tick may start or continue an attempt.
+///
+/// [`LinkPhase::PeerVanished`] stays stopped. A [`LinkPhase::Failed`] attempt
+/// waits out its backoff, then returns to [`LinkPhase::WaitingForPorts`]
+/// with `saw_edges` clear.
+pub fn allow_attempt(
+    phase: &mut LinkPhase,
+    linked: &mut bool,
+    saw_edges: &mut bool,
+    tries: u8,
+    wait: &mut u8,
+) -> bool {
+    if *phase == LinkPhase::PeerVanished {
+        return false;
+    }
+    if *phase == LinkPhase::Failed && !retry_due(tries, wait) {
+        return false;
+    }
+    if *phase == LinkPhase::Failed {
+        *phase = LinkPhase::WaitingForPorts;
+        *linked = false;
+        *saw_edges = false;
+    }
+    true
+}
+
+/// Give an exhausted failure a new budget of [`RETRY_LIMIT`] attempts.
+///
+/// A tap still inside its backoff is left alone. The bool is true when the
+/// budget was reset.
+pub fn revive_exhausted(
+    phase: LinkPhase,
+    tries: &mut u8,
+    wait: &mut u8,
+    saw_edges: &mut bool,
+) -> bool {
+    if phase == LinkPhase::Failed && *tries >= RETRY_LIMIT {
+        *tries = 0;
+        *wait = 0;
+        *saw_edges = false;
+        return true;
+    }
+    false
+}
+
+/// Watch edges from a linked tap.
+///
+/// A count above zero sets `saw_edges`. A later zero tears the attempt down
+/// so it can be linked again. A retry that has not yet appeared in the
+/// registry (`saw_edges` still false) is left up. The bool is true when the
+/// link proxies should be dropped.
+pub fn observe_edges(
+    linked: &mut bool,
+    saw_edges: &mut bool,
+    phase: &mut LinkPhase,
+    count: usize,
+) -> bool {
+    if !*linked {
+        return false;
+    }
+    if count > 0 {
+        *saw_edges = true;
+        return false;
+    }
+    if !*saw_edges {
+        return false;
+    }
+    *linked = false;
+    *saw_edges = false;
+    *phase = LinkPhase::Linking;
+    true
+}
+
 /// Both engine-to-Mix-Mic links. Ready only when both sides are up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EngineSides {
@@ -241,6 +342,175 @@ mod tests {
         assert!(!sides.ready());
         assert_eq!(sides.proxies, 0);
         assert_eq!(sides.up, [false, false]);
+    }
+
+    #[test]
+    fn a_successful_link_resets_the_retry_budget() {
+        let mut phase = LinkPhase::Linking;
+        let mut linked = true;
+        let mut saw_edges = false;
+        let mut tries = 0;
+        let mut wait = 0;
+        assert!(!fail_budget(
+            &mut phase,
+            &mut linked,
+            &mut saw_edges,
+            &mut tries,
+            &mut wait
+        ));
+        assert_eq!((tries, wait), (1, 1));
+        assert!(!allow_attempt(
+            &mut phase,
+            &mut linked,
+            &mut saw_edges,
+            tries,
+            &mut wait
+        ));
+        assert!(allow_attempt(
+            &mut phase,
+            &mut linked,
+            &mut saw_edges,
+            tries,
+            &mut wait
+        ));
+        phase = LinkPhase::Linking;
+        linked = true;
+        note_tap_success(&mut tries, &mut wait);
+        assert_eq!((phase, tries, wait), (LinkPhase::Linking, 0, 0));
+
+        assert!(!fail_budget(
+            &mut phase,
+            &mut linked,
+            &mut saw_edges,
+            &mut tries,
+            &mut wait
+        ));
+        assert_eq!((tries, wait), (1, 1));
+        assert!(!saw_edges);
+        assert!(!linked);
+    }
+
+    #[test]
+    fn an_exhausted_tap_retries_after_a_slot_is_freed() {
+        let mut phase = LinkPhase::WaitingForPorts;
+        let mut linked = false;
+        let mut saw_edges = true;
+        let mut tries = 0;
+        let mut wait = 0;
+        for _ in 0..RETRY_LIMIT {
+            assert!(allow_attempt(
+                &mut phase,
+                &mut linked,
+                &mut saw_edges,
+                tries,
+                &mut wait
+            ));
+            let _ = fail_budget(
+                &mut phase,
+                &mut linked,
+                &mut saw_edges,
+                &mut tries,
+                &mut wait,
+            );
+            while wait > 0 {
+                assert!(!allow_attempt(
+                    &mut phase,
+                    &mut linked,
+                    &mut saw_edges,
+                    tries,
+                    &mut wait
+                ));
+            }
+        }
+        assert_eq!(phase, LinkPhase::Failed);
+        assert_eq!(tries, RETRY_LIMIT);
+        assert!(!saw_edges);
+        assert!(!allow_attempt(
+            &mut phase,
+            &mut linked,
+            &mut saw_edges,
+            tries,
+            &mut wait
+        ));
+
+        let mut backing_off = (phase, tries, wait, saw_edges);
+        backing_off.1 = 2;
+        backing_off.2 = 4;
+        assert!(!revive_exhausted(
+            backing_off.0,
+            &mut backing_off.1,
+            &mut backing_off.2,
+            &mut backing_off.3
+        ));
+        assert_eq!(backing_off, (LinkPhase::Failed, 2, 4, false));
+
+        let mut vanished = LinkPhase::PeerVanished;
+        let mut vanished_tries = RETRY_LIMIT;
+        let mut vanished_wait = 0;
+        let mut vanished_edges = true;
+        assert!(!revive_exhausted(
+            vanished,
+            &mut vanished_tries,
+            &mut vanished_wait,
+            &mut vanished_edges
+        ));
+        assert!(!allow_attempt(
+            &mut vanished,
+            &mut linked,
+            &mut vanished_edges,
+            vanished_tries,
+            &mut vanished_wait
+        ));
+        assert_eq!(vanished, LinkPhase::PeerVanished);
+
+        assert!(revive_exhausted(
+            phase,
+            &mut tries,
+            &mut wait,
+            &mut saw_edges
+        ));
+        assert_eq!((tries, wait, saw_edges), (0, 0, false));
+        assert!(allow_attempt(
+            &mut phase,
+            &mut linked,
+            &mut saw_edges,
+            tries,
+            &mut wait
+        ));
+        assert_eq!(phase, LinkPhase::WaitingForPorts);
+        assert!(!saw_edges);
+    }
+
+    #[test]
+    fn a_failed_tap_does_not_tear_down_the_retry_before_edges_appear() {
+        let mut phase = LinkPhase::Linked;
+        let mut linked = true;
+        let mut saw_edges = true;
+        let mut tries = 0;
+        let mut wait = 0;
+        assert!(!observe_edges(&mut linked, &mut saw_edges, &mut phase, 2));
+        assert!(saw_edges);
+        let _ = fail_budget(
+            &mut phase,
+            &mut linked,
+            &mut saw_edges,
+            &mut tries,
+            &mut wait,
+        );
+        assert!(!saw_edges);
+        assert!(!linked);
+        while !allow_attempt(&mut phase, &mut linked, &mut saw_edges, tries, &mut wait) {}
+        phase = LinkPhase::Linking;
+        linked = true;
+        assert!(!observe_edges(&mut linked, &mut saw_edges, &mut phase, 0));
+        assert!(linked);
+        assert_eq!(phase, LinkPhase::Linking);
+        assert!(!observe_edges(&mut linked, &mut saw_edges, &mut phase, 2));
+        assert!(saw_edges);
+        assert!(observe_edges(&mut linked, &mut saw_edges, &mut phase, 0));
+        assert!(!linked);
+        assert!(!saw_edges);
+        assert_eq!(phase, LinkPhase::Linking);
     }
 
     #[test]
