@@ -600,6 +600,7 @@ struct Tap {
     tries: u8,
     wait: u8,
     revivals: u8,
+    relinks: u8,
     stop_logged: bool,
 }
 
@@ -727,7 +728,9 @@ fn note_global(shared: &Rc<LoopShared>, global: GlobalObject<PropertiesBox>) {
                     bound: false,
                 },
             );
-            note_budget_event(&mut inner, link::BudgetEvent::OtherNode);
+            if let Some(event) = link::registry_budget_event(link::RegistryKind::Node) {
+                note_budget_event(&mut inner, event);
+            }
             note_owned_ids(&mut inner);
         }
         pw::types::ObjectType::Port => {
@@ -739,7 +742,9 @@ fn note_global(shared: &Rc<LoopShared>, global: GlobalObject<PropertiesBox>) {
         pw::types::ObjectType::Link => {
             if let Some(edge) = edge_from_props(&props) {
                 inner.edges.insert(global.id, edge);
-                note_budget_event(&mut inner, link::BudgetEvent::OwnLink);
+                if let Some(event) = link::registry_budget_event(link::RegistryKind::Link) {
+                    note_budget_event(&mut inner, event);
+                }
             }
         }
         pw::types::ObjectType::Client => {
@@ -791,11 +796,13 @@ fn note_remove(shared: &LoopShared, id: u32) {
     inner
         .edges
         .retain(|gid, edge| *gid != id && edge.output_node != id && edge.input_node != id);
-    if had_node {
-        note_budget_event(&mut inner, link::BudgetEvent::OtherNode);
+    if had_node && let Some(event) = link::registry_budget_event(link::RegistryKind::Node) {
+        note_budget_event(&mut inner, event);
     }
-    if !removed_edges.is_empty() {
-        note_budget_event(&mut inner, link::BudgetEvent::OwnLink);
+    if !removed_edges.is_empty()
+        && let Some(event) = link::registry_budget_event(link::RegistryKind::Link)
+    {
+        note_budget_event(&mut inner, event);
     }
     let filter = inner.filter_node;
     if let Some(filter) = filter {
@@ -892,7 +899,9 @@ fn note_info(shared: &LoopShared, id: u32, props: &[(String, String)]) {
         && let std::collections::hash_map::Entry::Vacant(slot) = inner.edges.entry(id)
     {
         slot.insert(edge);
-        note_budget_event(&mut inner, link::BudgetEvent::OwnLink);
+        if let Some(event) = link::registry_budget_event(link::RegistryKind::Link) {
+            note_budget_event(&mut inner, event);
+        }
     }
 }
 
@@ -1345,6 +1354,7 @@ fn ensure_tap(shared: &Rc<LoopShared>, filter: &Rc<RefCell<Option<MixFilter>>>, 
             tries: 0,
             wait: 0,
             revivals: 0,
+            relinks: 0,
             stop_logged: false,
         });
         match result {
@@ -1374,6 +1384,7 @@ fn ensure_tap(shared: &Rc<LoopShared>, filter: &Rc<RefCell<Option<MixFilter>>>, 
             tries: 0,
             wait: 0,
             revivals: 0,
+            relinks: 0,
             stop_logged: false,
         });
         tap.phase = phase;
@@ -1726,12 +1737,13 @@ fn note_budget_event(inner: &mut LoopInner, event: link::BudgetEvent) {
 }
 
 fn revive_peer(inner: &mut LoopInner, node_id: u32) {
-    if node_id == 0 || inner.filter_node == Some(node_id) || inner.mix_mic_node == Some(node_id) {
+    let Some(event) = link::port_budget_event(node_id, inner.filter_node, inner.mix_mic_node)
+    else {
         return;
-    }
+    };
     if let Some(tap) = inner.taps.get_mut(&node_id) {
         let _ = link::apply_budget_event(
-            link::BudgetEvent::PeerPortsChanged,
+            event,
             tap.phase,
             &mut tap.tries,
             &mut tap.wait,
@@ -1752,6 +1764,7 @@ fn silent_unlink_peer(inner: &mut LoopInner, peer: u32) {
             &mut tap.saw_edges,
             &mut tap.tries,
             &mut tap.wait,
+            &mut tap.relinks,
         ) {
             return;
         }
@@ -1972,6 +1985,7 @@ fn relink_if_edges_gone(shared: &LoopShared, peer: u32) {
             &mut tap.phase,
             &mut tap.tries,
             &mut tap.wait,
+            &mut tap.relinks,
             count,
         ) {
             return;

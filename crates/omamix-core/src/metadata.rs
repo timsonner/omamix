@@ -160,8 +160,8 @@ mod tests {
         );
         assert!(allow_metadata_write("default.audio.source").is_err());
         assert_eq!(
-            metadata_node_name("{\"name\":\"alsa_input.usb-Shure\"}"),
-            Some("alsa_input.usb-Shure".into())
+            metadata_node_name("{\"name\":\"alsa_input.usb-ExampleMic\"}"),
+            Some("alsa_input.usb-ExampleMic".into())
         );
         assert_eq!(
             metadata_node_name("alsa_output.pci"),
@@ -219,6 +219,22 @@ mod tests {
             }
         }
         assert!(hits.is_empty(), "device write in {}", hits.join(", "));
+    }
+
+    #[test]
+    fn prove_script_stays_off_the_login_defaults() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/prove.sh");
+        let text = std::fs::read_to_string(&path).expect("scripts/prove.sh");
+        assert!(text.contains("omamix-private-0"));
+        assert!(text.contains("EXIT INT TERM"));
+        assert!(!text.contains(&word(&[
+            115, 101, 116, 45, 100, 101, 102, 97, 117, 108, 116,
+        ])));
+        assert!(!text.contains(&word(&[115, 101, 116, 45, 118, 111, 108, 117, 109, 101,])));
+        assert!(!text.contains(&word(&[115, 101, 116, 45, 109, 117, 116, 101])));
+        assert!(!text.contains(&word(&[
+            115, 121, 115, 116, 101, 109, 100, 45, 114, 117, 110,
+        ])));
     }
 
     #[test]
@@ -339,6 +355,40 @@ mod tests {
         let fork_call = word(&[108, 105, 98, 99, 58, 58, 102, 111, 114, 107, 40, 41, 10]);
         assert!(scan_text("evil.rs", &fork_call).contains(&"fork"));
 
+        let ufcs_push = word(&[
+            80, 97, 116, 104, 66, 117, 102, 58, 58, 112, 117, 115, 104, 40, 38, 109, 117, 116, 32,
+            112, 44, 32, 34, 119, 105, 114, 101, 112, 108, 117, 109, 98, 101, 114, 34, 41, 10,
+        ]);
+        assert!(scan_text("evil.rs", &ufcs_push).contains(&"config-dir"));
+
+        let ufcs_join = word(&[
+            80, 97, 116, 104, 58, 58, 106, 111, 105, 110, 40, 112, 44, 32, 34, 112, 105, 112, 101,
+            119, 105, 114, 101, 34, 41, 10,
+        ]);
+        assert!(scan_text("evil.rs", &ufcs_join).contains(&"config-dir"));
+
+        let raw_dir = word(&[
+            114, 34, 119, 105, 114, 101, 112, 108, 117, 109, 98, 101, 114, 34, 10,
+        ]);
+        assert!(scan_text("evil.rs", &raw_dir).contains(&"config-dir"));
+
+        let const_join = word(&[
+            99, 111, 110, 115, 116, 32, 87, 80, 58, 32, 38, 115, 116, 114, 32, 61, 32, 34, 104,
+            121, 112, 114, 34, 59, 10, 120, 46, 106, 111, 105, 110, 40, 87, 80, 41, 10,
+        ]);
+        assert!(scan_text("evil.rs", &const_join).contains(&"config-dir"));
+
+        let vfork_call = word(&[
+            108, 105, 98, 99, 58, 58, 118, 102, 111, 114, 107, 40, 41, 10,
+        ]);
+        assert!(scan_text("evil.rs", &vfork_call).contains(&"fork"));
+
+        let nix_fork = word(&[
+            110, 105, 120, 58, 58, 117, 110, 105, 115, 116, 100, 58, 58, 102, 111, 114, 107, 40,
+            41, 10,
+        ]);
+        assert!(scan_text("evil.rs", &nix_fork).contains(&"fork"));
+
         let property_only = word(&[
             110, 111, 100, 101, 46, 115, 101, 116, 95, 112, 114, 111, 112, 101, 114, 116, 121, 40,
             105, 100, 41, 10,
@@ -374,6 +424,10 @@ mod tests {
         let default_word = word(&[100, 101, 102, 97, 117, 108, 116]);
         let exec = word(&[101, 120, 101, 99, 118]);
         let libc_fork = word(&[108, 105, 98, 99, 58, 58, 102, 111, 114, 107]);
+        let libc_vfork = word(&[108, 105, 98, 99, 58, 58, 118, 102, 111, 114, 107]);
+        let nix_fork = word(&[
+            110, 105, 120, 58, 58, 117, 110, 105, 115, 116, 100, 58, 58, 102, 111, 114, 107,
+        ]);
         let posix = word(&[112, 111, 115, 105, 120, 95, 115, 112, 97, 119, 110]);
         let libc_system = word(&[108, 105, 98, 99, 58, 58, 115, 121, 115, 116, 101, 109]);
         let mut reasons = Vec::new();
@@ -413,6 +467,9 @@ mod tests {
             || joined_config(text, &config_wp, &config_pw, &config_hypr)
             || bare_join(text, &config_wp, &config_pw, &config_hypr)
             || push_config(text, &config_wp, &config_pw, &config_hypr)
+            || ufcs_config(text, &config_wp, &config_pw, &config_hypr)
+            || raw_config(text, &config_wp, &config_pw, &config_hypr)
+            || const_join(text, &config_wp, &config_pw, &config_hypr)
         {
             reasons.push("config-dir");
         }
@@ -422,7 +479,7 @@ mod tests {
         if mentions(text, &exec) {
             reasons.push("exec");
         }
-        if mentions(text, &libc_fork) {
+        if mentions(text, &libc_fork) || mentions(text, &libc_vfork) || mentions(text, &nix_fork) {
             reasons.push("fork");
         }
         if mentions(text, &posix) {
@@ -563,7 +620,106 @@ mod tests {
     fn push_config(text: &str, config_wp: &str, config_pw: &str, config_hypr: &str) -> bool {
         let marker = word(&[46, 112, 117, 115, 104, 40]);
         let dirs = config_dirs(config_wp, config_pw, config_hypr);
-        quoted_after(text, &marker, &dirs)
+        invocation_names_dir(text, &marker, &dirs)
+    }
+
+    fn ufcs_config(text: &str, config_wp: &str, config_pw: &str, config_hypr: &str) -> bool {
+        let dirs = config_dirs(config_wp, config_pw, config_hypr);
+        let push = word(&[
+            80, 97, 116, 104, 66, 117, 102, 58, 58, 112, 117, 115, 104, 40,
+        ]);
+        let join = word(&[80, 97, 116, 104, 58, 58, 106, 111, 105, 110, 40]);
+        invocation_names_dir(text, &push, &dirs) || invocation_names_dir(text, &join, &dirs)
+    }
+
+    fn raw_config(text: &str, config_wp: &str, config_pw: &str, config_hypr: &str) -> bool {
+        let dirs = config_dirs(config_wp, config_pw, config_hypr);
+        let raw = word(&[114, 34]);
+        let raw_hash = word(&[114, 35, 34]);
+        dirs.iter().any(|dir| {
+            text.contains(&format!("{raw}{dir}")) || text.contains(&format!("{raw_hash}{dir}"))
+        })
+    }
+
+    fn const_join(text: &str, config_wp: &str, config_pw: &str, config_hypr: &str) -> bool {
+        let dirs = config_dirs(config_wp, config_pw, config_hypr);
+        let join = word(&[46, 106, 111, 105, 110, 40]);
+        let path_join = word(&[80, 97, 116, 104, 58, 58, 106, 111, 105, 110, 40]);
+        const_arg_names_dir(text, &join, &dirs) || const_arg_names_dir(text, &path_join, &dirs)
+    }
+
+    fn call_args(after: &str) -> &str {
+        let mut depth = 1;
+        for (i, c) in after.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &after[..i];
+                    }
+                }
+                _ => {}
+            }
+            if i > 240 {
+                break;
+            }
+        }
+        &after[..after.len().min(240)]
+    }
+
+    fn invocation_names_dir(text: &str, marker: &str, dirs: &[&str]) -> bool {
+        let mut start = 0;
+        while let Some(found) = text[start..].find(marker) {
+            let args = call_args(&text[start + found + marker.len()..]);
+            if dirs.iter().any(|dir| args.contains(&format!("\"{dir}"))) {
+                return true;
+            }
+            start = start + found + marker.len();
+        }
+        false
+    }
+
+    fn const_arg_names_dir(text: &str, marker: &str, dirs: &[&str]) -> bool {
+        let mut start = 0;
+        while let Some(found) = text[start..].find(marker) {
+            let args = call_args(&text[start + found + marker.len()..]);
+            let mut ident = String::new();
+            for c in args.chars() {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    ident.push(c);
+                    continue;
+                }
+                if ident_holds_dir(text, &ident, dirs) {
+                    return true;
+                }
+                ident.clear();
+            }
+            if ident_holds_dir(text, &ident, dirs) {
+                return true;
+            }
+            start = start + found + marker.len();
+        }
+        false
+    }
+
+    fn ident_holds_dir(text: &str, ident: &str, dirs: &[&str]) -> bool {
+        if ident.len() < 2 || ident.chars().all(|c| c.is_ascii_digit()) {
+            return false;
+        }
+        for prefix in ["const ", "let ", "static "] {
+            let mut rest = text;
+            let marker = format!("{prefix}{ident}");
+            while let Some(at) = rest.find(&marker) {
+                let to = (at + marker.len() + 80).min(rest.len());
+                let slice = &rest[at..to];
+                if dirs.iter().any(|dir| slice.contains(&format!("\"{dir}"))) {
+                    return true;
+                }
+                rest = &rest[at + marker.len()..];
+            }
+        }
+        false
     }
 
     fn mentions(text: &str, needle: &str) -> bool {
@@ -747,6 +903,9 @@ mod tests {
                     continue;
                 }
                 collect(&path, out);
+            } else if path.file_name().is_some_and(|name| name == "prove.sh") {
+                // The private procedure links and writes the private default.
+                // Every other file stays in the product scan.
             } else if matches!(
                 path.extension().and_then(|ext| ext.to_str()),
                 Some("rs") | Some("sh") | Some("toml")

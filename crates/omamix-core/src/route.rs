@@ -331,7 +331,8 @@ impl NodeIdentity {
 /// Where a strip gets audio.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SourceKind {
-    /// A capture device, keyed by `node.name` (for example the X2u source).
+    /// A capture device, keyed by `node.name`. The name is whatever that
+    /// machine enumerates. The app does not assume a particular device.
     CaptureDevice { node_name: String },
     /// One playback app. Re-attached with [`RouteKey`].
     Application(RouteKey),
@@ -497,8 +498,7 @@ mod tests {
             3,
             "Mic",
             SourceKind::CaptureDevice {
-                node_name: "alsa_input.usb-Shure_Incorporated_Shure_Digital-00.analog-stereo"
-                    .into(),
+                node_name: "alsa_input.usb-ExampleMic.analog-stereo".into(),
             },
         );
         assert!(!strip_should_attach(

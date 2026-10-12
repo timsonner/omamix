@@ -13,7 +13,12 @@ if [ -n "${PIPEWIRE_REMOTE:-}" ]; then
   exit 1
 fi
 
-out=${1:-unplug-watch.log}
+# Default outside the repo. wpctl status lines can carry a device serial.
+if [ -n "${1:-}" ]; then
+  out=$1
+else
+  out=/tmp/omamix-unplug-watch.log
+fi
 
 while true; do
   {

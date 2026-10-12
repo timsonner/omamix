@@ -1,1 +1,8 @@
 target/
+*.log
+*.wav
+# makepkg writes these at the repo root. The leading slash keeps crates/*/src.
+/src/
+/pkg/
+*.pkg.tar.*
+

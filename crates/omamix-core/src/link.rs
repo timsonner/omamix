@@ -91,6 +91,52 @@ pub const RETRY_LIMIT: u8 = 4;
 /// How many times an exhausted tap may be given a new budget.
 pub const REVIVE_LIMIT: u8 = 2;
 
+/// After this many live links are removed, the next retry waits longer.
+///
+/// A success clears tries, wait, and revivals. It does not clear this count,
+/// so a peer that is linked and then removed over and over does not retry
+/// every couple of ticks.
+pub const RELINK_SLOW_AFTER: u8 = 4;
+
+/// Floor on the retry wait, in 50 ms ticks, once [`RELINK_SLOW_AFTER`] is passed.
+pub const RELINK_SLOW_WAIT: u8 = 16;
+
+/// Which registry object a budget event came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegistryKind {
+    Node,
+    Port,
+    Link,
+    Other,
+}
+
+/// Budget event for a node, port, or link add or remove.
+///
+/// A port is not a global event. The caller uses [`port_budget_event`] with
+/// that port's node.
+pub fn registry_budget_event(kind: RegistryKind) -> Option<BudgetEvent> {
+    match kind {
+        RegistryKind::Node => Some(BudgetEvent::OtherNode),
+        RegistryKind::Link => Some(BudgetEvent::OwnLink),
+        RegistryKind::Port | RegistryKind::Other => None,
+    }
+}
+
+/// `PeerPortsChanged` for a port on a tap peer.
+///
+/// The filter and Mix Mic are skipped. A zero node id is skipped.
+pub fn port_budget_event(
+    node_id: u32,
+    filter_node: Option<u32>,
+    mix_mic_node: Option<u32>,
+) -> Option<BudgetEvent> {
+    if node_id == 0 || Some(node_id) == filter_node || Some(node_id) == mix_mic_node {
+        None
+    } else {
+        Some(BudgetEvent::PeerPortsChanged)
+    }
+}
+
 /// What just happened in the graph, for the retry budget.
 ///
 /// [`BudgetEvent::OwnLink`] and [`BudgetEvent::OtherNode`] leave the budget
@@ -233,22 +279,37 @@ pub fn claim_stop_log(logged: &mut bool) -> bool {
     true
 }
 
+/// Count a live link that disappeared, and stretch the wait after several.
+fn note_relink(seen: bool, wait: &mut u8, relinks: &mut u8) {
+    if !seen {
+        return;
+    }
+    *relinks = relinks.saturating_add(1);
+    if *relinks > RELINK_SLOW_AFTER {
+        *wait = (*wait).max(RELINK_SLOW_WAIT);
+    }
+}
+
 /// The link objects are gone and no error state arrived.
 ///
 /// `linked` becomes false so the tap counts as unlinked. The existing failure
-/// budget decides whether another attempt is allowed. The bool is true when
-/// the link proxies should be dropped.
+/// budget decides whether another attempt is allowed. `relinks` grows when
+/// the registry had already shown the link, and it is not cleared by a later
+/// success. The bool is true when the link proxies should be dropped.
 pub fn note_silent_unlink(
     phase: &mut LinkPhase,
     linked: &mut bool,
     saw_edges: &mut bool,
     tries: &mut u8,
     wait: &mut u8,
+    relinks: &mut u8,
 ) -> bool {
     if !*linked {
         return false;
     }
+    let seen = *saw_edges;
     let _ = fail_budget(phase, linked, saw_edges, tries, wait);
+    note_relink(seen, wait, relinks);
     true
 }
 
@@ -264,6 +325,7 @@ pub fn observe_edges(
     phase: &mut LinkPhase,
     tries: &mut u8,
     wait: &mut u8,
+    relinks: &mut u8,
     count: usize,
 ) -> bool {
     if !*linked {
@@ -277,6 +339,7 @@ pub fn observe_edges(
         return false;
     }
     let _ = fail_budget(phase, linked, saw_edges, tries, wait);
+    note_relink(true, wait, relinks);
     true
 }
 
@@ -568,12 +631,14 @@ mod tests {
         let mut saw_edges = true;
         let mut tries = 0;
         let mut wait = 0;
+        let mut relinks = 0;
         assert!(!observe_edges(
             &mut linked,
             &mut saw_edges,
             &mut phase,
             &mut tries,
             &mut wait,
+            &mut relinks,
             2
         ));
         assert!(saw_edges);
@@ -595,6 +660,7 @@ mod tests {
             &mut phase,
             &mut tries,
             &mut wait,
+            &mut relinks,
             0
         ));
         assert!(linked);
@@ -605,6 +671,7 @@ mod tests {
             &mut phase,
             &mut tries,
             &mut wait,
+            &mut relinks,
             2
         ));
         assert!(saw_edges);
@@ -614,6 +681,7 @@ mod tests {
             &mut phase,
             &mut tries,
             &mut wait,
+            &mut relinks,
             0
         ));
         assert!(!linked);
@@ -706,12 +774,14 @@ mod tests {
         let mut tries = 1;
         let mut wait = 0;
         let mut revivals = 0;
+        let mut relinks = 0;
         assert!(note_silent_unlink(
             &mut phase,
             &mut linked,
             &mut saw_edges,
             &mut tries,
-            &mut wait
+            &mut wait,
+            &mut relinks
         ));
         assert!(!linked);
         assert!(!saw_edges);
@@ -754,7 +824,8 @@ mod tests {
             &mut linked,
             &mut saw_edges,
             &mut tries,
-            &mut wait
+            &mut wait,
+            &mut relinks
         ));
         assert!(!linked);
         assert_eq!(tries, RETRY_LIMIT);
@@ -852,5 +923,52 @@ mod tests {
             channel: "FL".into(),
         }];
         assert_eq!(stereo_input_ports(&input, 4), Some((9, 9)));
+    }
+
+    #[test]
+    fn a_node_is_not_a_revive_and_a_peer_port_is() {
+        assert_eq!(
+            registry_budget_event(RegistryKind::Node),
+            Some(BudgetEvent::OtherNode)
+        );
+        assert_eq!(
+            registry_budget_event(RegistryKind::Link),
+            Some(BudgetEvent::OwnLink)
+        );
+        assert_eq!(registry_budget_event(RegistryKind::Port), None);
+        assert_eq!(registry_budget_event(RegistryKind::Other), None);
+        assert_eq!(port_budget_event(0, None, None), None);
+        assert_eq!(port_budget_event(7, Some(7), None), None);
+        assert_eq!(port_budget_event(8, None, Some(8)), None);
+        assert_eq!(
+            port_budget_event(9, Some(7), Some(8)),
+            Some(BudgetEvent::PeerPortsChanged)
+        );
+    }
+
+    #[test]
+    fn repeated_removal_of_a_live_link_waits_longer() {
+        let mut phase = LinkPhase::Linked;
+        let mut linked = true;
+        let mut saw_edges = true;
+        let mut tries = 0;
+        let mut wait = 0;
+        let mut relinks = RELINK_SLOW_AFTER;
+        assert!(note_silent_unlink(
+            &mut phase,
+            &mut linked,
+            &mut saw_edges,
+            &mut tries,
+            &mut wait,
+            &mut relinks
+        ));
+        assert!(wait >= RELINK_SLOW_WAIT);
+        assert_eq!(relinks, RELINK_SLOW_AFTER + 1);
+        let mut revivals = 3;
+        note_tap_success(&mut tries, &mut wait, &mut revivals);
+        assert_eq!(
+            (tries, wait, revivals, relinks),
+            (0, 0, 0, RELINK_SLOW_AFTER + 1)
+        );
     }
 }

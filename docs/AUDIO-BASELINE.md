@@ -1,6 +1,6 @@
 # Audio baseline: XPS15-OMARCHY
 
-Read-only inspection on 2026-10-11, about 01:23–01:30 America/Denver (MDT). Host `XPS15-OMARCHY`. Defaults, volumes, mutes, and config files were not changed. There was no persistent graph change (`pw-record` briefly linked to the Shure X2u capture ports; that link ended when the process exited).
+Read-only inspection on 2026-10-11, about 01:23–01:30 America/Denver (MDT). Host `XPS15-OMARCHY`. This file is that machine's baseline, an example. Other systems may have none of these devices. omamix does not assume these names or these levels. Defaults, volumes, mutes, and config files were not changed. There was no persistent graph change (`pw-record` briefly linked to that machine's capture ports; that link ended when the process exited).
 
 Each fact below names the command that produced it.
 
@@ -154,9 +154,11 @@ Level commands: `ffmpeg -i /tmp/omamix-x2u-baseline.wav -af astats=metadata=1:re
 
 The take is digital silence (peak −90.3 dBFS, one 16-bit count) plus a few 1-LSB samples. Software volume was 0 dB (`pw-dump` / `pactl`), so the silence was not a PipeWire or ALSA fader turned down.
 
-## Speech level, 11:51 AM MT
+## Speech level, example on XPS15-OMARCHY
 
-Tim raised the X2u hardware gain dial and spoke. Speech peaked at **−14.4 dBFS** with no clipping. That measurement resolves the earlier silence and the "20 dB low" note: the dial was down, not a missing software boost. Mix Mic is designed for unity mic gain. The default master linear gain is 1.0. There is no built-in boost. Input trim still spans ±24 dB when a scene needs it.
+MEASURED by Tim, 2026-10-11, on XPS15-OMARCHY. Tim raised that machine's hardware gain dial and spoke. Speech peaked at **−14.4 dBFS** with no clipping. This is that machine's baseline and an example. It is not a default and not a target. No code uses it as a gain. Each input fader starts at 0 dB so the user can set the level. The master linear gain starts at 1.0, which is 0 dB, not a boost toward this measurement. Input trim still spans ±24 dB when a scene needs it.
+
+The earlier silent take was the hardware dial turned down, not a missing software boost. The command for that silent take is in the section above. This file does not repeat Tim's command for the speech take.
 
 ## What could not be verified
 
