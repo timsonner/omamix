@@ -324,6 +324,21 @@ mod tests {
         ]);
         assert!(scan_text("evil.rs", &bare).contains(&"config-dir"));
 
+        let spaced = word(&[
+            46, 106, 111, 105, 110, 40, 32, 34, 119, 105, 114, 101, 112, 108, 117, 109, 98, 101,
+            114, 34, 32, 41, 10,
+        ]);
+        assert!(scan_text("evil.rs", &spaced).contains(&"config-dir"));
+
+        let pushed = word(&[
+            112, 97, 116, 104, 46, 112, 117, 115, 104, 40, 34, 112, 105, 112, 101, 119, 105, 114,
+            101, 34, 41, 10,
+        ]);
+        assert!(scan_text("evil.rs", &pushed).contains(&"config-dir"));
+
+        let fork_call = word(&[108, 105, 98, 99, 58, 58, 102, 111, 114, 107, 40, 41, 10]);
+        assert!(scan_text("evil.rs", &fork_call).contains(&"fork"));
+
         let property_only = word(&[
             110, 111, 100, 101, 46, 115, 101, 116, 95, 112, 114, 111, 112, 101, 114, 116, 121, 40,
             105, 100, 41, 10,
@@ -358,6 +373,7 @@ mod tests {
         ]);
         let default_word = word(&[100, 101, 102, 97, 117, 108, 116]);
         let exec = word(&[101, 120, 101, 99, 118]);
+        let libc_fork = word(&[108, 105, 98, 99, 58, 58, 102, 111, 114, 107]);
         let posix = word(&[112, 111, 115, 105, 120, 95, 115, 112, 97, 119, 110]);
         let libc_system = word(&[108, 105, 98, 99, 58, 58, 115, 121, 115, 116, 101, 109]);
         let mut reasons = Vec::new();
@@ -396,6 +412,7 @@ mod tests {
             || mentions(text, &config_hypr)
             || joined_config(text, &config_wp, &config_pw, &config_hypr)
             || bare_join(text, &config_wp, &config_pw, &config_hypr)
+            || push_config(text, &config_wp, &config_pw, &config_hypr)
         {
             reasons.push("config-dir");
         }
@@ -404,6 +421,9 @@ mod tests {
         }
         if mentions(text, &exec) {
             reasons.push("exec");
+        }
+        if mentions(text, &libc_fork) {
+            reasons.push("fork");
         }
         if mentions(text, &posix) {
             reasons.push("posix");
@@ -507,16 +527,43 @@ mod tests {
         false
     }
 
-    fn bare_join(text: &str, config_wp: &str, config_pw: &str, config_hypr: &str) -> bool {
-        let join_quote = word(&[46, 106, 111, 105, 110, 40, 34]);
+    fn config_dirs<'a>(
+        config_wp: &'a str,
+        config_pw: &'a str,
+        config_hypr: &'a str,
+    ) -> [&'a str; 3] {
         let prefix_len = word(&[46, 99, 111, 110, 102, 105, 103, 47]).len();
-        let dirs = [
+        [
             &config_wp[prefix_len..],
             &config_pw[prefix_len..],
             &config_hypr[prefix_len..],
-        ];
-        dirs.iter()
-            .any(|dir| text.contains(&format!("{join_quote}{dir}")))
+        ]
+    }
+
+    fn quoted_after(text: &str, marker: &str, dirs: &[&str]) -> bool {
+        let mut start = 0;
+        while let Some(found) = text[start..].find(marker) {
+            let after = text[start + found + marker.len()..].trim_start();
+            if let Some(rest) = after.strip_prefix('"')
+                && dirs.iter().any(|dir| rest.starts_with(dir))
+            {
+                return true;
+            }
+            start = start + found + marker.len();
+        }
+        false
+    }
+
+    fn bare_join(text: &str, config_wp: &str, config_pw: &str, config_hypr: &str) -> bool {
+        let marker = word(&[46, 106, 111, 105, 110, 40]);
+        let dirs = config_dirs(config_wp, config_pw, config_hypr);
+        quoted_after(text, &marker, &dirs)
+    }
+
+    fn push_config(text: &str, config_wp: &str, config_pw: &str, config_hypr: &str) -> bool {
+        let marker = word(&[46, 112, 117, 115, 104, 40]);
+        let dirs = config_dirs(config_wp, config_pw, config_hypr);
+        quoted_after(text, &marker, &dirs)
     }
 
     fn mentions(text: &str, needle: &str) -> bool {

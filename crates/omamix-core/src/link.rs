@@ -88,6 +88,22 @@ pub fn link_failed(phase: LinkPhase) -> LinkPhase {
 /// How many failures a tap or the engine link will schedule before it stops.
 pub const RETRY_LIMIT: u8 = 4;
 
+/// How many times an exhausted tap may be given a new budget.
+pub const REVIVE_LIMIT: u8 = 2;
+
+/// What just happened in the graph, for the retry budget.
+///
+/// [`BudgetEvent::OwnLink`] and [`BudgetEvent::OtherNode`] leave the budget
+/// alone. A freed mixer slot or a change to the peer's own ports can revive
+/// an exhausted tap, up to [`REVIVE_LIMIT`] times.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BudgetEvent {
+    OwnLink,
+    OtherNode,
+    SlotFreed,
+    PeerPortsChanged,
+}
+
 /// One timer tick. True when a new attempt may start.
 ///
 /// `wait` counts down first, so a failure armed on this tick does not run
@@ -164,21 +180,71 @@ pub fn allow_attempt(
 
 /// Give an exhausted failure a new budget of [`RETRY_LIMIT`] attempts.
 ///
-/// A tap still inside its backoff is left alone. The bool is true when the
-/// budget was reset.
+/// A tap still inside its backoff is left alone. After [`REVIVE_LIMIT`]
+/// revivals the tap stays exhausted. The bool is true when the budget was reset.
 pub fn revive_exhausted(
     phase: LinkPhase,
     tries: &mut u8,
     wait: &mut u8,
     saw_edges: &mut bool,
+    revivals: &mut u8,
 ) -> bool {
-    if phase == LinkPhase::Failed && *tries >= RETRY_LIMIT {
+    if phase == LinkPhase::Failed && *tries >= RETRY_LIMIT && *revivals < REVIVE_LIMIT {
         *tries = 0;
         *wait = 0;
         *saw_edges = false;
+        *revivals = revivals.saturating_add(1);
         return true;
     }
     false
+}
+
+/// Apply one graph event to a tap budget.
+///
+/// Our own links, and nodes other than a change to this peer's ports, do not
+/// reset `tries`. The bool is true when an exhausted tap was revived.
+pub fn apply_budget_event(
+    event: BudgetEvent,
+    phase: LinkPhase,
+    tries: &mut u8,
+    wait: &mut u8,
+    saw_edges: &mut bool,
+    revivals: &mut u8,
+) -> bool {
+    match event {
+        BudgetEvent::OwnLink | BudgetEvent::OtherNode => false,
+        BudgetEvent::SlotFreed | BudgetEvent::PeerPortsChanged => {
+            revive_exhausted(phase, tries, wait, saw_edges, revivals)
+        }
+    }
+}
+
+/// True the first time this peer exhausts its budget.
+pub fn claim_stop_log(logged: &mut bool) -> bool {
+    if *logged {
+        return false;
+    }
+    *logged = true;
+    true
+}
+
+/// The link objects are gone and no error state arrived.
+///
+/// `linked` becomes false so the tap counts as unlinked. The existing failure
+/// budget decides whether another attempt is allowed. The bool is true when
+/// the link proxies should be dropped.
+pub fn note_silent_unlink(
+    phase: &mut LinkPhase,
+    linked: &mut bool,
+    saw_edges: &mut bool,
+    tries: &mut u8,
+    wait: &mut u8,
+) -> bool {
+    if !*linked {
+        return false;
+    }
+    let _ = fail_budget(phase, linked, saw_edges, tries, wait);
+    true
 }
 
 /// Watch edges from a linked tap.
@@ -191,6 +257,8 @@ pub fn observe_edges(
     linked: &mut bool,
     saw_edges: &mut bool,
     phase: &mut LinkPhase,
+    tries: &mut u8,
+    wait: &mut u8,
     count: usize,
 ) -> bool {
     if !*linked {
@@ -203,9 +271,7 @@ pub fn observe_edges(
     if !*saw_edges {
         return false;
     }
-    *linked = false;
-    *saw_edges = false;
-    *phase = LinkPhase::Linking;
+    let _ = fail_budget(phase, linked, saw_edges, tries, wait);
     true
 }
 
@@ -433,6 +499,7 @@ mod tests {
             &mut wait
         ));
 
+        let mut revivals = 0;
         let mut backing_off = (phase, tries, wait, saw_edges);
         backing_off.1 = 2;
         backing_off.2 = 4;
@@ -440,9 +507,11 @@ mod tests {
             backing_off.0,
             &mut backing_off.1,
             &mut backing_off.2,
-            &mut backing_off.3
+            &mut backing_off.3,
+            &mut revivals
         ));
         assert_eq!(backing_off, (LinkPhase::Failed, 2, 4, false));
+        assert_eq!(revivals, 0);
 
         let mut vanished = LinkPhase::PeerVanished;
         let mut vanished_tries = RETRY_LIMIT;
@@ -452,7 +521,8 @@ mod tests {
             vanished,
             &mut vanished_tries,
             &mut vanished_wait,
-            &mut vanished_edges
+            &mut vanished_edges,
+            &mut revivals
         ));
         assert!(!allow_attempt(
             &mut vanished,
@@ -467,7 +537,8 @@ mod tests {
             phase,
             &mut tries,
             &mut wait,
-            &mut saw_edges
+            &mut saw_edges,
+            &mut revivals
         ));
         assert_eq!((tries, wait, saw_edges), (0, 0, false));
         assert!(allow_attempt(
@@ -488,7 +559,14 @@ mod tests {
         let mut saw_edges = true;
         let mut tries = 0;
         let mut wait = 0;
-        assert!(!observe_edges(&mut linked, &mut saw_edges, &mut phase, 2));
+        assert!(!observe_edges(
+            &mut linked,
+            &mut saw_edges,
+            &mut phase,
+            &mut tries,
+            &mut wait,
+            2
+        ));
         assert!(saw_edges);
         let _ = fail_budget(
             &mut phase,
@@ -502,15 +580,182 @@ mod tests {
         while !allow_attempt(&mut phase, &mut linked, &mut saw_edges, tries, &mut wait) {}
         phase = LinkPhase::Linking;
         linked = true;
-        assert!(!observe_edges(&mut linked, &mut saw_edges, &mut phase, 0));
+        assert!(!observe_edges(
+            &mut linked,
+            &mut saw_edges,
+            &mut phase,
+            &mut tries,
+            &mut wait,
+            0
+        ));
         assert!(linked);
         assert_eq!(phase, LinkPhase::Linking);
-        assert!(!observe_edges(&mut linked, &mut saw_edges, &mut phase, 2));
+        assert!(!observe_edges(
+            &mut linked,
+            &mut saw_edges,
+            &mut phase,
+            &mut tries,
+            &mut wait,
+            2
+        ));
         assert!(saw_edges);
-        assert!(observe_edges(&mut linked, &mut saw_edges, &mut phase, 0));
+        assert!(observe_edges(
+            &mut linked,
+            &mut saw_edges,
+            &mut phase,
+            &mut tries,
+            &mut wait,
+            0
+        ));
         assert!(!linked);
         assert!(!saw_edges);
-        assert_eq!(phase, LinkPhase::Linking);
+        assert_eq!(phase, LinkPhase::Failed);
+        assert_eq!(tries, 2);
+        assert!(wait > 0);
+        assert!(!allow_attempt(
+            &mut phase,
+            &mut linked,
+            &mut saw_edges,
+            tries,
+            &mut wait
+        ));
+    }
+
+    #[test]
+    fn our_own_link_churn_does_not_revive_and_revivals_are_capped() {
+        let phase = LinkPhase::Failed;
+        let mut tries = RETRY_LIMIT;
+        let mut wait = 0;
+        let mut saw_edges = false;
+        let mut revivals = 0;
+        assert!(!apply_budget_event(
+            BudgetEvent::OwnLink,
+            phase,
+            &mut tries,
+            &mut wait,
+            &mut saw_edges,
+            &mut revivals
+        ));
+        assert!(!apply_budget_event(
+            BudgetEvent::OtherNode,
+            phase,
+            &mut tries,
+            &mut wait,
+            &mut saw_edges,
+            &mut revivals
+        ));
+        assert_eq!((tries, wait, revivals), (RETRY_LIMIT, 0, 0));
+
+        assert!(apply_budget_event(
+            BudgetEvent::SlotFreed,
+            phase,
+            &mut tries,
+            &mut wait,
+            &mut saw_edges,
+            &mut revivals
+        ));
+        assert_eq!((tries, revivals), (0, 1));
+        tries = RETRY_LIMIT;
+        assert!(apply_budget_event(
+            BudgetEvent::PeerPortsChanged,
+            phase,
+            &mut tries,
+            &mut wait,
+            &mut saw_edges,
+            &mut revivals
+        ));
+        assert_eq!((tries, revivals), (0, 2));
+        tries = RETRY_LIMIT;
+        assert!(!apply_budget_event(
+            BudgetEvent::SlotFreed,
+            phase,
+            &mut tries,
+            &mut wait,
+            &mut saw_edges,
+            &mut revivals
+        ));
+        assert!(!apply_budget_event(
+            BudgetEvent::OwnLink,
+            phase,
+            &mut tries,
+            &mut wait,
+            &mut saw_edges,
+            &mut revivals
+        ));
+        assert_eq!((tries, revivals), (RETRY_LIMIT, REVIVE_LIMIT));
+
+        let mut logged = false;
+        assert!(claim_stop_log(&mut logged));
+        assert!(!claim_stop_log(&mut logged));
+    }
+
+    #[test]
+    fn a_link_that_disappears_without_an_error_retries_inside_the_budget() {
+        let mut phase = LinkPhase::Linking;
+        let mut linked = true;
+        let mut saw_edges = false;
+        let mut tries = 1;
+        let mut wait = 0;
+        let mut revivals = 0;
+        assert!(note_silent_unlink(
+            &mut phase,
+            &mut linked,
+            &mut saw_edges,
+            &mut tries,
+            &mut wait
+        ));
+        assert!(!linked);
+        assert!(!saw_edges);
+        assert_eq!(phase, LinkPhase::Failed);
+        assert_eq!(tries, 2);
+        assert!(wait > 0);
+        assert!(!apply_budget_event(
+            BudgetEvent::OwnLink,
+            phase,
+            &mut tries,
+            &mut wait,
+            &mut saw_edges,
+            &mut revivals
+        ));
+        assert_eq!(tries, 2);
+        while wait > 0 {
+            assert!(!allow_attempt(
+                &mut phase,
+                &mut linked,
+                &mut saw_edges,
+                tries,
+                &mut wait
+            ));
+        }
+        assert!(allow_attempt(
+            &mut phase,
+            &mut linked,
+            &mut saw_edges,
+            tries,
+            &mut wait
+        ));
+        assert_eq!(phase, LinkPhase::WaitingForPorts);
+
+        tries = RETRY_LIMIT;
+        wait = 0;
+        phase = LinkPhase::Linked;
+        linked = true;
+        assert!(note_silent_unlink(
+            &mut phase,
+            &mut linked,
+            &mut saw_edges,
+            &mut tries,
+            &mut wait
+        ));
+        assert!(!linked);
+        assert_eq!(tries, RETRY_LIMIT);
+        assert!(!allow_attempt(
+            &mut phase,
+            &mut linked,
+            &mut saw_edges,
+            tries,
+            &mut wait
+        ));
     }
 
     #[test]

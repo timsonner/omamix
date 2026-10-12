@@ -291,7 +291,6 @@ fn pw_thread(
             engine_up: [false, false],
             engine_tries: 0,
             engine_wait: 0,
-            graph_changed: false,
             retired_slots: Vec::new(),
             quit: false,
             nodes: HashMap::new(),
@@ -554,8 +553,6 @@ struct LoopInner {
     engine_up: [bool; 2],
     engine_tries: u8,
     engine_wait: u8,
-    /// A node, port, or link was added or removed since the last reconcile.
-    graph_changed: bool,
     retired_slots: Vec<usize>,
     quit: bool,
     nodes: HashMap<u32, NodeRec>,
@@ -602,6 +599,8 @@ struct Tap {
     link_keys: Vec<u64>,
     tries: u8,
     wait: u8,
+    revivals: u8,
+    stop_logged: bool,
 }
 
 struct LiveLink {
@@ -728,19 +727,19 @@ fn note_global(shared: &Rc<LoopShared>, global: GlobalObject<PropertiesBox>) {
                     bound: false,
                 },
             );
-            inner.graph_changed = true;
+            note_budget_event(&mut inner, link::BudgetEvent::OtherNode);
             note_owned_ids(&mut inner);
         }
         pw::types::ObjectType::Port => {
-            inner
-                .ports
-                .insert(global.id, port_from_props(global.id, &props));
-            inner.graph_changed = true;
+            let port = port_from_props(global.id, &props);
+            let node_id = port.node_id;
+            inner.ports.insert(global.id, port);
+            revive_peer(&mut inner, node_id);
         }
         pw::types::ObjectType::Link => {
             if let Some(edge) = edge_from_props(&props) {
                 inner.edges.insert(global.id, edge);
-                inner.graph_changed = true;
+                note_budget_event(&mut inner, link::BudgetEvent::OwnLink);
             }
         }
         pw::types::ObjectType::Client => {
@@ -773,17 +772,44 @@ fn note_global(shared: &Rc<LoopShared>, global: GlobalObject<PropertiesBox>) {
 
 fn note_remove(shared: &LoopShared, id: u32) {
     let mut inner = shared.inner.borrow_mut();
+    let removed_port_nodes: Vec<u32> = inner
+        .ports
+        .iter()
+        .filter(|(gid, port)| **gid == id || port.node_id == id)
+        .map(|(_, port)| port.node_id)
+        .collect();
+    let removed_edges: Vec<LinkEdge> = inner
+        .edges
+        .iter()
+        .filter(|(gid, edge)| **gid == id || edge.output_node == id || edge.input_node == id)
+        .map(|(_, edge)| *edge)
+        .collect();
     let had_node = inner.nodes.remove(&id).is_some();
-    let ports_before = inner.ports.len();
     inner
         .ports
         .retain(|gid, port| *gid != id && port.node_id != id);
-    let edges_before = inner.edges.len();
     inner
         .edges
         .retain(|gid, edge| *gid != id && edge.output_node != id && edge.input_node != id);
-    if had_node || inner.ports.len() != ports_before || inner.edges.len() != edges_before {
-        inner.graph_changed = true;
+    if had_node {
+        note_budget_event(&mut inner, link::BudgetEvent::OtherNode);
+    }
+    if !removed_edges.is_empty() {
+        note_budget_event(&mut inner, link::BudgetEvent::OwnLink);
+    }
+    let filter = inner.filter_node;
+    if let Some(filter) = filter {
+        let peers: Vec<u32> = removed_edges
+            .iter()
+            .filter(|edge| edge.input_node == filter)
+            .map(|edge| edge.output_node)
+            .collect();
+        for peer in peers {
+            silent_unlink_peer(&mut inner, peer);
+        }
+    }
+    for node_id in removed_port_nodes {
+        revive_peer(&mut inner, node_id);
     }
     if inner.mix_mic_node == Some(id) {
         inner.mix_mic_node = None;
@@ -807,7 +833,7 @@ fn note_remove(shared: &LoopShared, id: u32) {
 
 fn note_info(shared: &LoopShared, id: u32, props: &[(String, String)]) {
     let mut inner = shared.inner.borrow_mut();
-    let mut graph = false;
+    let mut peer_port = None;
     if let Some(node) = inner.nodes.get_mut(&id) {
         let bound = NodeIdentity::from_props(props.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         node.identity.merge_bind(&bound);
@@ -827,22 +853,23 @@ fn note_info(shared: &LoopShared, id: u32, props: &[(String, String)]) {
     }
     if let Some(port) = inner.ports.get_mut(&id) {
         let parsed = port_from_props(id, props);
+        let mut changed = false;
         if port.node_id == 0 {
             port.node_id = parsed.node_id;
             if parsed.node_id != 0 {
-                graph = true;
+                changed = true;
             }
         }
         if port.port_id.is_none() {
             port.port_id = parsed.port_id;
             if parsed.port_id.is_some() {
-                graph = true;
+                changed = true;
             }
         }
         if port.direction.is_empty() {
             port.direction = parsed.direction;
             if !port.direction.is_empty() {
-                graph = true;
+                changed = true;
             }
         }
         if port.name.is_empty() {
@@ -851,18 +878,21 @@ fn note_info(shared: &LoopShared, id: u32, props: &[(String, String)]) {
         if port.channel.is_empty() {
             port.channel = parsed.channel;
             if !port.channel.is_empty() {
-                graph = true;
+                changed = true;
             }
         }
+        if changed {
+            peer_port = Some(port.node_id);
+        }
+    }
+    if let Some(node_id) = peer_port {
+        revive_peer(&mut inner, node_id);
     }
     if let Some(edge) = edge_from_props(props)
         && let std::collections::hash_map::Entry::Vacant(slot) = inner.edges.entry(id)
     {
         slot.insert(edge);
-        graph = true;
-    }
-    if graph {
-        inner.graph_changed = true;
+        note_budget_event(&mut inner, link::BudgetEvent::OwnLink);
     }
 }
 
@@ -873,7 +903,8 @@ fn fail_tap(tap: &mut Tap, peer: u32) {
         &mut tap.saw_edges,
         &mut tap.tries,
         &mut tap.wait,
-    ) {
+    ) && link::claim_stop_log(&mut tap.stop_logged)
+    {
         eprintln!("omamix: tap for node {peer} stopped retrying");
     }
 }
@@ -1097,13 +1128,6 @@ fn bind_one(shared: &Rc<LoopShared>, global: &GlobalObject<PropertiesBox>) {
 }
 
 fn reconcile(shared: &Rc<LoopShared>, filter: &Rc<RefCell<Option<MixFilter>>>) {
-    {
-        let mut inner = shared.inner.borrow_mut();
-        if inner.graph_changed {
-            inner.graph_changed = false;
-            revive_exhausted_taps(&mut inner);
-        }
-    }
     let peers = {
         let inner = shared.inner.borrow();
         if inner.own.is_none() || inner.mix_mic_node.is_none() || inner.filter_node.is_none() {
@@ -1320,6 +1344,8 @@ fn ensure_tap(shared: &Rc<LoopShared>, filter: &Rc<RefCell<Option<MixFilter>>>, 
             link_keys: Vec::new(),
             tries: 0,
             wait: 0,
+            revivals: 0,
+            stop_logged: false,
         });
         match result {
             Ok(slot) => tap.slot = Some(slot),
@@ -1347,6 +1373,8 @@ fn ensure_tap(shared: &Rc<LoopShared>, filter: &Rc<RefCell<Option<MixFilter>>>, 
             link_keys: Vec::new(),
             tries: 0,
             wait: 0,
+            revivals: 0,
+            stop_logged: false,
         });
         tap.phase = phase;
         if tap.linked || tap.phase != LinkPhase::Linking {
@@ -1681,13 +1709,59 @@ fn retire_ports(shared: &LoopShared, filter: &RefCell<Option<MixFilter>>) {
             engine.remove_tap_ports(slot);
         }
     }
-    revive_exhausted_taps(&mut shared.inner.borrow_mut());
+    note_budget_event(&mut shared.inner.borrow_mut(), link::BudgetEvent::SlotFreed);
 }
 
-fn revive_exhausted_taps(inner: &mut LoopInner) {
+fn note_budget_event(inner: &mut LoopInner, event: link::BudgetEvent) {
     for tap in inner.taps.values_mut() {
-        let _ =
-            link::revive_exhausted(tap.phase, &mut tap.tries, &mut tap.wait, &mut tap.saw_edges);
+        let _ = link::apply_budget_event(
+            event,
+            tap.phase,
+            &mut tap.tries,
+            &mut tap.wait,
+            &mut tap.saw_edges,
+            &mut tap.revivals,
+        );
+    }
+}
+
+fn revive_peer(inner: &mut LoopInner, node_id: u32) {
+    if node_id == 0 || inner.filter_node == Some(node_id) || inner.mix_mic_node == Some(node_id) {
+        return;
+    }
+    if let Some(tap) = inner.taps.get_mut(&node_id) {
+        let _ = link::apply_budget_event(
+            link::BudgetEvent::PeerPortsChanged,
+            tap.phase,
+            &mut tap.tries,
+            &mut tap.wait,
+            &mut tap.saw_edges,
+            &mut tap.revivals,
+        );
+    }
+}
+
+fn silent_unlink_peer(inner: &mut LoopInner, peer: u32) {
+    let keys = {
+        let Some(tap) = inner.taps.get_mut(&peer) else {
+            return;
+        };
+        if !link::note_silent_unlink(
+            &mut tap.phase,
+            &mut tap.linked,
+            &mut tap.saw_edges,
+            &mut tap.tries,
+            &mut tap.wait,
+        ) {
+            return;
+        }
+        if tap.tries >= link::RETRY_LIMIT && link::claim_stop_log(&mut tap.stop_logged) {
+            eprintln!("omamix: tap for node {peer} stopped retrying");
+        }
+        std::mem::take(&mut tap.link_keys)
+    };
+    for key in keys {
+        inner.links.remove(&key);
     }
 }
 
@@ -1892,10 +1966,21 @@ fn relink_if_edges_gone(shared: &LoopShared, peer: u32) {
         let Some(tap) = inner.taps.get_mut(&peer) else {
             return;
         };
-        if !link::observe_edges(&mut tap.linked, &mut tap.saw_edges, &mut tap.phase, count) {
+        if !link::observe_edges(
+            &mut tap.linked,
+            &mut tap.saw_edges,
+            &mut tap.phase,
+            &mut tap.tries,
+            &mut tap.wait,
+            count,
+        ) {
             return;
         }
-        eprintln!("omamix: tap link for node {peer} went away; linking it again");
+        if tap.tries >= link::RETRY_LIMIT && link::claim_stop_log(&mut tap.stop_logged) {
+            eprintln!("omamix: tap for node {peer} stopped retrying");
+        } else if tap.tries < link::RETRY_LIMIT {
+            eprintln!("omamix: tap link for node {peer} went away; linking it again");
+        }
         std::mem::take(&mut tap.link_keys)
     };
     for key in keys {
