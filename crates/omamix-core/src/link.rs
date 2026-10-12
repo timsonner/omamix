@@ -172,13 +172,15 @@ pub fn arm_retry(tries: &mut u8, wait: &mut u8) {
 
 /// A link that reached active or paused spends the failure budget.
 ///
-/// The revival cap is part of that budget, so a later slot free or a change
-/// to this peer's ports can revive the tap again. The once-per-peer stop log
-/// is left set.
-pub fn note_tap_success(tries: &mut u8, wait: &mut u8, revivals: &mut u8) {
+/// The revival cap and the slow-relink count are part of that budget, so a
+/// later slot free or a change to this peer's ports can revive the tap again,
+/// and the next removal starts the relink count over. The once-per-peer stop
+/// log is left set.
+pub fn note_tap_success(tries: &mut u8, wait: &mut u8, revivals: &mut u8, relinks: &mut u8) {
     *tries = 0;
     *wait = 0;
     *revivals = 0;
+    *relinks = 0;
 }
 
 /// Record a failed link call.
@@ -294,8 +296,8 @@ fn note_relink(seen: bool, wait: &mut u8, relinks: &mut u8) {
 ///
 /// `linked` becomes false so the tap counts as unlinked. The existing failure
 /// budget decides whether another attempt is allowed. `relinks` grows when
-/// the registry had already shown the link, and it is not cleared by a later
-/// success. The bool is true when the link proxies should be dropped.
+/// the registry had already shown the link. A later success clears that
+/// count. The bool is true when the link proxies should be dropped.
 pub fn note_silent_unlink(
     phase: &mut LinkPhase,
     linked: &mut bool,
@@ -510,10 +512,11 @@ mod tests {
         phase = LinkPhase::Linking;
         linked = true;
         let mut revivals = REVIVE_LIMIT;
-        note_tap_success(&mut tries, &mut wait, &mut revivals);
+        let mut relinks = RELINK_SLOW_AFTER + 1;
+        note_tap_success(&mut tries, &mut wait, &mut revivals, &mut relinks);
         assert_eq!(
-            (phase, tries, wait, revivals),
-            (LinkPhase::Linking, 0, 0, 0)
+            (phase, tries, wait, revivals, relinks),
+            (LinkPhase::Linking, 0, 0, 0, 0)
         );
 
         assert!(!fail_budget(
@@ -965,10 +968,21 @@ mod tests {
         assert!(wait >= RELINK_SLOW_WAIT);
         assert_eq!(relinks, RELINK_SLOW_AFTER + 1);
         let mut revivals = 3;
-        note_tap_success(&mut tries, &mut wait, &mut revivals);
-        assert_eq!(
-            (tries, wait, revivals, relinks),
-            (0, 0, 0, RELINK_SLOW_AFTER + 1)
-        );
+        note_tap_success(&mut tries, &mut wait, &mut revivals, &mut relinks);
+        assert_eq!((tries, wait, revivals, relinks), (0, 0, 0, 0));
+
+        phase = LinkPhase::Linked;
+        linked = true;
+        saw_edges = true;
+        assert!(note_silent_unlink(
+            &mut phase,
+            &mut linked,
+            &mut saw_edges,
+            &mut tries,
+            &mut wait,
+            &mut relinks
+        ));
+        assert!(wait < RELINK_SLOW_WAIT);
+        assert_eq!(relinks, 1);
     }
 }

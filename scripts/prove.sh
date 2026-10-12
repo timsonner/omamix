@@ -3,9 +3,11 @@
 # Execute this file. Do not source it.
 #
 # No verbose daemon flags. Stdout and stderr go to files under the private
-# root. Daemons are children of this script, not service-manager units, and
-# nothing is written to the journal. Pidfiles live under the private root and
-# are never printed.
+# root. Daemons are children of this script, not service-manager units.
+# PIPEWIRE_LOG_SYSTEMD=false is set before those daemons start, and
+# PIPEWIRE_DEBUG and WIREPLUMBER_DEBUG are unset, so even warnings go to the
+# private log files and nothing is written to the journal. Pidfiles live under
+# the private root and are never printed.
 # trap cleanup EXIT INT TERM tears the daemons down on success, failure, and
 # Ctrl-C. After cleanup, pgrep -f reports a count, not pids.
 
@@ -24,15 +26,25 @@ set -o pipefail
 set -m
 
 OMAMIX_REPO=$(cd "$(dirname "$0")/.." && pwd)
-cd "$OMAMIX_REPO"
+cd "$OMAMIX_REPO" || exit 1
 
 OMAMIX_REAL_HOME=${HOME:?}
 OMAMIX_REAL_RUNTIME=${XDG_RUNTIME_DIR:?}
 OMAMIX_CLEANED=0
 OMAMIX_PRIVATE_ROOT=
+OMAMIX_WPCTL_BEFORE=0
+
+drop_wpctl_snapshots() {
+  rm -f -- \
+    /tmp/omamix-wpctl-before.txt \
+    /tmp/omamix-wpctl-after.txt \
+    /tmp/omamix-wpctl-before.norm \
+    /tmp/omamix-wpctl-after.norm
+}
 
 die() {
   echo "$1" >&2
+  drop_wpctl_snapshots
   cleanup
   trap - EXIT INT TERM
   exit 1
@@ -90,7 +102,8 @@ cleanup() {
 
   unset XDG_RUNTIME_DIR XDG_CONFIG_HOME XDG_STATE_HOME XDG_DATA_HOME \
     PIPEWIRE_REMOTE PIPEWIRE_RUNTIME_DIR PULSE_RUNTIME_PATH PULSE_SERVER \
-    DBUS_SESSION_BUS_ADDRESS || true
+    DBUS_SESSION_BUS_ADDRESS PIPEWIRE_LOG_SYSTEMD \
+    PIPEWIRE_DEBUG WIREPLUMBER_DEBUG || true
   export HOME=$OMAMIX_REAL_HOME
   export XDG_RUNTIME_DIR=$OMAMIX_REAL_RUNTIME
 
@@ -110,7 +123,21 @@ cleanup() {
   fi
 
   # The bracket keeps pgrep's own command line from matching the path.
-  escaped=$(printf '%s' "$root" | sed 's/[].[*^$()+?{|\\]/\\&/g')
+  # Escape regex metacharacters without a single-quoted sed expression.
+  escaped=$root
+  escaped=${escaped//\\/\\\\}
+  escaped=${escaped//./\\.}
+  escaped=${escaped//\*/\\*}
+  escaped=${escaped//\[/\\[}
+  escaped=${escaped//\]/\\]}
+  escaped=${escaped//\^/\\^}
+  escaped=${escaped//\$/\\$}
+  escaped=${escaped//\(/\\(}
+  escaped=${escaped//\)/\\)}
+  escaped=${escaped//+/\\+}
+  escaped=${escaped//\?/\\?}
+  escaped=${escaped//\{/\\\{}
+  escaped=${escaped//\|/\\|}
   pattern="[${escaped:0:1}]${escaped:1}"
   cmd_count=$(pgrep -f -c "$pattern" 2>/dev/null || true)
   cmd_count=${cmd_count:-0}
@@ -140,10 +167,12 @@ if [ ! -x "$OMAMIX_REPO/target/debug/omamix" ]; then
   die "prebuilt omamix binary is missing"
 fi
 
-env -u PIPEWIRE_REMOTE -u PIPEWIRE_RUNTIME_DIR -u PULSE_RUNTIME_PATH \
+if env -u PIPEWIRE_REMOTE -u PIPEWIRE_RUNTIME_DIR -u PULSE_RUNTIME_PATH \
   XDG_RUNTIME_DIR="$OMAMIX_REAL_RUNTIME" \
   HOME="$OMAMIX_REAL_HOME" \
-  wpctl status > /tmp/omamix-wpctl-before.txt
+  wpctl status > /tmp/omamix-wpctl-before.txt; then
+  OMAMIX_WPCTL_BEFORE=1
+fi
 {
   stat -c '%n %Y' \
     "$OMAMIX_REAL_HOME/.config/wireplumber" \
@@ -191,7 +220,9 @@ export XDG_CONFIG_HOME="$OMAMIX_PRIVATE_ROOT/config"
 export XDG_STATE_HOME="$OMAMIX_PRIVATE_ROOT/state"
 export XDG_DATA_HOME="$OMAMIX_PRIVATE_ROOT/data"
 export HOME="$OMAMIX_PRIVATE_ROOT/home"
-unset PIPEWIRE_REMOTE PIPEWIRE_RUNTIME_DIR PULSE_RUNTIME_PATH || true
+unset PIPEWIRE_REMOTE PIPEWIRE_RUNTIME_DIR PULSE_RUNTIME_PATH \
+  PIPEWIRE_DEBUG WIREPLUMBER_DEBUG || true
+export PIPEWIRE_LOG_SYSTEMD=false
 
 case "${XDG_RUNTIME_DIR:?}" in
   /run/user | /run/user/*) die "refusing a runtime under /run/user" ;;
@@ -228,6 +259,16 @@ start_bg() {
   disown "$pid" 2>/dev/null || true
 }
 
+daemon_alive() {
+  local name=$1
+  local pidfile=$OMAMIX_PRIVATE_ROOT/run/${name}.pid
+  local pid
+  [ -f "$pidfile" ] || return 1
+  pid=$(cat "$pidfile" 2>/dev/null || true)
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
 start_bg dbus \
   dbus-daemon --session --nofork --nopidfile --address "unix:path=${dbus_socket}"
 export DBUS_SESSION_BUS_ADDRESS="unix:path=${dbus_socket}"
@@ -260,13 +301,20 @@ if [ -S "${XDG_RUNTIME_DIR:?}/pipewire-0" ]; then
   die "refusing pipewire-0 in the private runtime"
 fi
 
-start_bg wireplumber \
-  env PIPEWIRE_REMOTE="${XDG_RUNTIME_DIR}/omamix-private-0" \
-  wireplumber -p omamix-private
+if ! command -v wireplumber >/dev/null 2>&1; then
+  echo "private wireplumber did not start"
+else
+  start_bg wireplumber \
+    env PIPEWIRE_REMOTE="${XDG_RUNTIME_DIR}/omamix-private-0" \
+    wireplumber -p omamix-private
 
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  sleep 0.2
-done
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.2
+  done
+  if ! daemon_alive wireplumber; then
+    echo "private wireplumber did not start"
+  fi
+fi
 
 start_bg pulse \
   env PIPEWIRE_REMOTE="${XDG_RUNTIME_DIR}/omamix-private-0" \
@@ -524,30 +572,20 @@ PY
 record_tone pw-record || die "pw-record did not capture 440 Hz"
 record_tone parecord || die "parecord did not capture 440 Hz"
 
-XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:?}" \
-  HOME="${HOME:?}" \
-  pactl --server "unix:${XDG_RUNTIME_DIR:?}/pulse/omamix-private-pulse" info \
+pactl --server "unix:${XDG_RUNTIME_DIR:?}/pulse/omamix-private-pulse" info \
   > "$OMAMIX_PRIVATE_ROOT/log/pactl-info.txt"
 
-XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:?}" \
-  HOME="${HOME:?}" \
-  pw-dump -N -r "${XDG_RUNTIME_DIR:?}/omamix-private-0" \
+pw-dump -N -r "${XDG_RUNTIME_DIR:?}/omamix-private-0" \
   > "$OMAMIX_PRIVATE_ROOT/out/private-dump.json"
 
-meta=$(
-  XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:?}" \
-    HOME="${HOME:?}" \
-    pw-metadata -r "${XDG_RUNTIME_DIR:?}/omamix-private-0" -n default
-)
+meta=$(pw-metadata -r "${XDG_RUNTIME_DIR:?}/omamix-private-0" -n default)
 printf '%s\n' "$meta" | grep -q 'default.audio.sink' || die "default.audio.sink missing"
 printf '%s\n' "$meta" | grep -q 'default.audio.source' || die "default.audio.source missing"
 printf '%s\n' "$meta" | grep -q 'default.configured' && die "default.configured was present before the warning check"
 
 # After the captures: point the private default at Mix Mic. omamix removes
 # that node and logs the warning. This stays on the private socket.
-XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:?}" \
-  HOME="${HOME:?}" \
-  pw-metadata -r "${XDG_RUNTIME_DIR:?}/omamix-private-0" \
+pw-metadata -r "${XDG_RUNTIME_DIR:?}/omamix-private-0" \
   -n default 0 default.audio.source '{ "name": "omamix.mix-mic" }' \
   >"$OMAMIX_PRIVATE_ROOT/log/metadata-set.txt" 2>&1
 
@@ -594,10 +632,6 @@ PY
 cleanup || die "private-root processes remained after cleanup"
 trap - EXIT INT TERM
 
-env -u PIPEWIRE_REMOTE -u PIPEWIRE_RUNTIME_DIR -u PULSE_RUNTIME_PATH \
-  XDG_RUNTIME_DIR="$OMAMIX_REAL_RUNTIME" \
-  HOME="$OMAMIX_REAL_HOME" \
-  wpctl status > /tmp/omamix-wpctl-after.txt
 {
   stat -c '%n %Y' \
     "$OMAMIX_REAL_HOME/.config/wireplumber" \
@@ -612,19 +646,33 @@ env -u PIPEWIRE_REMOTE -u PIPEWIRE_RUNTIME_DIR -u PULSE_RUNTIME_PATH \
 
 # Each wpctl status is a new client, so that one line's id and pid change
 # every run. Compare the rest of the login session. Do not print the status.
-sed -E '/^[[:space:]]*[0-9]+\. wpctl[[:space:]]/d; s/pid:[0-9]+/pid:PID/g' \
-  /tmp/omamix-wpctl-before.txt > /tmp/omamix-wpctl-before.norm
-sed -E '/^[[:space:]]*[0-9]+\. wpctl[[:space:]]/d; s/pid:[0-9]+/pid:PID/g' \
-  /tmp/omamix-wpctl-after.txt > /tmp/omamix-wpctl-after.norm
-if ! cmp -s /tmp/omamix-wpctl-before.norm /tmp/omamix-wpctl-after.norm; then
-  die "wpctl status changed"
+# A missing or failing wpctl is not a match. Drop the snapshots afterwards
+# because the status text can carry a device serial.
+if [ "$OMAMIX_WPCTL_BEFORE" = 1 ] \
+  && env -u PIPEWIRE_REMOTE -u PIPEWIRE_RUNTIME_DIR -u PULSE_RUNTIME_PATH \
+    XDG_RUNTIME_DIR="$OMAMIX_REAL_RUNTIME" \
+    HOME="$OMAMIX_REAL_HOME" \
+    wpctl status > /tmp/omamix-wpctl-after.txt
+then
+  sed -E '/^[[:space:]]*[0-9]+\. wpctl[[:space:]]/d; s/pid:[0-9]+/pid:PID/g' \
+    /tmp/omamix-wpctl-before.txt > /tmp/omamix-wpctl-before.norm
+  sed -E '/^[[:space:]]*[0-9]+\. wpctl[[:space:]]/d; s/pid:[0-9]+/pid:PID/g' \
+    /tmp/omamix-wpctl-after.txt > /tmp/omamix-wpctl-after.norm
+  if ! cmp -s /tmp/omamix-wpctl-before.norm /tmp/omamix-wpctl-after.norm; then
+    drop_wpctl_snapshots
+    die "wpctl status changed"
+  fi
+  drop_wpctl_snapshots
+  echo "wpctl status unchanged"
+else
+  drop_wpctl_snapshots
+  echo "live graph not compared"
 fi
 if ! cmp -s /tmp/omamix-stat-before.txt /tmp/omamix-stat-after.txt; then
   echo "stat after:" >&2
   cat /tmp/omamix-stat-after.txt >&2
   die "wireplumber or pipewire config mtime changed"
 fi
-echo "wpctl status unchanged"
 echo "stat after:"
 stat -c '%n %Y' \
   "$OMAMIX_REAL_HOME/.config/wireplumber" \

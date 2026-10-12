@@ -300,7 +300,7 @@ mod tests {
             1,
             "mic",
             SourceKind::CaptureDevice {
-                node_name: "x2u".into(),
+                node_name: "ExampleMic".into(),
             },
         );
         strip.set_input_gain_db(48.0);
@@ -315,7 +315,7 @@ mod tests {
             1,
             "mic",
             SourceKind::CaptureDevice {
-                node_name: "x2u".into(),
+                node_name: "ExampleMic".into(),
             },
         );
         strip.set_input_gain_db(f32::NAN);

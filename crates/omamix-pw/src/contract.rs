@@ -230,7 +230,7 @@ mod tests {
             1,
             "mic",
             SourceKind::CaptureDevice {
-                node_name: "x2u".into(),
+                node_name: "ExampleMic".into(),
             },
         ));
         scene.strips[0].monitor_headphones = true;

@@ -238,6 +238,24 @@ mod tests {
     }
 
     #[test]
+    fn scanner_skips_only_the_procedure_script() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        assert!(is_private_procedure(&root.join("scripts/prove.sh")));
+        assert!(!is_private_procedure(&root.join("scripts/unplug-watch.sh")));
+        assert!(!is_private_procedure(
+            &root.join("crates/omamix-core/src/prove.sh")
+        ));
+
+        let dir = std::env::temp_dir().join(format!("omamix-scan-{}", std::process::id()));
+        let nested = dir.join("scripts");
+        std::fs::create_dir_all(&nested).expect("fixture dir");
+        let other = nested.join("prove.sh");
+        std::fs::write(&other, "#!/bin/bash\n").expect("fixture");
+        assert!(!is_private_procedure(&other));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn scanner_catches_alias_link_join_and_split_format() {
         let alias = word(&[
             117, 115, 101, 32, 115, 116, 100, 58, 58, 112, 114, 111, 99, 101, 115, 115, 58, 58, 67,
@@ -377,6 +395,50 @@ mod tests {
             121, 112, 114, 34, 59, 10, 120, 46, 106, 111, 105, 110, 40, 87, 80, 41, 10,
         ]);
         assert!(scan_text("evil.rs", &const_join).contains(&"config-dir"));
+
+        let one_const = word(&[
+            99, 111, 110, 115, 116, 32, 68, 58, 32, 38, 115, 116, 114, 32, 61, 32, 34, 119, 105,
+            114, 101, 112, 108, 117, 109, 98, 101, 114, 34, 59, 10, 112, 46, 106, 111, 105, 110,
+            40, 68, 41, 10,
+        ]);
+        assert!(scan_text("evil.rs", &one_const).contains(&"config-dir"));
+
+        let one_let = word(&[
+            108, 101, 116, 32, 68, 58, 32, 38, 115, 116, 114, 32, 61, 32, 34, 112, 105, 112, 101,
+            119, 105, 114, 101, 34, 59, 10, 112, 46, 106, 111, 105, 110, 40, 68, 41, 10,
+        ]);
+        assert!(scan_text("evil.rs", &one_let).contains(&"config-dir"));
+
+        let const_push = word(&[
+            99, 111, 110, 115, 116, 32, 68, 58, 32, 38, 115, 116, 114, 32, 61, 32, 34, 104, 121,
+            112, 114, 34, 59, 10, 112, 46, 112, 117, 115, 104, 40, 68, 41, 10,
+        ]);
+        assert!(scan_text("evil.rs", &const_push).contains(&"config-dir"));
+
+        let mut split_at = word(&[
+            99, 111, 110, 115, 116, 32, 68, 58, 32, 38, 115, 116, 114, 32, 61, 32, 34, 119, 105,
+            114, 101, 112, 108, 117, 109, 98, 101, 114, 34, 59, 10,
+        ]);
+        let raw_end = 7 + 80;
+        while split_at.len() < raw_end - 1 {
+            split_at.push(' ');
+        }
+        split_at.push('\u{2212}');
+        assert!(
+            !split_at.is_char_boundary(raw_end),
+            "fixture must straddle a byte index"
+        );
+        split_at.push('\n');
+        split_at.push_str(&word(&[112, 46, 106, 111, 105, 110, 40, 68, 41, 10]));
+        assert!(scan_text("evil.rs", &split_at).contains(&"config-dir"));
+
+        let mut mid_window = String::new();
+        mid_window.push('\u{2212}');
+        mid_window.push_str(&"b".repeat(78));
+        mid_window.push_str(&word(&[46, 106, 111, 105, 110, 40]));
+        mid_window.push_str(&"a".repeat(239));
+        mid_window.push('\u{2212}');
+        let _ = scan_text("boundary.rs", &mid_window);
 
         let vfork_call = word(&[
             108, 105, 98, 99, 58, 58, 118, 102, 111, 114, 107, 40, 41, 10,
@@ -573,9 +635,7 @@ mod tests {
         let mut start = 0;
         while let Some(found) = text[start..].find(&join) {
             let at = start + found;
-            let from = at.saturating_sub(80);
-            let to = (at + 160).min(text.len());
-            let window = &text[from..to];
+            let window = slice_window(text, at.saturating_sub(80), at + 160);
             if window.contains(&config) && dirs.iter().any(|dir| window.contains(dir)) {
                 return true;
             }
@@ -644,13 +704,20 @@ mod tests {
     fn const_join(text: &str, config_wp: &str, config_pw: &str, config_hypr: &str) -> bool {
         let dirs = config_dirs(config_wp, config_pw, config_hypr);
         let join = word(&[46, 106, 111, 105, 110, 40]);
+        let push = word(&[46, 112, 117, 115, 104, 40]);
         let path_join = word(&[80, 97, 116, 104, 58, 58, 106, 111, 105, 110, 40]);
-        const_arg_names_dir(text, &join, &dirs) || const_arg_names_dir(text, &path_join, &dirs)
+        const_arg_names_dir(text, &join, &dirs)
+            || const_arg_names_dir(text, &push, &dirs)
+            || const_arg_names_dir(text, &path_join, &dirs)
     }
 
     fn call_args(after: &str) -> &str {
         let mut depth = 1;
+        let mut limit = 0;
         for (i, c) in after.char_indices() {
+            if i >= 240 {
+                break;
+            }
             match c {
                 '(' => depth += 1,
                 ')' => {
@@ -661,11 +728,16 @@ mod tests {
                 }
                 _ => {}
             }
-            if i > 240 {
-                break;
-            }
+            limit = i + c.len_utf8();
         }
-        &after[..after.len().min(240)]
+        &after[..limit.min(after.len())]
+    }
+
+    fn slice_window(text: &str, from: usize, to: usize) -> &str {
+        let end = to.min(text.len());
+        let start = text.floor_char_boundary(from.min(end));
+        let end = text.ceil_char_boundary(end);
+        &text[start..end]
     }
 
     fn invocation_names_dir(text: &str, marker: &str, dirs: &[&str]) -> bool {
@@ -704,19 +776,25 @@ mod tests {
     }
 
     fn ident_holds_dir(text: &str, ident: &str, dirs: &[&str]) -> bool {
-        if ident.len() < 2 || ident.chars().all(|c| c.is_ascii_digit()) {
+        if ident.is_empty() || ident.chars().all(|c| c.is_ascii_digit()) {
             return false;
         }
         for prefix in ["const ", "let ", "static "] {
             let mut rest = text;
             let marker = format!("{prefix}{ident}");
             while let Some(at) = rest.find(&marker) {
-                let to = (at + marker.len() + 80).min(rest.len());
-                let slice = &rest[at..to];
-                if dirs.iter().any(|dir| slice.contains(&format!("\"{dir}"))) {
-                    return true;
+                let after = at + marker.len();
+                let boundary_ok = match rest[after..].chars().next() {
+                    Some(c) => !c.is_ascii_alphanumeric() && c != '_',
+                    None => true,
+                };
+                if boundary_ok {
+                    let slice = slice_window(rest, at, after + 80);
+                    if dirs.iter().any(|dir| slice.contains(&format!("\"{dir}"))) {
+                        return true;
+                    }
                 }
-                rest = &rest[at + marker.len()..];
+                rest = &rest[after..];
             }
         }
         false
@@ -870,9 +948,8 @@ mod tests {
         let mut start = 0;
         while let Some(found) = text[start..].find(set_dash) {
             let at = start + found;
-            let from = at.saturating_sub(48);
-            let to = (at + set_dash.len() + 48).min(text.len());
-            if text[from..to].contains(default_word) {
+            let window = slice_window(text, at.saturating_sub(48), at + set_dash.len() + 48);
+            if window.contains(default_word) {
                 return true;
             }
             start = at + set_dash.len();
@@ -903,9 +980,9 @@ mod tests {
                     continue;
                 }
                 collect(&path, out);
-            } else if path.file_name().is_some_and(|name| name == "prove.sh") {
+            } else if is_private_procedure(&path) {
                 // The private procedure links and writes the private default.
-                // Every other file stays in the product scan.
+                // Every other file, including another prove.sh, stays in the scan.
             } else if matches!(
                 path.extension().and_then(|ext| ext.to_str()),
                 Some("rs") | Some("sh") | Some("toml")
@@ -913,5 +990,15 @@ mod tests {
                 out.push(path);
             }
         }
+    }
+
+    fn is_private_procedure(path: &Path) -> bool {
+        let Ok(procedure) = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/prove.sh")
+            .canonicalize()
+        else {
+            return false;
+        };
+        path.canonicalize().ok().as_ref() == Some(&procedure)
     }
 }
