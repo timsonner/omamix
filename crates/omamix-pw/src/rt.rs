@@ -1,7 +1,8 @@
 //! Boundary between the UI thread and the PipeWire loop thread.
 //!
 //! The UI may [`CommandSender::submit`]. The loop thread drains the queue
-//! outside `process()`. `process()` writes [`AtomicMeter`] and reads
+//! outside `process()`. `process()` writes the master [`AtomicMeter`] and the
+//! per-strip [`omamix_core::params::StripMeterBank`], and it reads
 //! [`AtomicParams`]. It does not receive on this channel. This module does
 //! not start that thread and does not open a client.
 
@@ -9,7 +10,7 @@ use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU32, Ordering, fence};
 use std::sync::mpsc::{self, Receiver, Sender};
 
-use omamix_core::db::{self, BelowMin};
+use omamix_core::db;
 use omamix_core::fader;
 use omamix_core::params::StripParamUpdate;
 
@@ -82,45 +83,12 @@ impl Default for CommandQueue {
     }
 }
 
-/// Peak and RMS in dB, published without a mutex.
-#[derive(Debug)]
-pub struct AtomicMeter {
-    peak_bits: AtomicU32,
-    rms_bits: AtomicU32,
-}
-
-impl AtomicMeter {
-    pub fn new() -> Self {
-        Self {
-            peak_bits: AtomicU32::new(f32::NEG_INFINITY.to_bits()),
-            rms_bits: AtomicU32::new(f32::NEG_INFINITY.to_bits()),
-        }
-    }
-
-    pub fn store(&self, peak_db: f32, rms_db: f32) {
-        self.peak_bits
-            .store(meter_db(peak_db).to_bits(), Ordering::Relaxed);
-        self.rms_bits
-            .store(meter_db(rms_db).to_bits(), Ordering::Relaxed);
-    }
-
-    pub fn load(&self) -> (f32, f32) {
-        (
-            f32::from_bits(self.peak_bits.load(Ordering::Relaxed)),
-            f32::from_bits(self.rms_bits.load(Ordering::Relaxed)),
-        )
-    }
-}
-
-impl Default for AtomicMeter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn meter_db(db: f32) -> f32 {
-    db::sanitize_db(db, f32::NEG_INFINITY, db::MAX_BOOST_DB, BelowMin::Clamp)
-}
+/// Master block peak and RMS in dBFS, published without a mutex.
+///
+/// This is [`omamix_core::meter::BlockMeter`]. Per-strip meters use the same
+/// cell inside [`omamix_core::params::StripMeterBank`]. The callback stores
+/// the block. Hold and decay are [`omamix_core::meter::MeterDisplay`].
+pub use omamix_core::meter::BlockMeter as AtomicMeter;
 
 /// Fader and trim the realtime callback is allowed to read.
 ///

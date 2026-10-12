@@ -157,12 +157,14 @@ pub fn balance_gains(pan: f32) -> (f32, f32) {
     ((1.0 - pan).min(1.0), (1.0 + pan).min(1.0))
 }
 
-/// Equal-power pan for a mono source. −1 is hard left, 0 is center, +1 is hard right.
+/// Equal-power pan formula. The mix does not call this.
 ///
 /// Angle is `(pan + 1) * pi/4`, left is `cos`, right is `sin`. Center is
-/// equal power (about −3 dB each side) and `L² + R² = 1`. Stereo strips do
-/// not use this. A stereo strip at center must stay at unity, and this law
-/// would cut each side by about 3 dB. [`balance_gains`] is the strip law.
+/// about −3 dB each side and `L² + R² = 1`. Stereo strips use
+/// [`balance_gains`], which is unity at center. A mono source is copied onto
+/// both sides of a stereo tap and uses that same balance law. This formula
+/// stays for a later mono strip that does not exist yet. Do not wire it to
+/// a stereo tap: center would cut the level.
 pub fn constant_power_gains(pan: f32) -> (f32, f32) {
     let pan = pan.clamp(-1.0, 1.0);
     let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
@@ -217,10 +219,12 @@ mod tests {
     }
 
     #[test]
-    fn center_pan_is_equal_power() {
+    fn equal_power_formula_is_unused_and_is_not_unity_at_center() {
         let (left, right) = constant_power_gains(0.0);
         assert!((left - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-5);
         assert!((right - left).abs() < 1e-5);
+        // The strip law is unity here. This formula must not replace it.
+        assert!((balance_gains(0.0).0 - left).abs() > 0.2);
         let (hard_left, hard_left_right) = constant_power_gains(-1.0);
         assert!((hard_left - 1.0).abs() < 1e-5);
         assert!(hard_left_right.abs() < 1e-5);

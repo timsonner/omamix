@@ -9,6 +9,7 @@ pub mod fader;
 pub mod graph;
 pub mod link;
 pub mod metadata;
+pub mod meter;
 pub mod params;
 pub mod route;
 

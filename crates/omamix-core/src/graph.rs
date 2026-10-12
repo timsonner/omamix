@@ -27,8 +27,8 @@ pub struct Strip {
     pub solo: bool,
     pub pan: f32,
     pub input_gain_db: f32,
-    /// False bypasses the strip. A bypassed strip is silent, and its solo
-    /// flag does not silence the other strips.
+    /// False makes the strip silent. A silent strip's solo flag does not
+    /// silence the other strips.
     pub enabled: bool,
     /// Hear this strip in the headphones without requiring it on the virtual mic.
     pub monitor_headphones: bool,
@@ -301,9 +301,9 @@ mod tests {
     #[test]
     fn a_disabled_solo_does_not_silence_other_strips() {
         let mut scene = Scene::empty("t");
-        let mut bypassed = app_strip(1, "mic", true, false);
-        bypassed.enabled = false;
-        scene.strips.push(bypassed);
+        let mut disabled = app_strip(1, "mic", true, false);
+        disabled.enabled = false;
+        scene.strips.push(disabled);
         scene.strips.push(app_strip(2, "mpv", false, false));
         assert!(!scene.any_solo());
         let names: Vec<_> = scene
