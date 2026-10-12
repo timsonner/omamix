@@ -156,9 +156,9 @@ The take is digital silence (peak −90.3 dBFS, one 16-bit count) plus a few 1-L
 
 ## Speech level, example on XPS15-OMARCHY
 
-MEASURED by Tim, 2026-10-11, on XPS15-OMARCHY. Tim raised that machine's hardware gain dial and spoke. Speech peaked at **−14.4 dBFS** with no clipping. This is that machine's baseline and an example. It is not a default and not a target. No code uses it as a gain. Each input fader starts at 0 dB so the user can set the level. The master linear gain starts at 1.0, which is 0 dB, not a boost toward this measurement. Input trim still spans ±24 dB when a scene needs it.
+UNVERIFIED. Tim reported, on 2026-10-11, on XPS15-OMARCHY, that he raised that machine's hardware gain dial and that speech peaked at **−14.4 dBFS** with no clipping. The command for that take is not in this file, so the number is his report, not a checked measurement. It is that machine's reported baseline and an example. It is not a default and not a target. No code uses it as a gain. Each input fader starts at 0 dB so the user sets the level. The master linear gain starts at 1.0, which is 0 dB. Input trim still spans ±24 dB when a scene needs it.
 
-The earlier silent take was the hardware dial turned down, not a missing software boost. The command for that silent take is in the section above. This file does not repeat Tim's command for the speech take.
+The earlier silent take was the hardware dial turned down, not a missing software boost. The command for that silent take is in the section above.
 
 ## What could not be verified
 
