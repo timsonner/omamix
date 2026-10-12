@@ -125,9 +125,14 @@ pub fn arm_retry(tries: &mut u8, wait: &mut u8) {
 }
 
 /// A link that reached active or paused spends the failure budget.
-pub fn note_tap_success(tries: &mut u8, wait: &mut u8) {
+///
+/// The revival cap is part of that budget, so a later slot free or a change
+/// to this peer's ports can revive the tap again. The once-per-peer stop log
+/// is left set.
+pub fn note_tap_success(tries: &mut u8, wait: &mut u8, revivals: &mut u8) {
     *tries = 0;
     *wait = 0;
+    *revivals = 0;
 }
 
 /// Record a failed link call.
@@ -441,8 +446,12 @@ mod tests {
         ));
         phase = LinkPhase::Linking;
         linked = true;
-        note_tap_success(&mut tries, &mut wait);
-        assert_eq!((phase, tries, wait), (LinkPhase::Linking, 0, 0));
+        let mut revivals = REVIVE_LIMIT;
+        note_tap_success(&mut tries, &mut wait, &mut revivals);
+        assert_eq!(
+            (phase, tries, wait, revivals),
+            (LinkPhase::Linking, 0, 0, 0)
+        );
 
         assert!(!fail_budget(
             &mut phase,

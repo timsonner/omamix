@@ -971,7 +971,7 @@ fn note_link_state(shared: &LoopShared, key: u64, active: bool, error: bool) {
             std::mem::take(&mut tap.link_keys)
         } else if active && tap.phase == LinkPhase::Linking {
             tap.phase = link::advance_link(LinkPhase::Linking, true);
-            link::note_tap_success(&mut tap.tries, &mut tap.wait);
+            link::note_tap_success(&mut tap.tries, &mut tap.wait, &mut tap.revivals);
             Vec::new()
         } else {
             Vec::new()
