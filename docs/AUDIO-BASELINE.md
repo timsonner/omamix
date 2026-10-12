@@ -1,4 +1,4 @@
-# Audio baseline — XPS15-OMARCHY
+# Audio baseline: XPS15-OMARCHY
 
 Read-only inspection on 2026-10-11, about 01:23–01:30 America/Denver (MDT). Host `XPS15-OMARCHY`. Defaults, volumes, mutes, and config files were not changed. There was no persistent graph change (`pw-record` briefly linked to the Shure X2u capture ports; that link ended when the process exited).
 

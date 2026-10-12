@@ -1,4 +1,4 @@
-# omamix — PipeWire live mixer with a virtual mic
+# omamix: PipeWire live mixer with a virtual mic
 
 Requested by Tim, 2026-10-11 ~1:08 AM MT, via Kit. Owner: Coda (Software Dev). Language: Rust (Tim's pick).
 Target: Tim's XPS15-OMARCHY (Arch-based Omarchy, Hyprland/Wayland, PipeWire + WirePlumber, pipewire-pulse). Local dev and test on that laptop.
