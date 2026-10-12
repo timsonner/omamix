@@ -11,7 +11,12 @@ use std::ptr::{self, NonNull};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
-use omamix_core::params::{StripBlockInput, StripMeterBank, StripMixer, StripParamBank};
+use omamix_core::params::{
+    STRIP_SLOT_COUNT, StripBlockInput, StripMeterBank, StripMixer, StripParamBank,
+};
+use omamix_core::scope::{
+    SCOPE_FRAMES, ScopeBank, ScopeConsumer, ScopeProducer, ScopeReadBank, ScopeWatch, split,
+};
 use pipewire as pw;
 use pw::properties::PropertiesBox;
 use pw::sys as pw_sys;
@@ -161,8 +166,92 @@ impl RtMixer {
 // One data-loop mutator and no concurrent reader makes sharing the cell sound.
 unsafe impl Sync for RtMixer {}
 
+/// Scope rings shared with `process()`.
+///
+/// Each ring is one producer and one consumer. Those handles are `Send` and
+/// not shared, so they sit in separate cells. The data loop is the only
+/// mutator of the producer cells. The reader is the only mutator of the
+/// consumer cells. A discard and the dropped-frame count go through
+/// [`ScopeWatch`], which is an atomic and may be used from either thread.
+struct RtScopes {
+    writers: UnsafeCell<ScopeBank>,
+    /// Kept so the strip reader is not dropped. The UI pop is not wired yet.
+    #[allow(dead_code)]
+    readers: UnsafeCell<ScopeReadBank>,
+    master_writer: UnsafeCell<ScopeProducer>,
+    /// Kept so the master reader is not dropped. The UI pop is not wired yet.
+    #[allow(dead_code)]
+    master_reader: UnsafeCell<ScopeConsumer>,
+    watches: [ScopeWatch; STRIP_SLOT_COUNT],
+    /// Dropped-frame count for the UI. Nothing reads it on the audio thread.
+    #[allow(dead_code)]
+    master_watch: ScopeWatch,
+}
+
+impl RtScopes {
+    fn new() -> Self {
+        let (writers, readers, watches) = ScopeBank::open(SCOPE_FRAMES);
+        let (master_writer, master_reader, master_watch) = split(SCOPE_FRAMES);
+        Self {
+            writers: UnsafeCell::new(writers),
+            readers: UnsafeCell::new(readers),
+            master_writer: UnsafeCell::new(master_writer),
+            master_reader: UnsafeCell::new(master_reader),
+            watches,
+            master_watch,
+        }
+    }
+
+    fn request_discard(&self, slot: usize) {
+        if let Some(watch) = self.watches.get(slot) {
+            watch.request_discard();
+        }
+    }
+
+    fn writers(&self) -> *mut ScopeBank {
+        self.writers.get()
+    }
+
+    #[cfg(test)]
+    fn push_strip(&self, slot: usize, left: &[f32], right: &[f32]) -> usize {
+        // Safety: `RtScopes`'s Sync bound is one data-loop writer. This call
+        // is that writer, or a test that does not share the cell.
+        unsafe { (*self.writers.get()).push(slot, left, right) }
+    }
+
+    #[cfg(test)]
+    fn pop_strip(&self, slot: usize, left: &mut [f32], right: &mut [f32]) -> usize {
+        // Safety: one reader pops a strip ring. It does not alias the writer cell.
+        unsafe { (*self.readers.get()).pop(slot, left, right) }
+    }
+
+    fn push_master(&self, left: &[f32], right: &[f32]) -> usize {
+        // Safety: same data-loop writer as `push_strip`.
+        unsafe { (*self.master_writer.get()).push(left, right) }
+    }
+
+    #[cfg(test)]
+    fn pop_master(&self, left: &mut [f32], right: &mut [f32]) -> usize {
+        // Safety: one reader pops the master ring. It does not alias the writer cell.
+        unsafe { (*self.master_reader.get()).pop(left, right) }
+    }
+
+    #[cfg(test)]
+    fn master_dropped_frames(&self) -> u64 {
+        self.master_watch.dropped_frames()
+    }
+}
+
+// SAFETY: producer cells are mutated only on the data loop (`process`).
+// Consumer cells are mutated only by the thread that pops them. The two
+// cells do not alias, and a producer is not shared, so two threads cannot
+// both call `push`. `prepare_tap_slot` stores the discard flag on the watch
+// and does not touch either cell.
+unsafe impl Sync for RtScopes {}
+
 /// Shared with `process()`. The loop thread writes params and port pointers.
-/// `process()` writes the meters and the monitor slot. No channel receive.
+/// `process()` writes the meters, the scope rings, and the monitor slot.
+/// No channel receive.
 pub struct ProcessShared {
     pub params: AtomicParams,
     /// Per-strip trim, fader, pan, mute, solo, and enable. The loop thread writes.
@@ -173,6 +262,8 @@ pub struct ProcessShared {
     pub meter: AtomicMeter,
     /// Per-strip block peak and RMS, post-fader, before the master fader.
     pub strip_meters: StripMeterBank,
+    /// Post-fader strip rings and the master ring. The writer drops when full.
+    scopes: RtScopes,
     pub slot: MixSlot,
     pub filter: AtomicPtr<c_void>,
     pub node_id: AtomicU32,
@@ -196,6 +287,7 @@ impl ProcessShared {
             mixer: RtMixer::new(48_000),
             meter: AtomicMeter::new(),
             strip_meters: StripMeterBank::new(),
+            scopes: RtScopes::new(),
             slot: MixSlot::new(),
             filter: AtomicPtr::new(ptr::null_mut()),
             node_id: AtomicU32::new(u32::MAX),
@@ -556,6 +648,7 @@ unsafe extern "C" fn clear_tap_slot(
 fn prepare_tap_slot(shared: &ProcessShared, slot: usize) {
     shared.strips.reset_slot(slot);
     shared.strip_meters.reset_slot(slot);
+    shared.scopes.request_discard(slot);
 }
 
 unsafe extern "C" fn on_state(data: *mut c_void, _old: i32, state: i32, _error: *const c_char) {
@@ -654,9 +747,12 @@ fn mix_resolved_strips(
     // Safety: `RtMixer`'s Sync bound is the data-loop mutator. This call is
     // that mutator, or a test that does not share the cell.
     let mixer = unsafe { &mut *shared.mixer.get() };
+    // Safety: same data-loop mutator as the mixer cell.
+    let scopes = unsafe { &mut *shared.scopes.writers() };
     mixer.process(
         &shared.strips,
         &shared.strip_meters,
+        scopes,
         inputs,
         out_l,
         out_r,
@@ -675,6 +771,7 @@ fn mix_resolved_strips(
         }
     }
 
+    shared.scopes.push_master(out_l, out_r);
     let (peak, rms) = omamix_core::meter::block_peak_rms(out_l, out_r);
     shared.meter.store(peak, rms);
 }
@@ -1055,6 +1152,8 @@ mod tests {
         );
         assert!(filter.shared.strips.apply(1, StripParamUpdate::TrimDb(6.0)));
         filter.shared.strip_meters.store(1, -6.0, -12.0);
+        let baked = [0.5f32, -0.25, 0.125];
+        assert_eq!(filter.shared.scopes.push_strip(1, &baked, &baked), 0);
 
         assert!(filter.add_tap_ports(9).is_err());
 
@@ -1073,6 +1172,17 @@ mod tests {
         let (peak, rms) = filter.shared.strip_meters.load(1);
         assert!(peak.is_infinite() && peak.is_sign_negative());
         assert!(rms.is_infinite() && rms.is_sign_negative());
+        let mut scope_l = [1.0f32; 3];
+        let mut scope_r = [1.0f32; 3];
+        assert_eq!(
+            filter
+                .shared
+                .scopes
+                .pop_strip(1, &mut scope_l, &mut scope_r),
+            0
+        );
+        assert_eq!(scope_l, [1.0; 3]);
+        assert_eq!(scope_r, [1.0; 3]);
     }
 
     fn assert_minus_20_sine(peak: f32, rms: f32) {
@@ -1121,6 +1231,16 @@ mod tests {
         assert_minus_20_sine(strip_peak, strip_rms);
         let (peak, rms) = shared.meter.load();
         assert_minus_20_sine(peak, rms);
+        let mut scope_l = vec![0.0f32; frames];
+        let mut scope_r = vec![0.0f32; frames];
+        assert_eq!(
+            shared.scopes.pop_strip(0, &mut scope_l, &mut scope_r),
+            frames
+        );
+        assert_eq!(scope_l, sine);
+        assert_eq!(shared.scopes.pop_master(&mut scope_l, &mut scope_r), frames);
+        assert_eq!(shared.scopes.master_dropped_frames(), 0);
+        assert_eq!(scope_l, sine);
 
         shared.params.set_master_db(-6.0);
         mix_resolved_strips(
@@ -1163,6 +1283,15 @@ mod tests {
         let (strip_peak, strip_rms) = shared.strip_meters.load(0);
         assert!(strip_peak.is_infinite() && strip_peak.is_sign_negative());
         assert!(strip_rms.is_infinite() && strip_rms.is_sign_negative());
+        let mut scope_l = vec![0.0f32; frames];
+        let mut scope_r = vec![0.0f32; frames];
+        assert_eq!(
+            shared.scopes.pop_strip(0, &mut scope_l, &mut scope_r),
+            frames
+        );
+        assert!(scope_l.iter().all(|sample| *sample == 0.0));
+        assert_eq!(shared.scopes.pop_master(&mut scope_l, &mut scope_r), frames);
+        assert!(scope_l.iter().any(|sample| sample.abs() > 0.1));
         let (peak, rms) = shared.meter.load();
         let tone_peak = omamix_core::linear_to_db(0.2);
         assert!(

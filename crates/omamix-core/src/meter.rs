@@ -8,12 +8,16 @@
 //! the reading down. A sine whose peak is −20 dBFS reads about −23 dB RMS,
 //! which is −20 minus 10 log10(2). Non-finite samples are skipped. Silence
 //! is −∞ dB, not 0 dBFS. A block louder than [`crate::db::MAX_BOOST_DB`] is
-//! published at that ceiling, the same cap as a gain.
+//! published at that ceiling, the same cap as a gain. Peak and RMS share one
+//! atomic word, so a reader cannot pair values from two blocks. The sum of
+//! squares is `f64`, so a block around 1e19 does not overflow into silence.
 //!
-//! The hold time and the fall rate below are display constants. They are
-//! not a reading from a meter on any particular machine.
+//! The hold time, the fall rate, and [`METER_BAR_FLOOR_DB`] are display
+//! constants. They are not a reading from a meter on any particular machine.
+//! The engine still publishes −∞ for silence. A later bar draws empty below
+//! that floor. Nothing here clamps to it.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::db::{self, BelowMin};
 
@@ -23,36 +27,42 @@ pub const PEAK_HOLD_SECS: f32 = 1.0;
 /// How fast the displayed peak falls after the hold, in dB per second.
 pub const PEAK_DECAY_DB_PER_SEC: f32 = 20.0;
 
-/// Peak and RMS of one block, in dBFS, published without a mutex.
+/// Lowest dBFS a later meter bar draws. Below this the bar is empty.
+///
+/// About −60 dBFS, chosen for the display. Not a measured noise floor.
+/// [`BlockMeter`] and [`MeterDisplay`] keep publishing −∞ for silence.
+pub const METER_BAR_FLOOR_DB: f32 = -60.0;
+
+const SILENCE_PAIR: u64 = {
+    let bits = f32::NEG_INFINITY.to_bits() as u64;
+    bits | (bits << 32)
+};
+
+/// Peak and RMS of one block, in dBFS, published as one word.
 ///
 /// Starts at silence (−∞ dB). A store sanitizes NaN to silence and +∞ to
-/// [`db::MAX_BOOST_DB`].
+/// [`db::MAX_BOOST_DB`]. One store publishes both numbers.
 #[derive(Debug)]
 pub struct BlockMeter {
-    peak_bits: AtomicU32,
-    rms_bits: AtomicU32,
+    packed: AtomicU64,
 }
 
 impl BlockMeter {
     pub const fn new() -> Self {
         Self {
-            peak_bits: AtomicU32::new(f32::NEG_INFINITY.to_bits()),
-            rms_bits: AtomicU32::new(f32::NEG_INFINITY.to_bits()),
+            packed: AtomicU64::new(SILENCE_PAIR),
         }
     }
 
     pub fn store(&self, peak_db: f32, rms_db: f32) {
-        self.peak_bits
-            .store(sanitize_meter_db(peak_db).to_bits(), Ordering::Relaxed);
-        self.rms_bits
-            .store(sanitize_meter_db(rms_db).to_bits(), Ordering::Relaxed);
+        self.packed.store(
+            pack(sanitize_meter_db(peak_db), sanitize_meter_db(rms_db)),
+            Ordering::Release,
+        );
     }
 
     pub fn load(&self) -> (f32, f32) {
-        (
-            f32::from_bits(self.peak_bits.load(Ordering::Relaxed)),
-            f32::from_bits(self.rms_bits.load(Ordering::Relaxed)),
-        )
+        unpack(self.packed.load(Ordering::Acquire))
     }
 
     pub fn reset(&self) {
@@ -87,12 +97,12 @@ pub fn block_peak_rms(left: &[f32], right: &[f32]) -> (f32, f32) {
 /// this matches [`block_peak_rms`].
 pub(crate) fn levels_from_power(
     peak_l: f32,
-    sum_l: f32,
+    sum_l: f64,
     peak_r: f32,
-    sum_r: f32,
+    sum_r: f64,
     frames: usize,
 ) -> (f32, f32) {
-    let count = frames as f32;
+    let count = frames as f64;
     (
         db::linear_to_db(finite_peak(peak_l).max(finite_peak(peak_r))),
         db::linear_to_db(rms_linear(sum_l, count).max(rms_linear(sum_r, count))),
@@ -101,8 +111,8 @@ pub(crate) fn levels_from_power(
 
 fn channel_peak_rms(samples: &[f32]) -> (f32, f32) {
     let mut peak = 0.0f32;
-    let mut sum = 0.0f32;
-    let mut count = 0.0f32;
+    let mut sum = 0.0f64;
+    let mut count = 0.0f64;
     for sample in samples {
         if !sample.is_finite() {
             continue;
@@ -111,7 +121,7 @@ fn channel_peak_rms(samples: &[f32]) -> (f32, f32) {
         if abs > peak {
             peak = abs;
         }
-        sum += sample * sample;
+        sum += f64::from(*sample) * f64::from(*sample);
         count += 1.0;
     }
     (peak, rms_linear(sum, count))
@@ -125,16 +135,41 @@ fn finite_peak(peak: f32) -> f32 {
     }
 }
 
-fn rms_linear(sum_sq: f32, count: f32) -> f32 {
-    if !(count > 0.0 && sum_sq.is_finite()) {
+fn rms_linear(sum_sq: f64, count: f64) -> f32 {
+    if count <= 0.0 {
+        return 0.0;
+    }
+    // A non-finite sum is an overflowed loud block, not silence.
+    if !sum_sq.is_finite() {
+        return f32::INFINITY;
+    }
+    if sum_sq <= 0.0 {
         return 0.0;
     }
     let mean = sum_sq / count;
-    if mean > 0.0 && mean.is_finite() {
-        mean.sqrt()
-    } else {
-        0.0
+    if !mean.is_finite() {
+        return f32::INFINITY;
     }
+    if mean <= 0.0 {
+        return 0.0;
+    }
+    let rms = mean.sqrt();
+    if rms.is_finite() {
+        rms as f32
+    } else {
+        f32::INFINITY
+    }
+}
+
+fn pack(peak: f32, rms: f32) -> u64 {
+    (peak.to_bits() as u64) | ((rms.to_bits() as u64) << 32)
+}
+
+fn unpack(word: u64) -> (f32, f32) {
+    (
+        f32::from_bits(word as u32),
+        f32::from_bits((word >> 32) as u32),
+    )
 }
 
 fn sanitize_meter_db(db: f32) -> f32 {
@@ -247,6 +282,8 @@ mod tests {
         let (peak, rms) = meter.load();
         assert!(peak.is_infinite() && peak.is_sign_negative());
         assert!(rms.is_infinite() && rms.is_sign_negative());
+        assert_eq!(METER_BAR_FLOOR_DB, -60.0);
+        assert!(peak < METER_BAR_FLOOR_DB);
         meter.store(f32::NAN, f32::INFINITY);
         let (peak, rms) = meter.load();
         assert!(peak.is_infinite() && peak.is_sign_negative());
@@ -289,21 +326,21 @@ mod tests {
         let right = [-0.1f32, 0.0, 0.25, -0.5, 0.05];
         let mut peak_l = 0.0f32;
         let mut peak_r = 0.0f32;
-        let mut sum_l = 0.0f32;
-        let mut sum_r = 0.0f32;
+        let mut sum_l = 0.0f64;
+        let mut sum_r = 0.0f64;
         for sample in left {
             let abs = sample.abs();
             if abs > peak_l {
                 peak_l = abs;
             }
-            sum_l += sample * sample;
+            sum_l += f64::from(sample) * f64::from(sample);
         }
         for sample in right {
             let abs = sample.abs();
             if abs > peak_r {
                 peak_r = abs;
             }
-            sum_r += sample * sample;
+            sum_r += f64::from(sample) * f64::from(sample);
         }
         let from_sums = levels_from_power(peak_l, sum_l, peak_r, sum_r, left.len());
         let from_buf = block_peak_rms(&left, &right);
@@ -348,5 +385,53 @@ mod tests {
         stuck.update(-20.0, -23.0, 0.0);
         stuck.update(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NAN);
         near(stuck.peak_db(), -20.0, 1.0e-4);
+    }
+
+    #[test]
+    fn sum_of_squares_around_1e19_does_not_read_as_silence() {
+        let hot = [1.0e19f32; 8];
+        let (peak, rms) = block_peak_rms(&hot, &hot);
+        assert!(peak > 300.0, "{peak}");
+        assert!(rms > 300.0, "{rms}");
+        let meter = BlockMeter::new();
+        meter.store(peak, rms);
+        let (peak, rms) = meter.load();
+        assert_eq!(peak, db::MAX_BOOST_DB);
+        assert_eq!(rms, db::MAX_BOOST_DB);
+    }
+
+    #[test]
+    fn load_never_pairs_peak_and_rms_from_different_blocks() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::thread;
+
+        let meter = Arc::new(BlockMeter::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let meter = Arc::clone(&meter);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                let pairs = [(-20.0f32, -23.0f32), (-6.0, -9.0)];
+                while !stop.load(Ordering::Relaxed) {
+                    for pair in pairs {
+                        meter.store(pair.0, pair.1);
+                    }
+                }
+            })
+        };
+        for _ in 0..50_000 {
+            let (peak, rms) = meter.load();
+            let pair = (peak.to_bits(), rms.to_bits());
+            let silence = (f32::NEG_INFINITY.to_bits(), f32::NEG_INFINITY.to_bits());
+            let low = ((-20.0f32).to_bits(), (-23.0f32).to_bits());
+            let high = ((-6.0f32).to_bits(), (-9.0f32).to_bits());
+            assert!(
+                pair == silence || pair == low || pair == high,
+                "torn snapshot peak {peak} rms {rms}"
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
     }
 }

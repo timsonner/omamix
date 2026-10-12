@@ -87,7 +87,7 @@ impl Default for CommandQueue {
 ///
 /// This is [`omamix_core::meter::BlockMeter`]. Per-strip meters use the same
 /// cell inside [`omamix_core::params::StripMeterBank`]. The callback stores
-/// the block. Hold and decay are [`omamix_core::meter::MeterDisplay`].
+/// the block as one snapshot. Hold and decay are [`omamix_core::meter::MeterDisplay`].
 pub use omamix_core::meter::BlockMeter as AtomicMeter;
 
 /// Fader and trim the realtime callback is allowed to read.

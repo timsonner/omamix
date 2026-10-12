@@ -12,6 +12,7 @@ pub mod metadata;
 pub mod meter;
 pub mod params;
 pub mod route;
+pub mod scope;
 
 #[cfg(test)]
 mod test_alloc;

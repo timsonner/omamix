@@ -34,8 +34,10 @@
 //! +0.0. The value matches. The sign bit of a zero does not.
 //!
 //! Each block publishes that strip's peak and RMS through [`StripMeterBank`].
-//! The callback does not hold or decay those numbers. [`crate::meter::MeterDisplay`]
-//! does, on the UI side.
+//! The sum of squares is `f64`. The callback does not hold or decay those
+//! numbers. [`crate::meter::MeterDisplay`] does, on the UI side. The same
+//! post-fader frames go into [`crate::scope::ScopeBank`]. A full ring drops
+//! the frames that do not fit.
 //!
 //! For a constant input of amplitude `A` and a settled pan, a gain step from
 //! `g0` to `g1` moves each output sample by at most
@@ -50,6 +52,7 @@ use crate::dsp::balance_gains;
 use crate::fader;
 use crate::graph::{INPUT_GAIN_MAX_DB, INPUT_GAIN_MIN_DB};
 use crate::meter::{self, BlockMeter};
+use crate::scope::ScopeBank;
 
 /// One-pole time constant. About 10 ms.
 pub const SMOOTH_TAU_SECS: f32 = 0.010;
@@ -475,13 +478,15 @@ impl StripMixer {
     /// a disabled strip does not silence the others. Atomics are loaded once
     /// here. The one-pole then runs on every sample. No allocation.
     ///
-    /// Each participating slot publishes that block's post-fader peak and RMS.
-    /// An empty block does not publish. The sum starts at +0.0, so a -0.0
-    /// sample is stored as +0.0.
+    /// Each participating slot publishes that block's post-fader peak and RMS
+    /// and pushes those frames into `scopes`. An empty block does not publish.
+    /// The sum starts at +0.0, so a -0.0 sample is stored as +0.0.
+    #[allow(clippy::too_many_arguments)]
     pub fn process(
         &mut self,
         bank: &StripParamBank,
         meters: &StripMeterBank,
+        scopes: &mut ScopeBank,
         inputs: &[Option<StripBlockInput<'_>>],
         out_left: &mut [f32],
         out_right: &mut [f32],
@@ -511,8 +516,12 @@ impl StripMixer {
 
         let mut peak_l = [0.0f32; STRIP_SLOT_COUNT];
         let mut peak_r = [0.0f32; STRIP_SLOT_COUNT];
-        let mut sum_l = [0.0f32; STRIP_SLOT_COUNT];
-        let mut sum_r = [0.0f32; STRIP_SLOT_COUNT];
+        let mut sum_l = [0.0f64; STRIP_SLOT_COUNT];
+        let mut sum_r = [0.0f64; STRIP_SLOT_COUNT];
+        let mut scope_kept = [0usize; STRIP_SLOT_COUNT];
+        for (slot, kept) in scope_kept.iter_mut().enumerate().take(slots) {
+            *kept = scopes.reserve(slot, frames);
+        }
 
         for frame in 0..frames {
             // +0.0. Adding -0.0 yields +0.0, so a negative zero is not kept.
@@ -540,14 +549,18 @@ impl StripMixer {
                 if abs_r > peak_r[slot] {
                     peak_r[slot] = abs_r;
                 }
-                sum_l[slot] += y_l * y_l;
-                sum_r[slot] += y_r * y_r;
+                sum_l[slot] += f64::from(y_l) * f64::from(y_l);
+                sum_r[slot] += f64::from(y_r) * f64::from(y_r);
+                if frame < scope_kept[slot] {
+                    scopes.write_at(slot, frame, y_l, y_r);
+                }
             }
             out_left[frame] = finite_or(left, 0.0);
             out_right[frame] = finite_or(right, 0.0);
         }
 
         for slot in 0..slots {
+            scopes.commit(slot);
             let (peak, rms) = meter::levels_from_power(
                 peak_l[slot],
                 sum_l[slot],
@@ -643,7 +656,16 @@ mod tests {
         let mut left = vec![0.0; frames];
         let mut right = vec![0.0; frames];
         let meters = StripMeterBank::new();
-        mixer.process(bank, &meters, &inputs, &mut left, &mut right, rate);
+        let mut scopes = ScopeBank::with_capacity(4);
+        mixer.process(
+            bank,
+            &meters,
+            &mut scopes,
+            &inputs,
+            &mut left,
+            &mut right,
+            rate,
+        );
         (left, right)
     }
 
@@ -802,6 +824,7 @@ mod tests {
         for rate in [44_100, 48_000] {
             let bank = StripParamBank::new();
             let meters = StripMeterBank::new();
+            let mut scopes = ScopeBank::with_capacity(8);
             let mut mixer = StripMixer::new(rate);
             let inputs = [Some(StripBlockInput {
                 left: &samples_l,
@@ -809,11 +832,27 @@ mod tests {
             })];
             let mut left = [0.0f32; 8];
             let mut right = [0.0f32; 8];
-            mixer.process(&bank, &meters, &inputs, &mut left, &mut right, rate);
+            mixer.process(
+                &bank,
+                &meters,
+                &mut scopes,
+                &inputs,
+                &mut left,
+                &mut right,
+                rate,
+            );
             assert_eq!(left, samples_l);
             assert_eq!(right, samples_r);
             assert_eq!(left[5].to_bits(), 0.0f32.to_bits());
-            mixer.process(&bank, &meters, &inputs, &mut left, &mut right, rate);
+            mixer.process(
+                &bank,
+                &meters,
+                &mut scopes,
+                &inputs,
+                &mut left,
+                &mut right,
+                rate,
+            );
             assert_eq!(left, samples_l);
             assert_eq!(right, samples_r);
             assert_eq!(left[5].to_bits(), 0.0f32.to_bits());
@@ -944,10 +983,27 @@ mod tests {
             let mut left = vec![0.0f32; frames];
             let mut right = vec![0.0f32; frames];
             let meters = StripMeterBank::new();
-            mixer.process(&bank, &meters, &inputs, &mut left, &mut right, rate);
+            let mut scopes = ScopeBank::with_capacity(frames);
+            mixer.process(
+                &bank,
+                &meters,
+                &mut scopes,
+                &inputs,
+                &mut left,
+                &mut right,
+                rate,
+            );
 
             crate::test_alloc::arm();
-            mixer.process(&bank, &meters, &inputs, &mut left, &mut right, rate);
+            mixer.process(
+                &bank,
+                &meters,
+                &mut scopes,
+                &inputs,
+                &mut left,
+                &mut right,
+                rate,
+            );
             let reading = meters.load(0);
             let allocations = crate::test_alloc::disarm();
             let heard = left
@@ -1000,6 +1056,7 @@ mod tests {
             let sine = minus_20_sine(frames);
             let bank = StripParamBank::new();
             let meters = StripMeterBank::new();
+            let mut scopes = ScopeBank::with_capacity(frames);
             let mut mixer = StripMixer::new(rate);
             let inputs = [Some(StripBlockInput {
                 left: sine.as_slice(),
@@ -1007,7 +1064,15 @@ mod tests {
             })];
             let mut left = vec![0.0f32; frames];
             let mut right = vec![0.0f32; frames];
-            mixer.process(&bank, &meters, &inputs, &mut left, &mut right, rate);
+            mixer.process(
+                &bank,
+                &meters,
+                &mut scopes,
+                &inputs,
+                &mut left,
+                &mut right,
+                rate,
+            );
             let (peak, rms) = meters.load(0);
             assert_minus_20_sine(peak, rms);
             let (want_peak, want_rms) = meter::block_peak_rms(&sine, &sine);
@@ -1024,6 +1089,7 @@ mod tests {
         let sine = minus_20_sine(frames);
         let bank = StripParamBank::new();
         let meters = StripMeterBank::new();
+        let mut scopes = ScopeBank::with_capacity(frames);
         let mut mixer = StripMixer::new(48_000);
         let inputs = [Some(StripBlockInput {
             left: sine.as_slice(),
@@ -1031,7 +1097,15 @@ mod tests {
         })];
         let mut left = vec![0.0f32; frames];
         let mut right = vec![0.0f32; frames];
-        mixer.process(&bank, &meters, &inputs, &mut left, &mut right, 48_000);
+        mixer.process(
+            &bank,
+            &meters,
+            &mut scopes,
+            &inputs,
+            &mut left,
+            &mut right,
+            48_000,
+        );
         let (peak, rms) = meters.load(0);
         assert_minus_20_sine(peak, rms);
 
@@ -1043,7 +1117,15 @@ mod tests {
             left: zeros.as_slice(),
             right: zeros.as_slice(),
         })];
-        mixer.process(&bank, &meters, &silent, &mut left, &mut right, 48_000);
+        mixer.process(
+            &bank,
+            &meters,
+            &mut scopes,
+            &silent,
+            &mut left,
+            &mut right,
+            48_000,
+        );
         let (peak, rms) = meters.load(0);
         assert!(peak.is_infinite() && peak.is_sign_negative());
         assert!(rms.is_infinite() && rms.is_sign_negative());
@@ -1058,6 +1140,7 @@ mod tests {
         let bank = StripParamBank::new();
         bank.apply(0, StripParamUpdate::Pan(-1.0));
         let meters = StripMeterBank::new();
+        let mut scopes = ScopeBank::with_capacity(frames);
         let mut mixer = StripMixer::new(48_000);
         mixer.align_to_targets(&bank, 1);
         let inputs = [Some(StripBlockInput {
@@ -1066,7 +1149,15 @@ mod tests {
         })];
         let mut left = vec![0.0f32; frames];
         let mut right = vec![0.0f32; frames];
-        mixer.process(&bank, &meters, &inputs, &mut left, &mut right, 48_000);
+        mixer.process(
+            &bank,
+            &meters,
+            &mut scopes,
+            &inputs,
+            &mut left,
+            &mut right,
+            48_000,
+        );
         let (peak, rms) = meters.load(0);
         assert_minus_20_sine(peak, rms);
         assert!(right.iter().all(|sample| sample.abs() < 1.0e-6));
@@ -1078,6 +1169,7 @@ mod tests {
         let sine = minus_20_sine(frames);
         let bank = StripParamBank::new();
         let meters = StripMeterBank::new();
+        let mut scopes = ScopeBank::with_capacity(frames);
         let mut mixer = StripMixer::new(48_000);
         let inputs = [
             Some(StripBlockInput {
@@ -1091,7 +1183,15 @@ mod tests {
         ];
         let mut left = vec![0.0f32; frames];
         let mut right = vec![0.0f32; frames];
-        mixer.process(&bank, &meters, &inputs, &mut left, &mut right, 48_000);
+        mixer.process(
+            &bank,
+            &meters,
+            &mut scopes,
+            &inputs,
+            &mut left,
+            &mut right,
+            48_000,
+        );
         assert_minus_20_sine(meters.load(0).0, meters.load(0).1);
         assert_minus_20_sine(meters.load(1).0, meters.load(1).1);
         let (master_peak, master_rms) = meter::block_peak_rms(&left, &right);
@@ -1108,6 +1208,7 @@ mod tests {
         let bank = StripParamBank::new();
         bank.apply(0, StripParamUpdate::Enabled(false));
         let meters = StripMeterBank::new();
+        let mut scopes = ScopeBank::with_capacity(frames);
         let mut mixer = StripMixer::new(48_000);
         mixer.align_to_targets(&bank, 1);
         let inputs = [Some(StripBlockInput {
@@ -1116,9 +1217,80 @@ mod tests {
         })];
         let mut left = vec![0.0f32; frames];
         let mut right = vec![0.0f32; frames];
-        mixer.process(&bank, &meters, &inputs, &mut left, &mut right, 48_000);
+        mixer.process(
+            &bank,
+            &meters,
+            &mut scopes,
+            &inputs,
+            &mut left,
+            &mut right,
+            48_000,
+        );
         let (peak, rms) = meters.load(0);
         assert!(peak.is_infinite() && peak.is_sign_negative());
         assert!(rms.is_infinite() && rms.is_sign_negative());
+    }
+
+    #[test]
+    fn extreme_input_rms_does_not_read_as_silence() {
+        let hot = [1.0e19f32; 8];
+        let bank = StripParamBank::new();
+        let meters = StripMeterBank::new();
+        let mut scopes = ScopeBank::with_capacity(8);
+        let mut mixer = StripMixer::new(48_000);
+        let inputs = [Some(StripBlockInput {
+            left: hot.as_slice(),
+            right: hot.as_slice(),
+        })];
+        let mut left = [0.0f32; 8];
+        let mut right = [0.0f32; 8];
+        mixer.process(
+            &bank,
+            &meters,
+            &mut scopes,
+            &inputs,
+            &mut left,
+            &mut right,
+            48_000,
+        );
+        let (peak, rms) = meters.load(0);
+        assert_eq!(peak, db::MAX_BOOST_DB);
+        assert_eq!(rms, db::MAX_BOOST_DB);
+    }
+
+    #[test]
+    fn enabled_strip_meter_is_after_the_fader() {
+        let frames = 480;
+        let sine = minus_20_sine(frames);
+        let bank = StripParamBank::new();
+        assert!(bank.enabled(0));
+        assert!(bank.apply(0, StripParamUpdate::FaderDb(-20.0)));
+        let meters = StripMeterBank::new();
+        let (mut scopes, mut reads, _) = ScopeBank::open(frames);
+        let mut mixer = StripMixer::new(48_000);
+        mixer.align_to_targets(&bank, 1);
+        let inputs = [Some(StripBlockInput {
+            left: sine.as_slice(),
+            right: sine.as_slice(),
+        })];
+        let mut left = vec![0.0f32; frames];
+        let mut right = vec![0.0f32; frames];
+        mixer.process(
+            &bank,
+            &meters,
+            &mut scopes,
+            &inputs,
+            &mut left,
+            &mut right,
+            48_000,
+        );
+        let (peak, rms) = meters.load(0);
+        near(peak, -40.0, 0.1);
+        near(rms, -40.0 - 10.0 * 2.0f32.log10(), 0.1);
+        let gain = db::db_to_linear(-20.0);
+        let mut got = vec![0.0f32; 8];
+        let mut other = vec![0.0f32; 8];
+        assert!(reads.pop(0, &mut got, &mut other) >= 1);
+        near(got[0], sine[0] * gain, 1.0e-5);
     }
 }

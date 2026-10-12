@@ -3,8 +3,8 @@
 //! Every PipeWire object lives on that thread. The control thread sends
 //! [`LoopMsg`] through [`pipewire::channel`], which wakes the loop. A timer
 //! on the same thread drains [`crate::rt::CommandQueue`]. `process()` does
-//! neither: it writes the master [`crate::rt::AtomicMeter`] and the per-strip
-//! meters, reads [`crate::rt::AtomicParams`] and the per-strip
+//! neither: it writes the master [`crate::rt::AtomicMeter`], the per-strip
+//! meters, and the scope rings, reads [`crate::rt::AtomicParams`] and the per-strip
 //! [`omamix_core::params::StripParamBank`], and publishes the master quantum
 //! in [`crate::rt::MixSlot`].
 //!
