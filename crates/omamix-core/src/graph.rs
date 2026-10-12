@@ -27,6 +27,9 @@ pub struct Strip {
     pub solo: bool,
     pub pan: f32,
     pub input_gain_db: f32,
+    /// False bypasses the strip. A bypassed strip is silent, and its solo
+    /// flag does not silence the other strips.
+    pub enabled: bool,
     /// Hear this strip in the headphones without requiring it on the virtual mic.
     pub monitor_headphones: bool,
 }
@@ -42,6 +45,7 @@ impl Strip {
             solo: false,
             pan: 0.0,
             input_gain_db: 0.0,
+            enabled: true,
             monitor_headphones: false,
         }
     }
@@ -52,7 +56,7 @@ impl Strip {
     }
 
     pub fn audible(&self, any_solo: bool) -> bool {
-        if self.mute {
+        if !self.enabled || self.mute {
             return false;
         }
         if any_solo { self.solo } else { true }
@@ -125,7 +129,7 @@ impl Scene {
     }
 
     pub fn any_solo(&self) -> bool {
-        self.strips.iter().any(|strip| strip.solo)
+        self.strips.iter().any(|strip| strip.enabled && strip.solo)
     }
 
     pub fn audible_strips(&self) -> Vec<&Strip> {
@@ -292,6 +296,32 @@ mod tests {
             .map(|s| s.name.as_str())
             .collect();
         assert_eq!(names, ["mic"]);
+    }
+
+    #[test]
+    fn a_disabled_solo_does_not_silence_other_strips() {
+        let mut scene = Scene::empty("t");
+        let mut bypassed = app_strip(1, "mic", true, false);
+        bypassed.enabled = false;
+        scene.strips.push(bypassed);
+        scene.strips.push(app_strip(2, "mpv", false, false));
+        assert!(!scene.any_solo());
+        let names: Vec<_> = scene
+            .audible_strips()
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(names, ["mpv"]);
+        assert!(
+            Strip::new(
+                1,
+                "Strip",
+                SourceKind::CaptureDevice {
+                    node_name: String::new(),
+                },
+            )
+            .enabled
+        );
     }
 
     #[test]

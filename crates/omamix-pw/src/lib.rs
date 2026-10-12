@@ -19,6 +19,8 @@ pub use engine::{HeadlessOptions, run_headless};
 
 use std::fmt;
 
+use omamix_core::params::StripParamBank;
+
 pub use rt::{CommandSender, EngineCommand};
 
 /// What the UI thread is allowed to hold.
@@ -35,6 +37,7 @@ pub trait AudioEngine: Send {
 pub struct NullEngine {
     queue: rt::CommandQueue,
     shut_down: bool,
+    strips: StripParamBank,
 }
 
 impl NullEngine {
@@ -42,6 +45,7 @@ impl NullEngine {
         Self {
             queue: rt::CommandQueue::new(),
             shut_down: false,
+            strips: StripParamBank::new(),
         }
     }
 
@@ -51,6 +55,9 @@ impl NullEngine {
             match command {
                 EngineCommand::Shutdown => self.shut_down = true,
                 EngineCommand::SetMasterFaderDb(_) | EngineCommand::SetMonitorMix(_) => {}
+                EngineCommand::SetStripParam { slot, update } => {
+                    self.strips.apply(slot, update);
+                }
             }
         }
         Ok(())
@@ -58,6 +65,11 @@ impl NullEngine {
 
     pub fn is_shut_down(&self) -> bool {
         self.shut_down
+    }
+
+    /// Parameters applied by [`Self::drive`]. Defaults are neutral.
+    pub fn strips(&self) -> &StripParamBank {
+        &self.strips
     }
 }
 
@@ -98,6 +110,7 @@ impl std::error::Error for EngineError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use omamix_core::params::StripParamUpdate;
 
     #[test]
     fn ui_submit_does_not_run_the_engine_until_drive() {
@@ -108,5 +121,23 @@ mod tests {
         engine.drive().unwrap();
         assert!(engine.is_shut_down());
         engine.drive().unwrap();
+    }
+
+    #[test]
+    fn strip_params_apply_on_drive_not_on_submit() {
+        let mut engine = NullEngine::new();
+        assert!(engine.strips().enabled(1));
+        assert!(!engine.strips().mute(1));
+        engine
+            .command_sender()
+            .submit(EngineCommand::SetStripParam {
+                slot: 1,
+                update: StripParamUpdate::Mute(true),
+            });
+        assert!(!engine.strips().mute(1));
+        engine.drive().unwrap();
+        assert!(engine.strips().mute(1));
+        assert!(engine.strips().enabled(1));
+        assert_eq!(engine.strips().fader_db(1), 0.0);
     }
 }

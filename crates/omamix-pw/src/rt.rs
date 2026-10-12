@@ -11,6 +11,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use omamix_core::db::{self, BelowMin};
 use omamix_core::fader;
+use omamix_core::params::StripParamUpdate;
 
 /// What the UI or the headless CLI is allowed to enqueue.
 ///
@@ -22,6 +23,12 @@ pub enum EngineCommand {
     SetMasterFaderDb(f32),
     /// Publish the monitor playback stream. Off unless the CLI asks.
     SetMonitorMix(bool),
+    /// One strip field. The loop thread stores it in [`omamix_core::params::StripParamBank`].
+    /// `process` does not read this command; it loads the atomics.
+    SetStripParam {
+        slot: u16,
+        update: StripParamUpdate,
+    },
 }
 
 /// Clone of the sending half. Safe to hold on the UI thread.

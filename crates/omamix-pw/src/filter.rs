@@ -5,11 +5,13 @@
 //! adapter. This filter is `omamix.mix-engine`: one `process` callback.
 //! Strip taps are input ports on it. Output ports feed the adapter.
 
+use std::cell::UnsafeCell;
 use std::ffi::{CString, c_char, c_void};
 use std::ptr::{self, NonNull};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
+use omamix_core::params::{StripBlockInput, StripMixer, StripParamBank};
 use pipewire as pw;
 use pw::properties::PropertiesBox;
 use pw::sys as pw_sys;
@@ -65,7 +67,7 @@ struct ClearJob {
     fr: *mut c_void,
 }
 
-pub const MAX_TAP_PORTS: usize = 64;
+pub const MAX_TAP_PORTS: usize = omamix_core::params::STRIP_SLOT_COUNT;
 
 #[repr(C)]
 struct SpaFraction {
@@ -140,10 +142,33 @@ unsafe extern "C" {
     fn pw_filter_get_data_loop(filter: *mut c_void) -> *mut PwLoopHead;
 }
 
+/// Smoother state. Only the data loop (`process` and `clear_tap_slot`) mutates it.
+struct RtMixer(UnsafeCell<StripMixer>);
+
+impl RtMixer {
+    fn new(sample_rate: u32) -> Self {
+        Self(UnsafeCell::new(StripMixer::new(sample_rate)))
+    }
+
+    fn get(&self) -> *mut StripMixer {
+        self.0.get()
+    }
+}
+
+// SAFETY: `StripMixer` is mutated only on the PipeWire data loop, from
+// `process` and from `clear_tap_slot` (a blocking invoke on that same loop).
+// The main loop writes atomics and port pointers and does not read the mixer.
+// One data-loop mutator and no concurrent reader makes sharing the cell sound.
+unsafe impl Sync for RtMixer {}
+
 /// Shared with `process()`. The loop thread writes params and port pointers.
 /// `process()` writes the meter and the monitor slot. No channel receive.
 pub struct ProcessShared {
     pub params: AtomicParams,
+    /// Per-strip trim, fader, pan, mute, solo, and enable. The loop thread writes.
+    pub strips: StripParamBank,
+    /// Smoother state. Only the data loop (`process` and `clear_tap_slot`) touches it.
+    mixer: RtMixer,
     pub meter: AtomicMeter,
     pub slot: MixSlot,
     pub filter: AtomicPtr<c_void>,
@@ -164,6 +189,8 @@ impl ProcessShared {
     fn new() -> Self {
         Self {
             params: AtomicParams::new(),
+            strips: StripParamBank::new(),
+            mixer: RtMixer::new(48_000),
             meter: AtomicMeter::new(),
             slot: MixSlot::new(),
             filter: AtomicPtr::new(ptr::null_mut()),
@@ -278,6 +305,10 @@ impl MixFilter {
                         .is_null()
             })
             .ok_or(())?;
+        // Neutral before either new port pointer is stored. `clear_tap_slot`
+        // already resets on free; a control-thread write after that free must
+        // not ride into the next input.
+        prepare_tap_slot(&self.shared, slot);
         let fl = self.add_port(
             pw::spa::utils::Direction::Input,
             &format!("in-{peer}-FL"),
@@ -467,7 +498,19 @@ unsafe extern "C" fn clear_tap_slot(
         count -= 1;
     }
     shared.input_count.store(count, Ordering::Release);
+    // Same data loop as `process`. Put the slot back to the neutral smoother
+    // and the neutral parameters so the next tap does not inherit a mute.
+    prepare_tap_slot(shared, slot);
+    unsafe { (*shared.mixer.get()).reset_slot(slot) };
     0
+}
+
+/// Neutral strip parameters for a slot that is about to be claimed or was just freed.
+///
+/// Atomics only. The smoother reset stays in `clear_tap_slot`, which runs on
+/// the data loop. `add_tap_ports` calls this before either port pointer is stored.
+fn prepare_tap_slot(shared: &ProcessShared, slot: usize) {
+    shared.strips.reset_slot(slot);
 }
 
 unsafe extern "C" fn on_state(data: *mut c_void, _old: i32, state: i32, _error: *const c_char) {
@@ -512,37 +555,66 @@ fn render(shared: &ProcessShared, position: &SpaIoPosition) {
     let (Some(out_l), Some(out_r)) = (out_l, out_r) else {
         return;
     };
-    out_l.fill(0.0);
-    out_r.fill(0.0);
-
     let taps = shared
         .input_count
         .load(Ordering::Acquire)
         .min(MAX_TAP_PORTS);
+    // Copy the port addresses first. The `&mut` from `dsp_samples` must not
+    // still be live when the mixer borrows `out_l` / `out_r`.
+    let mut ptr_l = [std::ptr::null::<f32>(); MAX_TAP_PORTS];
+    let mut ptr_r = [std::ptr::null::<f32>(); MAX_TAP_PORTS];
     for index in 0..taps {
         let in_l = shared.inputs_fl[index].load(Ordering::Acquire);
         let in_r = shared.inputs_fr[index].load(Ordering::Acquire);
-        if let Some(samples) = dsp_samples(in_l, n) {
-            for (dst, src) in out_l.iter_mut().zip(samples.iter()) {
-                *dst += *src;
-            }
-        }
-        if let Some(samples) = dsp_samples(in_r, n) {
-            for (dst, src) in out_r.iter_mut().zip(samples.iter()) {
-                *dst += *src;
-            }
-        }
+        ptr_l[index] = port_samples(in_l, n);
+        ptr_r[index] = port_samples(in_r, n);
     }
+    let mut inputs = [None; MAX_TAP_PORTS];
+    for index in 0..taps {
+        inputs[index] = Some(StripBlockInput {
+            left: input_view(ptr_l[index], n as usize),
+            right: input_view(ptr_r[index], n as usize),
+        });
+    }
+    mix_resolved_strips(
+        shared,
+        &inputs[..taps],
+        out_l,
+        out_r,
+        n,
+        position.clock.rate.num,
+        position.clock.rate.denom,
+    );
+
+    let frames = (n as usize).min(MIX_SLOT_CAP);
+    shared.slot.write(&out_l[..frames], &out_r[..frames]);
+
+    let (peak, rms) = peak_rms(out_l, out_r);
+    shared.meter.store(peak, rms);
+}
+
+/// Strip mix, optional tone, then the master fader.
+///
+/// `render` calls this after the port pointers are resolved. A default bank
+/// (tone off, master gain 1, neutral strips) leaves a finite stereo block
+/// unchanged. The mixer cell is the data loop's, or a single-threaded test's.
+fn mix_resolved_strips(
+    shared: &ProcessShared,
+    inputs: &[Option<StripBlockInput<'_>>],
+    out_l: &mut [f32],
+    out_r: &mut [f32],
+    n: u32,
+    num: u32,
+    denom: u32,
+) {
+    let rate = negotiated_rate(num, denom);
+    // Safety: `RtMixer`'s Sync bound is the data-loop mutator. This call is
+    // that mutator, or a test that does not share the cell.
+    let mixer = unsafe { &mut *shared.mixer.get() };
+    mixer.process(&shared.strips, inputs, out_l, out_r, rate);
 
     if shared.tone.load(Ordering::Acquire) {
-        write_tone(
-            shared,
-            n,
-            position.clock.rate.num,
-            position.clock.rate.denom,
-            out_l,
-            out_r,
-        );
+        write_tone(shared, n, num, denom, out_l, out_r);
     }
 
     // Unity unless the loop thread published a fader. No hidden mic boost.
@@ -552,12 +624,6 @@ fn render(shared: &ProcessShared, position: &SpaIoPosition) {
             *sample *= gain;
         }
     }
-
-    let frames = (n as usize).min(MIX_SLOT_CAP);
-    shared.slot.write(&out_l[..frames], &out_r[..frames]);
-
-    let (peak, rms) = peak_rms(out_l, out_r);
-    shared.meter.store(peak, rms);
 }
 
 /// One 440 Hz sample at amplitude 0.2, and the next phase in `0.0..1.0`.
@@ -612,6 +678,24 @@ fn write_tone(
         phase = next;
     }
     shared.tone_phase.store(phase.to_bits(), Ordering::Relaxed);
+}
+
+fn port_samples(port: *mut c_void, n: u32) -> *const f32 {
+    match dsp_samples(port, n) {
+        Some(samples) => samples.as_ptr(),
+        None => std::ptr::null(),
+    }
+}
+
+/// View a DSP buffer for this `process` call.
+///
+/// The lifetime is chosen by the caller. `ptr` stays valid until `process` returns.
+fn input_view<'a>(ptr: *const f32, frames: usize) -> &'a [f32] {
+    if ptr.is_null() || frames == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(ptr, frames) }
+    }
 }
 
 fn dsp_samples<'a>(port: *mut c_void, n: u32) -> Option<&'a mut [f32]> {
@@ -831,6 +915,83 @@ mod tests {
         assert_eq!(shared.inputs_fl[0].load(Ordering::Acquire), keep);
         assert_eq!(shared.inputs_fr[1].load(Ordering::Acquire), keep);
         assert_eq!(shared.input_count.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn default_strip_mix_leaves_a_stereo_block_unchanged() {
+        let shared = ProcessShared::new();
+        assert!(!shared.tone.load(Ordering::Acquire));
+        assert_eq!(shared.params.master_linear(), 1.0);
+        let samples_l = [0.1f32, -0.25, 0.5, 1.0, -1.0, 0.0, 0.70710677, -0.003];
+        let samples_r = [-0.1f32, 0.25, -0.5, 0.125, 0.5, -1.0, 0.0, 0.003];
+        let inputs = [Some(StripBlockInput {
+            left: &samples_l,
+            right: &samples_r,
+        })];
+        for rate in [44_100, 48_000] {
+            let mut left = [0.0f32; 8];
+            let mut right = [0.0f32; 8];
+            mix_resolved_strips(&shared, &inputs, &mut left, &mut right, 8, rate, 1);
+            assert_eq!(left, samples_l);
+            assert_eq!(right, samples_r);
+            mix_resolved_strips(&shared, &inputs, &mut left, &mut right, 8, rate, 1);
+            assert_eq!(left, samples_l);
+            assert_eq!(right, samples_r);
+        }
+    }
+
+    #[test]
+    fn claiming_a_tap_slot_resets_inherited_strip_params() {
+        use omamix_core::params::StripParamUpdate;
+        let shared = ProcessShared::new();
+        assert!(shared.strips.apply(3, StripParamUpdate::Mute(true)));
+        assert!(shared.strips.apply(3, StripParamUpdate::Solo(true)));
+        assert!(shared.strips.apply(3, StripParamUpdate::Enabled(false)));
+        assert!(shared.strips.apply(3, StripParamUpdate::Pan(0.4)));
+        assert!(shared.strips.apply(3, StripParamUpdate::FaderDb(-12.0)));
+        assert!(shared.strips.apply(3, StripParamUpdate::TrimDb(6.0)));
+        prepare_tap_slot(&shared, 3);
+        assert!(!shared.strips.mute(3));
+        assert!(!shared.strips.solo(3));
+        assert!(shared.strips.enabled(3));
+        assert_eq!(shared.strips.pan(3), 0.0);
+        assert_eq!(shared.strips.fader_db(3), 0.0);
+        assert_eq!(shared.strips.trim_db(3), 0.0);
+        assert!((shared.strips.target_gain(3, false) - 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn clear_tap_slot_resets_strip_params_with_the_pointers() {
+        use omamix_core::params::StripParamUpdate;
+        let shared = ProcessShared::new();
+        let fl = std::ptr::without_provenance_mut::<c_void>(0x31);
+        let fr = std::ptr::without_provenance_mut::<c_void>(0x32);
+        shared.inputs_fl[1].store(fl, Ordering::Release);
+        shared.inputs_fr[1].store(fr, Ordering::Release);
+        shared.input_count.store(2, Ordering::Release);
+        assert!(shared.strips.apply(1, StripParamUpdate::Mute(true)));
+        assert!(shared.strips.apply(1, StripParamUpdate::Pan(-0.2)));
+        let mut job = ClearJob {
+            shared: &shared,
+            slot: 1,
+            fl: ptr::null_mut(),
+            fr: ptr::null_mut(),
+        };
+        let rc = unsafe {
+            clear_tap_slot(
+                ptr::null_mut(),
+                false,
+                0,
+                ptr::null(),
+                0,
+                (&mut job as *mut ClearJob).cast(),
+            )
+        };
+        assert_eq!(rc, 0);
+        assert!(shared.inputs_fl[1].load(Ordering::Acquire).is_null());
+        assert!(!shared.strips.mute(1));
+        assert_eq!(shared.strips.pan(1), 0.0);
+        assert!(shared.strips.enabled(1));
     }
 
     #[test]

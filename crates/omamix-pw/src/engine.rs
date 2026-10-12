@@ -3,8 +3,9 @@
 //! Every PipeWire object lives on that thread. The control thread sends
 //! [`LoopMsg`] through [`pipewire::channel`], which wakes the loop. A timer
 //! on the same thread drains [`crate::rt::CommandQueue`]. `process()` does
-//! neither: it writes [`crate::rt::AtomicMeter`], reads [`crate::rt::AtomicParams`],
-//! and publishes the master quantum in [`crate::rt::MixSlot`].
+//! neither: it writes [`crate::rt::AtomicMeter`], reads [`crate::rt::AtomicParams`]
+//! and the per-strip [`omamix_core::params::StripParamBank`], and publishes the
+//! master quantum in [`crate::rt::MixSlot`].
 //!
 //! Mix Mic is an adapter node (`media.class` Audio/Source/Virtual,
 //! `node.name` omamix.mix-mic) created with `support.null-audio-sink`. The
@@ -40,6 +41,7 @@ use std::time::{Duration, Instant};
 use omamix_core::graph::Scene;
 use omamix_core::link::{self, LinkPhase, PortEndpoint};
 use omamix_core::metadata::{self, DefaultDeviceObservation};
+use omamix_core::params::StripParamUpdate;
 use omamix_core::route::{
     self, LinkEdge, LoopGraph, MIX_MIC_NODE_NAME, NodeIdentity, NodeRef, OwnClient, PlaybackStream,
     SourceKind,
@@ -78,6 +80,7 @@ enum LoopMsg {
     Shutdown,
     SetMasterFaderDb(f32),
     SetMonitorMix(bool),
+    SetStripParam { slot: u16, update: StripParamUpdate },
 }
 
 fn engine_command_msg(command: EngineCommand) -> LoopMsg {
@@ -85,6 +88,7 @@ fn engine_command_msg(command: EngineCommand) -> LoopMsg {
         EngineCommand::Shutdown => LoopMsg::Shutdown,
         EngineCommand::SetMasterFaderDb(db) => LoopMsg::SetMasterFaderDb(db),
         EngineCommand::SetMonitorMix(on) => LoopMsg::SetMonitorMix(on),
+        EngineCommand::SetStripParam { slot, update } => LoopMsg::SetStripParam { slot, update },
     }
 }
 
@@ -394,6 +398,12 @@ fn apply_loop_msg(
         }
         LoopMsg::SetMonitorMix(on) => {
             monitor_on.store(*on, Ordering::Relaxed);
+            false
+        }
+        LoopMsg::SetStripParam { slot, update } => {
+            if let Some(filter) = filter.borrow().as_ref() {
+                filter.shared().strips.apply(*slot, *update);
+            }
             false
         }
     }

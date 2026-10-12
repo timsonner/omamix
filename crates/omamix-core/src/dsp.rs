@@ -142,7 +142,27 @@ impl DspChain {
     }
 }
 
-/// Constant-power pan. −1 is hard left, 0 is center, +1 is hard right.
+/// Balance pan for a stereo strip. −1 is hard left, 0 is center, +1 is hard right.
+///
+/// Left is `min(1, 1 - pan)` and right is `min(1, 1 + pan)`, after clamping
+/// pan to `-1..=1`. Center is gain 1 on both channels, so a default strip
+/// does not change the level. Neither side goes above 1. A non-finite pan
+/// is center. [`StripMixer`](crate::params::StripMixer) applies this law.
+pub fn balance_gains(pan: f32) -> (f32, f32) {
+    let pan = if pan.is_finite() {
+        pan.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    ((1.0 - pan).min(1.0), (1.0 + pan).min(1.0))
+}
+
+/// Equal-power pan for a mono source. −1 is hard left, 0 is center, +1 is hard right.
+///
+/// Angle is `(pan + 1) * pi/4`, left is `cos`, right is `sin`. Center is
+/// equal power (about −3 dB each side) and `L² + R² = 1`. Stereo strips do
+/// not use this. A stereo strip at center must stay at unity, and this law
+/// would cut each side by about 3 dB. [`balance_gains`] is the strip law.
 pub fn constant_power_gains(pan: f32) -> (f32, f32) {
     let pan = pan.clamp(-1.0, 1.0);
     let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
@@ -179,6 +199,21 @@ mod tests {
         let mut dry = [0.1, -0.2];
         skipped.process(&mut dry, 2);
         assert_eq!(dry, [0.1, -0.2]);
+    }
+
+    #[test]
+    fn balance_pan_is_unity_at_center_and_never_above_one() {
+        assert_eq!(balance_gains(0.0), (1.0, 1.0));
+        assert_eq!(balance_gains(-1.0), (1.0, 0.0));
+        assert_eq!(balance_gains(1.0), (0.0, 1.0));
+        assert_eq!(balance_gains(0.5), (0.5, 1.0));
+        assert_eq!(balance_gains(-0.25), (1.0, 0.75));
+        assert_eq!(balance_gains(f32::NAN), (1.0, 1.0));
+        for pan in [-1.5, -1.0, -0.3, 0.0, 0.3, 1.0, 1.5] {
+            let (left, right) = balance_gains(pan);
+            assert!(left <= 1.0 && right <= 1.0, "{pan}");
+            assert!(left >= 0.0 && right >= 0.0, "{pan}");
+        }
     }
 
     #[test]
