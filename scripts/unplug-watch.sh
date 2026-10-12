@@ -14,11 +14,20 @@ if [ -n "${PIPEWIRE_REMOTE:-}" ]; then
 fi
 
 # Default outside the repo. wpctl status lines can carry a device serial.
+# The default path is a fresh mktemp name, printed once. An argument still
+# selects the log and is not printed.
 if [ -n "${1:-}" ]; then
   out=$1
 else
-  out=/tmp/omamix-unplug-watch.log
+  out=$(mktemp /tmp/omamix-unplug.XXXXXX) || exit 1
+  printf '%s\n' "$out"
 fi
+case "$out" in
+  /tmp/omamix-fixround | /tmp/omamix-fixround/*)
+    echo "refusing /tmp/omamix-fixround" >&2
+    exit 1
+    ;;
+esac
 
 while true; do
   {

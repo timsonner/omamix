@@ -30,11 +30,22 @@ bash scripts/prove.sh
 
 The private socket path on every daemon and client command is the literal `${XDG_RUNTIME_DIR}/omamix-private-0`. The script unsets `PIPEWIRE_REMOTE`, `PIPEWIRE_RUNTIME_DIR`, and `PULSE_RUNTIME_PATH`. It does not load ALSA and it does not open the session that owns the speakers. It does not use tmux.
 
-The private root is a fresh `mktemp -d /tmp/omamix-private.XXXXXX`. The script refuses `/tmp/omamix-fixround` and anything under `/run/user`. It exports the private `XDG_RUNTIME_DIR`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_DATA_HOME`, and `HOME`, and checks that runtime, before it copies any config.
+The private root is a fresh `mktemp -d /tmp/omamix-private.XXXXXX`. Evidence files (daemon logs, recordings, the pactl note, and the private dump) go in a separate fresh `mktemp -d /tmp/omamix-scratch.XXXXXX`. The script refuses `/tmp/omamix-fixround` and anything under `/run/user`. It does not use a fixed `/tmp/omamix-*` name. It exports the private `XDG_RUNTIME_DIR`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_DATA_HOME`, and `HOME`, and checks that runtime, before it copies any config.
 
-Daemons are children of the script. Their stdout and stderr are log files under the private root. The script does not pass `-v` or `-vv`, does not use `systemd-run`, and does not write to the journal. Each pipewire, pipewire-pulse, wireplumber, dbus, and omamix process has a pidfile under the private root. Those pids are not printed. `trap cleanup EXIT INT TERM` tears them down on success, on failure, and on Ctrl-C.
+Daemons are children of the script. Their stdout and stderr are log files under the scratch directory. The script does not pass `-v` or `-vv` and does not use `systemd-run`. `PIPEWIRE_LOG_SYSTEMD=false` is set before those daemons start, so PipeWire's own logger does not write the journal. The committed private pipewire and pipewire-pulse configs set `rtkit.enabled = false`, and the script checks that on the private copies. `DISABLE_RTKIT` is set for the private processes so wireplumber and the clients do not call rtkit-daemon either: they load `libpipewire-module-rt` from the system config, where `rtkit.enabled` defaults to true. rtkit-daemon is a system service. This script does not stop it from logging for other sessions. Each pipewire, pipewire-pulse, wireplumber, dbus, and omamix process has a pidfile under the private root. Those pids are not printed. `trap cleanup EXIT INT TERM HUP` tears the daemons down on success, on failure, on Ctrl-C, on SIGTERM, and on SIGHUP. `cleanup` and those traps remove the scratch directory and the private root. `OMAMIX_KEEP_LOGS=1` copies the logs and recordings to a fresh `/tmp/omamix-keep.XXXXXX` directory and prints that path. Without it, nothing is kept.
 
-After cleanup the script runs `pgrep -f` on the private root and prints a count, not pids. It also counts processes whose environment still contains that path. Both counts must be 0. The login-session check then runs `wpctl status` again with the real runtime, the real home, and with `PIPEWIRE_REMOTE` removed. Each `wpctl status` is a new client, so the comparison ignores that wpctl line. Pass: the rest of the status is unchanged, and the mtimes of `~/.config/wireplumber`, `~/.config/pipewire`, and `~/.local/state/wireplumber` are unchanged. The script prints those `stat` lines. It does not print `wpctl status`.
+The before `wpctl status` and the before config-tree listing stay in shell variables. They are not written to files, so a SIGKILL does not leave a status file or a stat file. The login-session check then runs `wpctl status` again with the real runtime, the real home, and with `PIPEWIRE_REMOTE` removed, and keeps that text in a variable too. Each `wpctl status` is a new client, so the comparison ignores that wpctl line and rewrites pids. The script prints the `stat` lines for `~/.config/wireplumber`, `~/.config/pipewire`, and `~/.local/state/wireplumber`. A missing directory is printed as `absent` plus that path, and the run passes when it is still absent afterward. The run fails if that directory appears or if any listing changes. It does not print `wpctl status`. Existing directories' mtimes must be unchanged. If both `wpctl` commands succeed, the rest of the status must be unchanged. If `wpctl` is missing or fails before or after, the live graph was not compared: that is a gap. A private wireplumber that did not start, or that died before cleanup, is a gap.
+
+Exit codes:
+
+- `0`: `private procedure passed`. No gaps.
+- `3`: `PASSED WITH GAPS:` and the list. The private captures succeeded, and at least one gap was recorded.
+- `1`: a failure. A changed status, a changed mtime, a failed capture, a leftover private process, or a setup error. The script does not print `private procedure passed` or `PASSED WITH GAPS:`.
+- `130`: SIGINT. A terminal Ctrl-C during a foreground step, including `pw-record`, is this code. Monitor mode is on only while a background daemon is spawned, so the Ctrl-C reaches the script. The script does not print `private procedure passed`.
+- `143`: SIGTERM.
+- `129`: SIGHUP.
+
+After cleanup the script runs `pgrep -f` on the private root and prints a count, not pids. It also counts processes whose environment still contains that path. Both counts must be 0.
 
 `--tone` is linked into Mix Mic. Mix Mic configures its own adapter ports at creation (`adapter.auto-port-config` and `node.param.PortConfig` on that node, with monitor outputs), so the ports exist without a session manager. WirePlumber, when it is present, links a recorder that names the source. Without a session manager the ports are still there; the link to `capture_FL` / `capture_FR` has to be created by something else. The recorder stream also stays at PortConfig mode none until that stream gets its own `node.param.PortConfig` (direction Input, mode dsp, with the ports the link will use). `pw-record --target` sets a target name and does not set that PortConfig, and it does not create the link by itself. Its remote flag is `--remote` (`-R`).
 
@@ -48,14 +59,14 @@ After the captures, the script points the private default at Mix Mic with `pw-me
 
 ## Unplug test
 
-Tim runs this once, on the login session, after `scripts/prove.sh` has exited. It is read only. It does not set a default, a volume, or a config file. `scripts/unplug-watch.sh` refuses to start when `PIPEWIRE_REMOTE` is set. It pins the `XDG_RUNTIME_DIR` and `HOME` it is given. Pass: the default source name and the default sink name in the last sample match the first sample, and the mtimes of `~/.config/wireplumber`, `~/.config/pipewire`, and `~/.local/state/wireplumber` are unchanged.
+Tim runs this once, on the login session, after `scripts/prove.sh` has exited. It is read only. It does not set a default, a volume, or a config file. `scripts/unplug-watch.sh` refuses to start when `PIPEWIRE_REMOTE` is set. It pins the `XDG_RUNTIME_DIR` and `HOME` it is given. With no argument it creates a fresh `mktemp` log, prints that path, and appends samples there. An argument still selects the log and is not printed. Pass: the default source name and the default sink name in the last sample match the first sample, and the mtimes of `~/.config/wireplumber`, `~/.config/pipewire`, and `~/.local/state/wireplumber` are unchanged.
 
 ```sh
 env -u PIPEWIRE_REMOTE -u PIPEWIRE_RUNTIME_DIR -u PULSE_RUNTIME_PATH \
-  scripts/unplug-watch.sh /tmp/omamix-unplug-watch.log
+  scripts/unplug-watch.sh
 ```
 
-Leave that running. Unplug the example USB capture device, wait until the log has a new sample, plug it back in, wait for another sample, then stop the script with Ctrl-C. Compare the first and last `default-source` and `default-sink` lines. The log path is outside the repository. `*.log` is gitignored. An example device name is "Shure X2u". That name is not a default and not assumed hardware.
+Leave that running. Unplug the example USB capture device, wait until the log has a new sample, plug it back in, wait for another sample, then stop the script with Ctrl-C. Compare the first and last `default-source` and `default-sink` lines. Delete the log after comparing. The default log path is outside the repository. `*.log` is gitignored. An example device name is "Shure X2u". That name is not a default and not assumed hardware.
 
 ## Definition of done (v1)
 
@@ -64,7 +75,7 @@ Run these on the laptop after the engine and the UI exist. Record the SHA.
 - [ ] **Strips.** Add a USB capture device (an example name is "Shure X2u"), an mpv OST, and a Chromium tab. Set levels. Master limiter on, ceiling −1 dBTP. Device names here are examples, not defaults.
 - [ ] **Chromium getUserMedia.** On a WebRTC mic test page, select **Mix Mic**. The recording contains voice and music at the balance set on the strips. No silence, no doubled music.
 - [ ] **Firefox getUserMedia.** The same WebRTC check in Firefox, with **Mix Mic** selected. Voice and music at the set balance. No silence, no doubled music.
-- [ ] **gpu-screen-recorder default source.** Tim sets the default source to Mix Mic, records, then restores the previous source. Omarchy screen recording via gpu-screen-recorder captures voice and music. UNVERIFIED: this session did not re-run that test. UNVERIFIED: Tim reported that this case failed for `module-remap-source` (silence until the source was named explicitly).
+- [ ] **gpu-screen-recorder default source.** Tim sets the default source to Mix Mic, records, then restores the previous source. Omarchy screen recording via gpu-screen-recorder captures voice and music. UNVERIFIED: this session did not re-run that test, and Tim reported that this case failed for `module-remap-source` (silence until the source was named explicitly).
 - [ ] **OBS.** OBS input set to Mix Mic captures the same balance. No silence, no doubling.
 - [ ] **Loudness.** The master momentary/short-term LUFS and peak agree with `ffmpeg -i <file> -af ebur128 -f null -` within about 1 dB.
 - [ ] **Clean quit.** With `PIPEWIRE_REMOTE` unset, `XDG_RUNTIME_DIR` set to the login runtime, and `HOME` set to the login home, dump nodes and links, quit omamix, and dump again. The diff shows no nodes or links left behind. The default sink and default source are unchanged unless the gsr test above changed the source and the restore step has already run. That dump does not call `pw-metadata`.
