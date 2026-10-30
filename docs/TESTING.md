@@ -86,3 +86,5 @@ Run these on the laptop after the engine and the UI exist. Record the SHA.
 ## Out of scope for the scaffold
 
 No PipeWire nodes are created by the unit tests. Do not point `pw-record`, `pw-link`, or the omamix binary at the default source from CI. The 5 s capture used to write [AUDIO-BASELINE.md](AUDIO-BASELINE.md) was a one-off read of an existing node, targeted by name, and the wav was deleted. `pw-record` briefly linked to that capture node; the link was gone when the process exited. That capture was measured on one machine. It is an example baseline, not a default gain.
+
+This sentence is the deliberate RMM-002 docs-only prove for the pr-house-rules gate.
