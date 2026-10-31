@@ -58,7 +58,7 @@ use crate::scope::ScopeBank;
 pub const SMOOTH_TAU_SECS: f32 = 0.010;
 
 /// Slots in the mix engine. Matches the filter's tap table.
-pub const STRIP_SLOT_COUNT: usize = 64;
+pub const STRIP_SLOT_COUNT: usize = 38;
 
 const FLAG_MUTE: u32 = 1 << 0;
 const FLAG_SOLO: u32 = 1 << 1;
@@ -746,6 +746,21 @@ mod tests {
         assert!(bank.enabled(0));
         near(bank.target_gain(0, false), 1.0, 1.0e-6);
         assert!(!bank.apply(u16::MAX, StripParamUpdate::Mute(true)));
+    }
+
+    // Slot 38 is the first index past a 38-slot table. A 64-slot bank accepts
+    // this apply, so the test fails on the old count. A clamp onto slot 37
+    // would clear the mute already stored there.
+    #[test]
+    fn a_slot_past_37_is_rejected() {
+        let bank = StripParamBank::new();
+        assert!(bank.apply(37, StripParamUpdate::Mute(true)));
+        assert!(bank.mute(37));
+        assert!(!bank.apply(38, StripParamUpdate::Mute(false)));
+        assert!(bank.mute(37));
+        assert!(!bank.mute(38));
+        bank.reset_slot(38);
+        assert!(bank.mute(37));
     }
 
     #[test]
