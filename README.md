@@ -1,59 +1,92 @@
 # omamix
 
-PipeWire live mixer for Omarchy. It will take a mic and per-app playback, set levels and processing, and publish one virtual microphone other apps can record.
+omamix is a PipeWire live mixer (version 0.1.0) for combining a capture device and per-app playback into one virtual microphone, Mix Mic, that other programs can record. The window is pre-alpha: it draws one placeholder strip and does not publish that node. A build with `--features pipewire`, run as `omamix --headless --mix-mic`, publishes Mix Mic (`media.class` `Audio/Source/Virtual`, `node.name` `omamix.mix-mic`, `priority.session` 1) and removes it on exit. If that name is the default source, including a choice already stored at startup, omamix destroys the node. If the default source cannot be read, Mix Mic is not published.
 
-**Status: pre-alpha.** The window is a placeholder strip and does not publish a virtual mic. With `--features pipewire`, `omamix --headless --mix-mic` publishes Mix Mic (`Audio/Source/Virtual`, `node.name` `omamix.mix-mic`, `priority.session` 1) and removes it on exit. It watches the default metadata and leaves it in place; if Mix Mic is that source, including when that choice is already stored at startup, it destroys the Mix Mic node right away. If the default source cannot be read, Mix Mic is not published. `--headless` without `--mix-mic` does not open a client. The master fader starts at unity (0 dB). Strip trim and fader start at 0 dB, pan at center, with mute and solo off and the strip enabled. Center pan is a balance law: both channels stay at gain 1, so a default stereo strip does not change the level, and neither side goes above 1. A 10 ms one-pole in `omamix-core` ramps a later step so it does not click. A disabled strip is silent, and its solo flag does not silence the other strips. That is not a guess about the microphone. The user sets each input. Each strip and the master publish the peak and the RMS of the block in dBFS, as one snapshot. A sine at −20 dBFS reads −20 peak and about −23 RMS. Silence stays −∞. A later meter bar draws empty below about −60 dBFS, and the callback does not clamp to that. The UI holds and decays the peak. The audio callback does not. Each strip and the master also push post-fader samples into a ring that drops when it is full and does not block. Levels, routing keys, the fader wheel rule, and the meters have unit tests. Those tests do not connect to PipeWire.
+## Prerequisites
 
-## Build
+- Rust **1.95** or newer. [`rust-toolchain.toml`](rust-toolchain.toml) selects the 1.95 channel, and `rust-version` is 1.95 because eframe 0.36 requires it. Edition 2024 itself needs 1.85.
+- A display for the window. On X11 the process loads `libxkbcommon-x11.so.0` before the window opens. It also loads Wayland, libxkbcommon, and EGL (`libEGL.so.1`).
+- For `--features pipewire`: `pkg-config`, clang, libclang, and **libpipewire >= 1.2** (`pkg-config --atleast-version=1.2 libpipewire-0.3`). pipewire-rs 0.10 with feature `v1_2_0` fails on libspa 1.0.x. [`crates/omamix-pw/build.rs`](crates/omamix-pw/build.rs) runs that check. Ubuntu 24.04 apt ships `libpipewire-0.3-dev` 1.0.5, which is too old. `cargo test --workspace` leaves the feature off, so it needs neither the library nor a running daemon.
 
-Rust **1.95 or newer** (`rust-toolchain.toml` selects the 1.95 channel, any 1.95.x; edition 2024 itself needs 1.85, and eframe 0.36 requires 1.95). This machine is on 1.99.0 (MEASURED: `rustc --version`), which still builds. libpipewire **>= 1.2** is required for `--features pipewire`. pipewire-rs 0.10 with feature `v1_2_0` fails on 1.0.x with E0425 (`spa_meta_sync_timeline`). Ubuntu 24.04's apt package is libpipewire 1.0.5, which is too old. `crates/omamix-pw/build.rs` runs `$PKG_CONFIG` (or `pkg-config`) `--atleast-version=1.2 libpipewire-0.3` and stops with that explanation. CI (`.github/workflows/ci.yml`) runs fmt, clippy, and tests with the default features only, for that Ubuntu package reason.
+Arch:
 
-From the repo root:
+```sh
+sudo pacman -S rustup clang pkgconf pipewire libpipewire wayland libxkbcommon libxkbcommon-x11 mesa
+```
+
+Debian/Ubuntu (install `libpipewire-0.3-dev` only when that package is >= 1.2):
+
+```sh
+sudo apt install clang libclang-dev pkg-config libwayland-dev libxkbcommon-dev libxkbcommon-x11-0 libegl1 libgl1-mesa-dev
+```
+
+## Build, test, and run
+
+From the repo root. These match [`.github/workflows/ci.yml`](.github/workflows/ci.yml), plus the local window:
 
 ```sh
 cargo test --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
 cargo build -p omamix
-cargo build -p omamix --features pipewire
-cargo test -p omamix-pw --features pipewire
-cargo test -p omamix --features pipewire
+cargo run -p omamix
 ```
 
-`cargo test --workspace` does not enable the `pipewire` feature, so it does not need a running daemon or libpipewire.
-
-Build dependencies for the PipeWire feature and the egui binary:
-
-| | Packages |
-| --- | --- |
-| Arch | `rustup` (or `rust`), `clang`, `pkgconf`, `pipewire`, `libpipewire` (>= 1.2), `wayland`, `libxkbcommon`, `mesa` |
-| Debian/Ubuntu | rustup for rustc >= 1.95, plus `clang`, `libclang-dev`, `pkg-config`, `libpipewire-0.3-dev` (>= 1.2; Ubuntu 24.04 apt is 1.0.5 and is too old), `libwayland-dev`, `libxkbcommon-dev`, `libgl1-mesa-dev` |
-
-Arch example: `sudo pacman -S rustup clang pkgconf pipewire libpipewire wayland libxkbcommon mesa`
-
-Debian/Ubuntu example: `sudo apt install clang libclang-dev pkg-config libpipewire-0.3-dev libwayland-dev libxkbcommon-dev libgl1-mesa-dev`
-
-Run the window locally with `cargo run -p omamix`. That path does not publish Mix Mic.
-
-Headless, on a machine with libpipewire >= 1.2, until SIGINT or SIGTERM:
+`cargo run -p omamix` opens the window. It does not publish Mix Mic. `--help` exits before any window:
 
 ```sh
+cargo run -p omamix -- --help
+```
+
+With libpipewire >= 1.2:
+
+```sh
+cargo test -p omamix-pw --features pipewire
+cargo test -p omamix --features pipewire
+cargo build -p omamix --features pipewire
 cargo run -p omamix --features pipewire -- --headless --mix-mic
 ```
 
-`--duration 2` stops it after two seconds. `--strips other`, `--strips device:<node.name>`, `--strips app:<application.name>:<binary>`, and `--monitor-mix` are optional. UI checks are Tim's; the agent does not launch the window.
+Those feature tests build a local `pw_properties` object. They do not connect to a daemon. [`scripts/prove.sh`](scripts/prove.sh) is the private-socket check (execute it; do not source it). It builds with `--features pipewire --offline`, so fetch dependencies first, and it needs PipeWire, WirePlumber, pipewire-pulse, `pw-record`, and `parecord`:
 
-## Dev machine
+```sh
+bash scripts/prove.sh
+```
 
-XPS15-OMARCHY: Arch-based Omarchy, Hyprland/Wayland, PipeWire 1.6.8 + WirePlumber 0.5.17 + pipewire-pulse. Measured levels and the graph are in [docs/AUDIO-BASELINE.md](docs/AUDIO-BASELINE.md). Do not change the default sink or source, Easy Effects (if it is installed again), Hyprland binds, or WirePlumber/PipeWire config from an agent session.
+The Arch package is `omamix-git` ([`PKGBUILD`](PKGBUILD)). `build` runs `cargo build --frozen --release -p omamix --features pipewire` and `package` installs `/usr/bin/omamix`.
 
-## Docs
+## Usage
 
-- [docs/SPEC.md](docs/SPEC.md): product spec
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): UI toolkit, PipeWire approach, what this machine has installed
-- [docs/TESTING.md](docs/TESTING.md): v1 definition of done
-- [docs/AUDIO-BASELINE.md](docs/AUDIO-BASELINE.md): read-only measurement of this laptop's audio graph
+```text
+omamix [--headless] [--mix-mic] [--duration SECS] [--monitor-mix] [--tone]
+       [--strips other] [--strips device:NODE] [--strips app:NAME:BINARY]
+```
 
-Packaging is `omamix-git` (`PKGBUILD` in the repo). It `provides` and `conflicts` with `omamix`. It lists Arch repository packages only, no AUR dependencies. `source` is the unpinned Origin git URL (`sha256sums` is `SKIP`, and `pkgver()` follows HEAD). A clean chroot clone of that URL needs credentials. `prepare` runs `cargo fetch --locked`. `build` runs `cargo build --frozen --release -p omamix --features pipewire`. `check` runs `cargo test --frozen --workspace`. `package` installs `/usr/bin/omamix`. Runtime `depends` are `pipewire`, `libpipewire`, `glibc`, `wayland`, `libxkbcommon`, and `mesa`. `libpipewire` is the library `readelf` lists as `NEEDED` (`libpipewire-0.3.so.0`); it is not also a `makedepend`, because Arch installs `depends` before the build. `glibc` covers `libc`, `libm`, and the dynamic linker. `libgcc_s` is implicit, so `gcc-libs` and `libgcc` are not listed. `pipewire` stays in `depends` because the daemon has to be running; `readelf` NEEDED does not list it. `wayland`, `libxkbcommon`, and `mesa` stay because eframe dlopens them (`libwayland-client.so.0`, `libwayland-egl.so.1`, `libxkbcommon.so.0`, `libEGL.so.1`) even though they are absent from `NEEDED`. wgpu also dlopens `libvulkan.so.1` when a loader is present; that loader is not a package dependency. The binary does not call `pactl`, so `libpulse` is not a dependency.
+`--headless` does not open a window. On a build without `--features pipewire` it exits and opens no audio client. `--mix-mic`, `--strips`, `--monitor-mix`, `--tone`, and `--duration` require `--headless`. `--duration 2` stops the process after two seconds. `--tone` writes a 440 Hz sine on Mix Mic for a recorder aimed at that node. `--monitor-mix` also publishes the monitor playback stream. `--strips` may be repeated: `device:` is an ALSA `node.name`, and `app:NAME:BINARY` is `application.name` and `application.process.binary`.
+
+```sh
+cargo run -p omamix --features pipewire -- --headless --mix-mic --duration 2
+cargo run -p omamix --features pipewire -- --headless --mix-mic --tone --duration 2 --monitor-mix --strips other
+```
+
+In the window, click a fader, then scroll while the pointer is still on it. One notch is 0.5 dB. Strip trim and fader start at 0 dB, pan at center (both channels stay at gain 1), with mute and solo off. The master fader starts at 0 dB.
+
+## Layout
+
+```text
+crates/omamix-core/   scene, dB math, fader, meters, DSP (no PipeWire)
+crates/omamix-pw/     audio engine; PipeWire filter and headless loop behind the feature
+crates/omamix/        eframe binary
+docs/                 spec, architecture, testing, audio baseline
+scripts/prove.sh      private PipeWire procedure
+PKGBUILD              Arch package omamix-git
+```
+
+- [docs/SPEC.md](docs/SPEC.md)
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- [docs/TESTING.md](docs/TESTING.md)
+- [docs/AUDIO-BASELINE.md](docs/AUDIO-BASELINE.md)
 
 ## License
 
-omamix is MIT-licensed. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
