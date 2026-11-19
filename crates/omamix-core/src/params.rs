@@ -1718,8 +1718,14 @@ mod tests {
         }
     }
 
-    fn fnv_mix(mut hash: u64, bits: u32) -> u64 {
-        for byte in bits.to_le_bytes() {
+    fn fnv_mix(mut hash: u64, sample: f32) -> u64 {
+        let scaled = (f64::from(sample) * f64::from(1u32 << 20)).round();
+        let grid = if scaled.is_nan() {
+            0
+        } else {
+            scaled.clamp(i64::MIN as f64, i64::MAX as f64) as i64
+        };
+        for byte in grid.to_le_bytes() {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(0x100000001b3);
         }
@@ -1789,9 +1795,9 @@ mod tests {
             );
             if block >= warmup {
                 for sample in left.iter().chain(right.iter()) {
-                    hash = fnv_mix(hash, sample.to_bits());
+                    hash = fnv_mix(hash, *sample);
                 }
-                hash = fnv_mix(hash, comp_r.master_gain_reduction_db().to_bits());
+                hash = fnv_mix(hash, comp_r.master_gain_reduction_db());
             }
             cursor += frames;
         }
@@ -1867,9 +1873,9 @@ mod tests {
                     rate,
                 );
                 for sample in left.iter().chain(right.iter()) {
-                    hash = fnv_mix(hash, sample.to_bits());
+                    hash = fnv_mix(hash, *sample);
                 }
-                hash = fnv_mix(hash, comp_r.master_gain_reduction_db().to_bits());
+                hash = fnv_mix(hash, comp_r.master_gain_reduction_db());
                 cursor += frames;
             }
         };
@@ -1889,19 +1895,19 @@ mod tests {
     #[test]
     fn eq_transition_fingerprint_matches_the_locked_hash() {
         let got = transition_fingerprint();
-        let want = 0x0070236e340d7ef8u64;
+        let want = 0x12cc1fdb795cc826u64;
         assert_eq!(got, want, "transition fingerprint {got:016x}");
     }
 
     #[test]
     fn settled_38_strip_mix_matches_the_locked_fingerprint() {
         let locked = [
-            (48_000u32, 64usize, 0x2f440f4e51d142afu64),
-            (48_000, 256, 0x6e73a3a782baf7d3),
-            (48_000, 1024, 0x97c388abe4efbcf5),
-            (96_000, 64, 0x127b85f25d6ca41f),
-            (96_000, 256, 0xc8eb3e2c654952a5),
-            (96_000, 1024, 0x649ed2482ffda36d),
+            (48_000u32, 64usize, 0xe366faf01b3233d8u64),
+            (48_000, 256, 0xd3d1b3988810bcd9),
+            (48_000, 1024, 0x6b57e13a766beb51),
+            (96_000, 64, 0x045df505f303fd21),
+            (96_000, 256, 0x8745f8aa1f0aa4e6),
+            (96_000, 1024, 0xe6085cb96e975618),
         ];
         for (rate, frames, want) in locked {
             let got = mix_fingerprint(rate, frames);
