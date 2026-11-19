@@ -3,15 +3,20 @@
 //! The UI may [`CommandSender::submit`]. The loop thread drains the queue
 //! outside `process()`. `process()` writes the master [`AtomicMeter`] and the
 //! per-strip [`omamix_core::params::StripMeterBank`], and it reads
-//! [`AtomicParams`]. It does not receive on this channel. This module does
-//! not start that thread and does not open a client.
+//! [`AtomicParams`], the published EQ coefficients, and the published
+//! compressor block. It writes each gain-reduction atomic. It does not
+//! receive on this channel. This module does not start that thread and does
+//! not open a client.
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU32, Ordering, fence};
 use std::sync::mpsc::{self, Receiver, Sender};
 
+use omamix_core::comp::CompUpdate;
 use omamix_core::db;
+use omamix_core::eq::EqUpdate;
 use omamix_core::fader;
+use omamix_core::limit::LimitUpdate;
 use omamix_core::params::StripParamUpdate;
 
 /// What the UI or the headless CLI is allowed to enqueue.
@@ -30,6 +35,25 @@ pub enum EngineCommand {
         slot: u16,
         update: StripParamUpdate,
     },
+    /// One strip EQ field. The loop thread rebuilds coefficients and publishes
+    /// them. `process` only loads the published block.
+    SetStripEq {
+        slot: u16,
+        update: EqUpdate,
+    },
+    /// Master-bus EQ. Same publication rule as [`Self::SetStripEq`].
+    SetMasterEq(EqUpdate),
+    /// One strip compressor field. The loop thread rebuilds the detector
+    /// block and publishes it. `process` only loads that block.
+    SetStripComp {
+        slot: u16,
+        update: CompUpdate,
+    },
+    /// Master-bus compressor. Same publication rule as [`Self::SetStripComp`].
+    SetMasterComp(CompUpdate),
+    /// Master limiter. The loop thread publishes the block. `process` only
+    /// loads it.
+    SetMasterLimit(LimitUpdate),
 }
 
 /// Clone of the sending half. Safe to hold on the UI thread.

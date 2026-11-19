@@ -1,8 +1,6 @@
 # Maintainer: timsonner
 # The git source is unpinned: sha256sums is SKIP and pkgver() follows
-# whatever commit HEAD is when makepkg runs. The Origin git URL is not
-# anonymous. A clean chroot clone needs credentials.
-# `makepkg --nobuild` failed here without them.
+# whatever commit HEAD is when makepkg runs.
 # The omamix binary does not call pactl. libpulse is not a dependency.
 #
 # Runtime NEEDED (readelf -d on the pipewire-feature binary):
@@ -26,7 +24,7 @@ pkgver=0.1.0
 pkgrel=1
 pkgdesc='PipeWire live mixer that publishes one virtual microphone'
 arch=('x86_64')
-url='https://origin.cursor.com/timsonner/omamix'
+url='https://github.com/timsonner/omamix'
 license=('MIT')
 depends=(
   'pipewire'
@@ -43,7 +41,7 @@ conflicts=('omamix')
 # libpipewire must be >= 1.2. The pipewire feature's build.rs rejects older headers.
 options=('!lto' '!debug')
 
-source=("omamix::git+https://origin.cursor.com/timsonner/omamix.git")
+source=("omamix::git+https://github.com/timsonner/omamix.git")
 sha256sums=('SKIP')
 
 pkgver() {

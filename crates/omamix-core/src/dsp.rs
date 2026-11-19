@@ -1,6 +1,11 @@
-//! DSP chain. Stages are in-process and real-time later; this scaffold ships
-//! the order, the trait, and a gain stage. Noise reduction, EQ, compression,
-//! and limiting are identity placeholders until their implementations land.
+//! DSP chain. Stages are in-process. This module ships the order, the trait,
+//! and a gain stage. Noise reduction is an identity placeholder.
+//! The high-pass and the 10-band graphic EQ (peaking sections, not shelves)
+//! are implemented in [`crate::eq`]. The compressor is implemented in
+//! [`crate::comp`]. The limiter is implemented in [`crate::limit`]. All three
+//! run inside [`crate::params::StripMixer`]. The template below still lists
+//! every kind as a bypassed identity so the order test does not depend on
+//! filter state.
 //!
 //! Strip order, from the spec: noise reduction, high-pass, 10-band graphic EQ,
 //! compressor, limiter. Input trim and the fader sit outside this list.

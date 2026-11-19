@@ -19,6 +19,9 @@ pub use engine::{HeadlessOptions, run_headless};
 
 use std::fmt;
 
+use omamix_core::comp::{CompWriter, open as open_comp};
+use omamix_core::eq::{EqWriter, open};
+use omamix_core::limit::{LimitWriter, open as open_limit};
 use omamix_core::params::StripParamBank;
 
 pub use rt::{CommandSender, EngineCommand};
@@ -38,6 +41,9 @@ pub struct NullEngine {
     queue: rt::CommandQueue,
     shut_down: bool,
     strips: StripParamBank,
+    eq: EqWriter,
+    comp: CompWriter,
+    limit: LimitWriter,
 }
 
 impl NullEngine {
@@ -46,6 +52,9 @@ impl NullEngine {
             queue: rt::CommandQueue::new(),
             shut_down: false,
             strips: StripParamBank::new(),
+            eq: open().0,
+            comp: open_comp().0,
+            limit: open_limit().0,
         }
     }
 
@@ -57,6 +66,21 @@ impl NullEngine {
                 EngineCommand::SetMasterFaderDb(_) | EngineCommand::SetMonitorMix(_) => {}
                 EngineCommand::SetStripParam { slot, update } => {
                     self.strips.apply(slot, update);
+                }
+                EngineCommand::SetStripEq { slot, update } => {
+                    self.eq.apply(slot, update);
+                }
+                EngineCommand::SetMasterEq(update) => {
+                    self.eq.apply_master(update);
+                }
+                EngineCommand::SetStripComp { slot, update } => {
+                    self.comp.apply(slot, update);
+                }
+                EngineCommand::SetMasterComp(update) => {
+                    self.comp.apply_master(update);
+                }
+                EngineCommand::SetMasterLimit(update) => {
+                    self.limit.apply_master(update);
                 }
             }
         }
@@ -70,6 +94,30 @@ impl NullEngine {
     /// Parameters applied by [`Self::drive`]. Defaults are neutral.
     pub fn strips(&self) -> &StripParamBank {
         &self.strips
+    }
+
+    /// EQ applied by [`Self::drive`]. Defaults are flat.
+    ///
+    /// The handle is not `Sync`. Publishing happens in [`Self::drive`], which
+    /// has `&mut self`.
+    pub fn eq(&self) -> &EqWriter {
+        &self.eq
+    }
+
+    /// Compressor applied by [`Self::drive`]. Defaults are bypassed.
+    ///
+    /// The handle is not `Sync`. Publishing happens in [`Self::drive`], which
+    /// has `&mut self`.
+    pub fn comp(&self) -> &CompWriter {
+        &self.comp
+    }
+
+    /// Master limiter applied by [`Self::drive`]. It starts on, at -1 dBTP, with 5 ms of lookahead.
+    ///
+    /// The handle is not `Sync`. Publishing happens in [`Self::drive`], which
+    /// has `&mut self`.
+    pub fn limit(&self) -> &LimitWriter {
+        &self.limit
     }
 }
 
@@ -110,6 +158,8 @@ impl std::error::Error for EngineError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use omamix_core::comp::CompUpdate;
+    use omamix_core::eq::EqUpdate;
     use omamix_core::params::StripParamUpdate;
 
     #[test]
@@ -139,5 +189,67 @@ mod tests {
         assert!(engine.strips().mute(1));
         assert!(engine.strips().enabled(1));
         assert_eq!(engine.strips().fader_db(1), 0.0);
+    }
+
+    #[test]
+    fn eq_applies_on_drive_and_starts_flat() {
+        let mut engine = NullEngine::new();
+        let before = engine.eq().settings(0).unwrap();
+        assert!(!before.hpf_enabled());
+        assert_eq!(before.band_db(), [0.0; 10]);
+        engine.command_sender().submit(EngineCommand::SetStripEq {
+            slot: 0,
+            update: EqUpdate::Band {
+                index: 4,
+                gain_db: 6.0,
+            },
+        });
+        assert_eq!(engine.eq().settings(0).unwrap().band_db()[4], 0.0);
+        engine.drive().unwrap();
+        assert!((engine.eq().settings(0).unwrap().band_db()[4] - 6.0).abs() < 1.0e-6);
+        engine
+            .command_sender()
+            .submit(EngineCommand::SetMasterEq(EqUpdate::HighPassEnabled(true)));
+        engine.drive().unwrap();
+        assert!(engine.eq().master_settings().hpf_enabled());
+    }
+
+    #[test]
+    fn compressor_applies_on_drive_and_starts_bypassed() {
+        let mut engine = NullEngine::new();
+        assert!(!engine.comp().settings(0).unwrap().enabled());
+        assert!(!engine.comp().master_settings().enabled());
+        assert_eq!(engine.comp().gain_reduction_db(0), 0.0);
+        engine.command_sender().submit(EngineCommand::SetStripComp {
+            slot: 0,
+            update: CompUpdate::Enabled(true),
+        });
+        assert!(!engine.comp().settings(0).unwrap().enabled());
+        engine.drive().unwrap();
+        assert!(engine.comp().settings(0).unwrap().enabled());
+        assert_eq!(engine.comp().settings(0).unwrap().ratio(), 4.0);
+        engine
+            .command_sender()
+            .submit(EngineCommand::SetMasterComp(CompUpdate::ThresholdDb(-24.0)));
+        engine.drive().unwrap();
+        assert!(!engine.comp().master_settings().enabled());
+        assert!((engine.comp().master_settings().threshold_db() - (-24.0)).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn master_limiter_applies_on_drive_and_starts_on() {
+        use omamix_core::limit::LimitUpdate;
+        let mut engine = NullEngine::new();
+        assert!(engine.limit().master_settings().enabled());
+        assert!((engine.limit().master_settings().ceiling_db() - (-1.0)).abs() < 1.0e-5);
+        assert!((engine.limit().master_settings().lookahead_ms() - 5.0).abs() < 1.0e-5);
+        engine
+            .command_sender()
+            .submit(EngineCommand::SetMasterLimit(LimitUpdate::LookaheadMs(
+                20.0,
+            )));
+        assert!((engine.limit().master_settings().lookahead_ms() - 5.0).abs() < 1.0e-5);
+        engine.drive().unwrap();
+        assert!((engine.limit().master_settings().lookahead_ms() - 20.0).abs() < 1.0e-5);
     }
 }

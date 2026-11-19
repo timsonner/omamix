@@ -4,9 +4,10 @@
 //! [`LoopMsg`] through [`pipewire::channel`], which wakes the loop. A timer
 //! on the same thread drains [`crate::rt::CommandQueue`]. `process()` does
 //! neither: it writes the master [`crate::rt::AtomicMeter`], the per-strip
-//! meters, and the scope rings, reads [`crate::rt::AtomicParams`] and the per-strip
-//! [`omamix_core::params::StripParamBank`], and publishes the master quantum
-//! in [`crate::rt::MixSlot`].
+//! meters, and the scope rings, reads [`crate::rt::AtomicParams`], the per-strip
+//! [`omamix_core::params::StripParamBank`], the published EQ coefficients, and
+//! the published compressor block, writes each gain-reduction atomic, and
+//! publishes the master quantum in [`crate::rt::MixSlot`].
 //!
 //! Mix Mic is an adapter node (`media.class` Audio/Source/Virtual,
 //! `node.name` omamix.mix-mic) created with `support.null-audio-sink`. The
@@ -39,7 +40,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use omamix_core::comp::CompUpdate;
+use omamix_core::eq::EqUpdate;
 use omamix_core::graph::Scene;
+use omamix_core::limit::{LIMIT_LOOKAHEAD_MAX_MS, LIMIT_LOOKAHEAD_MIN_MS, LimitUpdate};
 use omamix_core::link::{self, LinkPhase, PortEndpoint};
 use omamix_core::metadata::{self, DefaultDeviceObservation};
 use omamix_core::params::StripParamUpdate;
@@ -82,6 +86,11 @@ enum LoopMsg {
     SetMasterFaderDb(f32),
     SetMonitorMix(bool),
     SetStripParam { slot: u16, update: StripParamUpdate },
+    SetStripEq { slot: u16, update: EqUpdate },
+    SetMasterEq(EqUpdate),
+    SetStripComp { slot: u16, update: CompUpdate },
+    SetMasterComp(CompUpdate),
+    SetMasterLimit(LimitUpdate),
 }
 
 fn engine_command_msg(command: EngineCommand) -> LoopMsg {
@@ -90,6 +99,11 @@ fn engine_command_msg(command: EngineCommand) -> LoopMsg {
         EngineCommand::SetMasterFaderDb(db) => LoopMsg::SetMasterFaderDb(db),
         EngineCommand::SetMonitorMix(on) => LoopMsg::SetMonitorMix(on),
         EngineCommand::SetStripParam { slot, update } => LoopMsg::SetStripParam { slot, update },
+        EngineCommand::SetStripEq { slot, update } => LoopMsg::SetStripEq { slot, update },
+        EngineCommand::SetMasterEq(update) => LoopMsg::SetMasterEq(update),
+        EngineCommand::SetStripComp { slot, update } => LoopMsg::SetStripComp { slot, update },
+        EngineCommand::SetMasterComp(update) => LoopMsg::SetMasterComp(update),
+        EngineCommand::SetMasterLimit(update) => LoopMsg::SetMasterLimit(update),
     }
 }
 
@@ -145,6 +159,10 @@ pub fn run_headless(options: HeadlessOptions) -> Result<HeadlessReport, EngineEr
     }
 
     let deadline = duration.map(|span| Instant::now() + span);
+    let (look_tx, look_rx) = std::sync::mpsc::channel::<f32>();
+    let _reader = std::thread::Builder::new()
+        .name("omamix-lookahead".into())
+        .spawn(move || read_lookahead_lines(look_tx));
     loop {
         if STOP.swap(false, Ordering::SeqCst) {
             break;
@@ -155,7 +173,15 @@ pub fn run_headless(options: HeadlessOptions) -> Result<HeadlessReport, EngineEr
         if thread.is_finished() {
             break;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        match look_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(ms) => {
+                let _ = pw_tx.send(LoopMsg::SetMasterLimit(LimitUpdate::LookaheadMs(ms)));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
 
     let _ = pw_tx.send(LoopMsg::Shutdown);
@@ -165,6 +191,48 @@ pub fn run_headless(options: HeadlessOptions) -> Result<HeadlessReport, EngineEr
         node_id: ready.node_id,
         client_id: ready.client_id,
     })
+}
+
+/// Parse one lookahead token from a `lookahead <ms>` line.
+///
+/// Unparsable text, NaN, and infinities are ignored. A finite value is
+/// clamped to [`LIMIT_LOOKAHEAD_MIN_MS`] and [`LIMIT_LOOKAHEAD_MAX_MS`].
+fn clamp_lookahead_token(text: &str) -> Option<f32> {
+    let ms = text.parse::<f32>().ok()?;
+    if !ms.is_finite() {
+        return None;
+    }
+    Some(ms.clamp(LIMIT_LOOKAHEAD_MIN_MS, LIMIT_LOOKAHEAD_MAX_MS))
+}
+
+/// Read `lookahead <ms>` lines and forward the milliseconds.
+///
+/// Other lines are ignored. This does not touch the audio callback. The
+/// caller waits on the channel. A closed stdin ends this task, and the
+/// caller sleeps 50 ms when the sender is gone so it does not spin.
+fn read_lookahead_lines(tx: std::sync::mpsc::Sender<f32>) {
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match stdin.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let mut parts = line.split_whitespace();
+        if parts.next() != Some("lookahead") {
+            continue;
+        }
+        let Some(text) = parts.next() else {
+            continue;
+        };
+        let Some(ms) = clamp_lookahead_token(text) else {
+            continue;
+        };
+        if tx.send(ms).is_err() {
+            break;
+        }
+    }
 }
 
 fn wait_until_ready(
@@ -404,6 +472,36 @@ fn apply_loop_msg(
         LoopMsg::SetStripParam { slot, update } => {
             if let Some(filter) = filter.borrow().as_ref() {
                 filter.shared().strips.apply(*slot, *update);
+            }
+            false
+        }
+        LoopMsg::SetStripEq { slot, update } => {
+            if let Some(filter) = filter.borrow_mut().as_mut() {
+                filter.apply_strip_eq(*slot, *update);
+            }
+            false
+        }
+        LoopMsg::SetMasterEq(update) => {
+            if let Some(filter) = filter.borrow_mut().as_mut() {
+                filter.apply_master_eq(*update);
+            }
+            false
+        }
+        LoopMsg::SetStripComp { slot, update } => {
+            if let Some(filter) = filter.borrow_mut().as_mut() {
+                filter.apply_strip_comp(*slot, *update);
+            }
+            false
+        }
+        LoopMsg::SetMasterComp(update) => {
+            if let Some(filter) = filter.borrow_mut().as_mut() {
+                filter.apply_master_comp(*update);
+            }
+            false
+        }
+        LoopMsg::SetMasterLimit(update) => {
+            if let Some(filter) = filter.borrow_mut().as_mut() {
+                filter.apply_master_limit(*update);
             }
             false
         }
@@ -659,6 +757,10 @@ fn tick(
     monitor_on: &Arc<AtomicBool>,
 ) -> bool {
     let quit = drain_commands(shared, filter, monitor_on);
+    sync_eq_rate(filter);
+    sync_comp_rate(filter);
+    sync_limit_rate(filter);
+    sync_limit_quantum(filter);
     for _ in 0..8 {
         let batch = match shared.pending.lock() {
             Ok(mut pending) => std::mem::take(&mut *pending),
@@ -684,6 +786,63 @@ fn tick(
     reconcile(shared, filter);
     publish_ready(shared);
     quit || shared.inner.borrow().quit
+}
+
+/// Rebuild EQ coefficients when the callback's rate is not the published one.
+///
+/// The audio callback only stores the rate. This runs on the loop thread.
+fn sync_eq_rate(filter: &RefCell<Option<MixFilter>>) {
+    let mut borrowed = filter.borrow_mut();
+    let Some(filter) = borrowed.as_mut() else {
+        return;
+    };
+    let rate = filter.shared().observed_rate.load(Ordering::Relaxed);
+    if rate != 0 {
+        filter.set_eq_rate(rate);
+    }
+}
+
+/// Rebuild compressor coefficients when the callback's rate is not the published one.
+///
+/// The audio callback only stores the rate. This runs on the loop thread.
+fn sync_comp_rate(filter: &RefCell<Option<MixFilter>>) {
+    let mut borrowed = filter.borrow_mut();
+    let Some(filter) = borrowed.as_mut() else {
+        return;
+    };
+    let rate = filter.shared().observed_rate.load(Ordering::Relaxed);
+    if rate != 0 {
+        filter.set_comp_rate(rate);
+    }
+}
+
+/// Rebuild limiter coefficients when the callback's rate is not the published one.
+///
+/// The audio callback only stores the rate. This runs on the loop thread.
+/// Until it runs, the callback still limits: it recomputes the delay at the
+/// rate it is processing. `set_limit_rate` also publishes `ProcessLatency`.
+fn sync_limit_rate(filter: &RefCell<Option<MixFilter>>) {
+    let mut borrowed = filter.borrow_mut();
+    let Some(filter) = borrowed.as_mut() else {
+        return;
+    };
+    let rate = filter.shared().observed_rate.load(Ordering::Relaxed);
+    if rate != 0 {
+        filter.set_limit_rate(rate);
+    }
+}
+
+/// Apply the callback quantum to the master 0 ms cap.
+///
+/// The audio callback only stores the frame count. This runs on the loop
+/// thread from the 50 ms engine timer, then publishes port latency if a
+/// shorter quantum demoted the master.
+fn sync_limit_quantum(filter: &RefCell<Option<MixFilter>>) {
+    let mut borrowed = filter.borrow_mut();
+    let Some(filter) = borrowed.as_mut() else {
+        return;
+    };
+    filter.sync_limit_quantum();
 }
 
 fn drain_commands(
@@ -2064,5 +2223,29 @@ mod owned_id_tests {
             select_owned_id(&nodes, Some(4), 3, contract::FILTER_NODE_NAME),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod lookahead_token_tests {
+    use super::clamp_lookahead_token;
+
+    #[test]
+    fn stdin_lookahead_rejects_non_finite_and_clamps_the_range() {
+        assert_eq!(clamp_lookahead_token("5"), Some(5.0));
+        assert_eq!(clamp_lookahead_token("0"), Some(0.0));
+        assert_eq!(clamp_lookahead_token("20"), Some(20.0));
+        assert_eq!(clamp_lookahead_token("-0.5"), Some(0.0));
+        assert_eq!(clamp_lookahead_token("20.1"), Some(20.0));
+        assert_eq!(clamp_lookahead_token("100"), Some(20.0));
+        assert_eq!(clamp_lookahead_token("NaN"), None);
+        assert_eq!(clamp_lookahead_token("nan"), None);
+        assert_eq!(clamp_lookahead_token("inf"), None);
+        assert_eq!(clamp_lookahead_token("Inf"), None);
+        assert_eq!(clamp_lookahead_token("+inf"), None);
+        assert_eq!(clamp_lookahead_token("-inf"), None);
+        assert_eq!(clamp_lookahead_token("infinity"), None);
+        assert_eq!(clamp_lookahead_token(""), None);
+        assert_eq!(clamp_lookahead_token("nope"), None);
     }
 }
