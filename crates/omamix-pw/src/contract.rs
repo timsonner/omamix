@@ -25,10 +25,6 @@ pub fn mix_mic_selected_as_default(other_priorities: &[i32]) -> bool {
         .all(|priority| *priority < MIX_MIC_SESSION_PRIORITY)
 }
 
-/// Declared processing latency of Mix Mic, as samples/rate.
-/// This is the contract value, not a measured quantum.
-pub const MIX_MIC_NODE_LATENCY: &str = "1024/48000";
-
 /// One `pw_filter` and one process callback. Documented in ARCHITECTURE.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClockPlan {
@@ -54,7 +50,7 @@ pub const ADAPTER_AUTO_PORT_CONFIG: &str =
 /// JSON for `node.param.PortConfig`, applied by the node when its
 /// implementation is set. Direction is Input because `support.null-audio-sink`
 /// has an input port. The format makes the dsp ports exist immediately.
-pub const MIX_MIC_PORT_CONFIG: &str = r#"{"direction":"Input","mode":"dsp","monitor":true,"control":false,"format":{"mediaType":"audio","mediaSubtype":"raw","format":"F32P","rate":48000,"channels":2,"position":["FL","FR"]}}"#;
+pub const MIX_MIC_PORT_CONFIG: &str = r#"{"direction":"Input","mode":"dsp","monitor":true,"control":false,"format":{"mediaType":"audio","mediaSubtype":"raw","format":"F32P","channels":2,"position":["FL","FR"]}}"#;
 
 /// JSON for `node.param.Props`. Unity gain on the public adapter, same
 /// channels the filter advertises on connect.
@@ -86,7 +82,6 @@ pub fn mix_mic_properties() -> Vec<(&'static str, &'static str)> {
         ("audio.position", "FL,FR"),
         ("priority.session", "1"),
         ("priority.driver", "1"),
-        ("node.latency", MIX_MIC_NODE_LATENCY),
         ("node.dont-reconnect", "true"),
         ("node.autoconnect", "false"),
         ("object.linger", "false"),
@@ -134,7 +129,6 @@ pub fn filter_properties() -> Vec<(&'static str, &'static str)> {
         ("node.virtual", "true"),
         ("priority.session", "1"),
         ("priority.driver", "1"),
-        ("node.latency", MIX_MIC_NODE_LATENCY),
         ("node.dont-reconnect", "true"),
         ("node.autoconnect", "false"),
         ("object.linger", "false"),
@@ -188,7 +182,7 @@ mod tests {
                 .unwrap(),
             MIX_MIC_SESSION_PRIORITY
         );
-        assert_eq!(get(&props, "node.latency"), Some(MIX_MIC_NODE_LATENCY));
+        assert!(get(&props, "node.latency").is_none());
         assert_eq!(get(&props, "node.dont-reconnect"), Some("true"));
         assert_eq!(get(&props, "node.autoconnect"), Some("false"));
         assert_eq!(get(&props, "object.linger"), Some("false"));
@@ -213,11 +207,23 @@ mod tests {
         assert_eq!(get(&filter, "priority.session"), Some("1"));
         assert_eq!(get(&filter, "node.autoconnect"), Some("false"));
         for bag in [&props, &filter] {
-            assert!(
-                bag.iter()
-                    .all(|(key, _)| { *key != "node.driver" && *key != "node.want-driver" })
-            );
+            assert!(bag.iter().all(|(key, _)| {
+                *key != "node.driver" && *key != "node.want-driver" && *key != "node.latency"
+            }));
         }
+    }
+
+    #[test]
+    fn mix_mic_follows_the_graph_rate_and_quantum() {
+        assert!(get(&mix_mic_properties(), "node.latency").is_none());
+        assert!(get(&filter_properties(), "node.latency").is_none());
+        assert!(!MIX_MIC_PORT_CONFIG.contains("\"rate\""));
+        assert!(!MIX_MIC_PORT_CONFIG.contains("48000"));
+        assert!(!MIX_MIC_PORT_CONFIG.contains("44100"));
+        assert!(!MIX_MIC_PORT_CONFIG.contains("96000"));
+        assert!(MIX_MIC_PORT_CONFIG.contains("\"FL\""));
+        assert!(MIX_MIC_PORT_CONFIG.contains("\"FR\""));
+        assert!(MIX_MIC_PORT_CONFIG.contains("\"channels\":2"));
     }
 
     #[test]

@@ -799,9 +799,6 @@ impl MixFilter {
     }
 
     /// Samples of lookahead in the mix. A bypassed master counts as 0.
-    ///
-    /// This is the delay `process` inserts. `node.latency` stays the quantum
-    /// contract and is not this number.
     pub fn reported_latency_samples(&self) -> u32 {
         self.limit.reported_latency_samples()
     }
@@ -1302,11 +1299,9 @@ fn mix_resolved_strips(
 /// graph clock position: that counter does not fit in `f32`, and casting it
 /// turns the sine into a different pitch.
 fn advance_tone(phase: f32, rate: u32) -> (f32, f32) {
-    let rate = if (8_000..384_000).contains(&rate) {
-        rate
-    } else {
-        48_000
-    };
+    if !audio_rate(rate) {
+        return (0.0, phase);
+    }
     let sample = (phase * std::f32::consts::TAU).sin() * 0.2;
     let mut next = phase + (440.0 / rate as f32);
     if next >= 1.0 {
@@ -1315,16 +1310,23 @@ fn advance_tone(phase: f32, rate: u32) -> (f32, f32) {
     (sample, next)
 }
 
-/// `spa_io_clock.rate` is `1/samplerate` when PipeWire fills it that way
-/// (`num` 1, `denom` 48000). Prefer a denominator in the audio range, then
-/// the numerator, then 48 kHz.
+fn audio_rate(rate: u32) -> bool {
+    (8_000..384_000).contains(&rate)
+}
+
 pub(crate) fn negotiated_rate(num: u32, denom: u32) -> u32 {
-    if (8_000..384_000).contains(&denom) {
+    let num_ok = audio_rate(num);
+    let denom_ok = audio_rate(denom);
+    if num == 1 && denom_ok {
         denom
-    } else if (8_000..384_000).contains(&num) {
+    } else if num_ok && (denom == 1 || num == denom) {
+        num
+    } else if denom_ok && !num_ok {
+        denom
+    } else if num_ok && !denom_ok {
         num
     } else {
-        48_000
+        0
     }
 }
 
@@ -2044,10 +2046,84 @@ mod tests {
     }
 
     #[test]
-    fn negotiated_rate_uses_the_denominator_of_a_one_over_rate_clock() {
-        assert_eq!(negotiated_rate(1, 48_000), 48_000);
-        assert_eq!(negotiated_rate(48_000, 1), 48_000);
-        assert_eq!(negotiated_rate(1, 1), 48_000);
+    fn negotiated_rate_follows_44100_48000_and_96000() {
+        for rate in [44_100, 48_000, 96_000] {
+            assert_eq!(negotiated_rate(1, rate), rate);
+            assert_eq!(negotiated_rate(rate, 1), rate);
+            assert_eq!(negotiated_rate(rate, rate), rate);
+        }
+        assert_eq!(negotiated_rate(1, 1), 0);
+        assert_eq!(negotiated_rate(0, 0), 0);
+        assert_eq!(negotiated_rate(44_100, 48_000), 0);
+        assert_eq!(negotiated_rate(96_000, 48_000), 0);
+        let (sample, phase) = advance_tone(0.25, 0);
+        assert_eq!(sample, 0.0);
+        assert_eq!(phase, 0.25);
+        let (sample, phase) = advance_tone(0.0, 44_100);
+        assert!(sample.abs() < 1.0e-6);
+        assert!((phase - (440.0 / 44_100.0)).abs() < 1.0e-6);
+    }
+
+    fn latency_range_pod(direction: u32, min_rate: Option<i32>, max_rate: Option<i32>) -> Vec<u8> {
+        use pw::spa::pod::serialize::PodSerializer;
+        use pw::spa::pod::{Object, Property, PropertyFlags, Value};
+        use pw::spa::utils::Id;
+
+        let mut properties = vec![Property {
+            key: pw::spa::sys::SPA_PARAM_LATENCY_direction,
+            flags: PropertyFlags::empty(),
+            value: Value::Id(Id(direction)),
+        }];
+        if let Some(rate) = min_rate {
+            properties.push(Property {
+                key: pw::spa::sys::SPA_PARAM_LATENCY_minRate,
+                flags: PropertyFlags::empty(),
+                value: Value::Int(rate),
+            });
+        }
+        if let Some(rate) = max_rate {
+            properties.push(Property {
+                key: pw::spa::sys::SPA_PARAM_LATENCY_maxRate,
+                flags: PropertyFlags::empty(),
+                value: Value::Int(rate),
+            });
+        }
+        let object = Value::Object(Object {
+            type_: pw::spa::sys::SPA_TYPE_OBJECT_ParamLatency,
+            id: pw::spa::sys::SPA_PARAM_Latency,
+            properties,
+        });
+        PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &object)
+            .expect("latency range pod")
+            .0
+            .into_inner()
+    }
+
+    #[test]
+    fn latency_pairing_keeps_sample_counts_at_44100_48000_and_96000() {
+        for rate in [44_100u32, 48_000, 96_000] {
+            let samples = omamix_core::limit::lookahead_samples(rate, 5.0);
+            assert!(samples > 0);
+            let both = port_latency_pod(samples, pw::spa::sys::SPA_DIRECTION_OUTPUT);
+            let (direction, got) = latency_direction_and_rate(&both).unwrap();
+            assert_eq!(direction, pw::spa::sys::SPA_DIRECTION_OUTPUT);
+            assert_eq!(got, samples);
+            let min_only = latency_range_pod(
+                pw::spa::sys::SPA_DIRECTION_OUTPUT,
+                Some(i32::try_from(samples).unwrap()),
+                None,
+            );
+            assert_eq!(latency_direction_and_rate(&min_only).unwrap().1, samples);
+            let max_wins = latency_range_pod(
+                pw::spa::sys::SPA_DIRECTION_OUTPUT,
+                Some(1),
+                Some(i32::try_from(samples).unwrap()),
+            );
+            assert_eq!(latency_direction_and_rate(&max_wins).unwrap().1, samples);
+            assert_eq!(output_direction_latency(32, samples), 32 + samples);
+            let missing = latency_range_pod(pw::spa::sys::SPA_DIRECTION_OUTPUT, None, None);
+            assert!(latency_direction_and_rate(&missing).is_none());
+        }
     }
 
     #[test]

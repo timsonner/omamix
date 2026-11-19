@@ -227,6 +227,14 @@ mod tests {
         let text = std::fs::read_to_string(&path).expect("scripts/prove.sh");
         assert!(text.contains("omamix-private-0"));
         assert!(text.contains("EXIT INT TERM"));
+        assert_private_script_has_no_login_writes(&text);
+        let matrix = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/rate-matrix.sh");
+        let matrix_text = std::fs::read_to_string(&matrix).expect("scripts/rate-matrix.sh");
+        assert!(matrix_text.contains("omamix-private-0"));
+        assert_private_script_has_no_login_writes(&matrix_text);
+    }
+
+    fn assert_private_script_has_no_login_writes(text: &str) {
         assert!(!text.contains(&word(&[
             115, 101, 116, 45, 100, 101, 102, 97, 117, 108, 116,
         ])));
@@ -241,6 +249,7 @@ mod tests {
     fn scanner_skips_only_the_procedure_script() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         assert!(is_private_procedure(&root.join("scripts/prove.sh")));
+        assert!(is_private_procedure(&root.join("scripts/rate-matrix.sh")));
         assert!(!is_private_procedure(&root.join("scripts/unplug-watch.sh")));
         assert!(!is_private_procedure(
             &root.join("crates/omamix-core/src/prove.sh")
@@ -993,12 +1002,13 @@ mod tests {
     }
 
     fn is_private_procedure(path: &Path) -> bool {
-        let Ok(procedure) = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../scripts/prove.sh")
-            .canonicalize()
-        else {
+        let Ok(path) = path.canonicalize() else {
             return false;
         };
-        path.canonicalize().ok().as_ref() == Some(&procedure)
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        ["scripts/prove.sh", "scripts/rate-matrix.sh"]
+            .into_iter()
+            .filter_map(|rel| root.join(rel).canonicalize().ok())
+            .any(|procedure| procedure == path)
     }
 }
