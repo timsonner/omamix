@@ -92,24 +92,21 @@ The Arch package is `omamix-git` ([`PKGBUILD`](PKGBUILD)). `build` runs `cargo b
 ## Usage
 
 ```text
-omamix [--headless] [--mix-mic] [--duration SECS] [--monitor-mix] [--tone]
-       [--strips other] [--strips device:NODE] [--strips app:NAME:BINARY]
+omamix [--list]
+       [--headless] [--mix-mic] [--duration SECS] [--monitor-mix] [--tone]
+       [--strips other] [--strips default]
+       [--strips device:NODE] [--strips app:NAME:BINARY]
 ```
 
-`--headless` does not open a window. A binary built without the `gui` feature is headless only, and starting it without `--headless` prints an error. On a build without `--features pipewire` it exits and opens no audio client. `--mix-mic`, `--strips`, `--monitor-mix`, `--tone`, and `--duration` require `--headless`. `--duration 2` stops the process after two seconds. `--tone` writes a 440 Hz sine on Mix Mic for a recorder aimed at that node. `--monitor-mix` also publishes the monitor playback stream. `--strips` may be repeated: `device:` is an ALSA `node.name`, and `app:NAME:BINARY` is `application.name` and `application.process.binary`.
+`--list` prints capture devices (`Audio/Source`, `Audio/Source/Virtual`, `Audio/Duplex`) and playback streams (`Stream/Output/Audio`) and does not open a window. Omamix's own nodes are left out. Each line is tab-separated: kind, `node.name`, `node.description`, and for an app `application.name` and `application.process.binary`. The last field is a `--strips` value (`device:NODE` or `app:NAME:BINARY`).
+
+`--headless` does not open a window. A binary built without the `gui` feature is headless only, and starting it without `--headless` prints an error. On a build without `--features pipewire` it exits and opens no audio client. `--mix-mic`, `--strips`, `--monitor-mix`, `--tone`, and `--duration` require `--headless`. `--duration 2` stops the process after two seconds. `--tone` writes a 440 Hz sine on Mix Mic for a recorder aimed at that node. `--monitor-mix` also publishes the monitor playback stream. `--strips` may be repeated. `default` uses the metadata name `default.audio.source`, or `default.configured.audio.source` when that name is absent. `device:` is a capture `node.name`. `app:NAME:BINARY` is `application.name` and `application.process.binary`. If no default name is stored, or a `device:` name is not a capture node in the graph, omamix prints an error and exits 2.
 
 ```sh
+cargo run -p omamix --features pipewire -- --list
 cargo run -p omamix --features pipewire -- --headless --mix-mic --duration 2
+cargo run -p omamix --features pipewire -- --headless --mix-mic --strips default --duration 2
 cargo run -p omamix --features pipewire -- --headless --mix-mic --tone --duration 2 --monitor-mix --strips other
-```
-
-To add your own mic, find its PipeWire `node.name` and pass it as a device strip. omamix has no default device:
-
-```sh
-wpctl status
-pw-cli ls Node
-cargo run -p omamix --features pipewire -- --headless --mix-mic \
-  --strips device:alsa_input.usb-Your_Vendor_Your_Product-00.analog-stereo
 ```
 
 In the window, click a fader, then scroll while the pointer is still on it. One notch is 0.5 dB. Strip trim and fader start at 0 dB, pan at center (both channels stay at gain 1), with mute and solo off. The master fader starts at 0 dB.

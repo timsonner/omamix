@@ -43,6 +43,41 @@ fn metadata_key_allowed(key: &str, allowed: &[&str]) -> bool {
     allowed.iter().any(|item| key.eq_ignore_ascii_case(item))
 }
 
+pub const AUDIO_SOURCE_KEY: &str = "default.audio.source";
+
+pub const CONFIGURED_AUDIO_SOURCE_KEY: &str = "default.configured.audio.source";
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DefaultSourceSnapshot {
+    pub audio_source: Option<String>,
+    pub configured_audio_source: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DefaultSourceError {
+    Missing,
+}
+
+pub fn resolve_default_source(
+    snapshot: &DefaultSourceSnapshot,
+) -> Result<String, DefaultSourceError> {
+    if let Some(name) = snapshot
+        .audio_source
+        .as_deref()
+        .and_then(metadata_node_name)
+    {
+        return Ok(name);
+    }
+    if let Some(name) = snapshot
+        .configured_audio_source
+        .as_deref()
+        .and_then(metadata_node_name)
+    {
+        return Ok(name);
+    }
+    Err(DefaultSourceError::Missing)
+}
+
 /// Node name inside a PipeWire metadata value.
 ///
 /// WirePlumber stores `{"name":"alsa_input..."}`. A bare name is accepted too.
@@ -146,6 +181,47 @@ mod tests {
             &["default.audio.source"]
         ));
         assert!(!metadata_key_allowed("node.name", &[]));
+    }
+
+    #[test]
+    fn resolve_default_source_prefers_audio_source_then_configured() {
+        assert_eq!(
+            resolve_default_source(&DefaultSourceSnapshot {
+                audio_source: Some("{\"name\":\"live-source\"}".into()),
+                configured_audio_source: Some("{\"name\":\"stored-source\"}".into()),
+            }),
+            Ok("live-source".into())
+        );
+        assert_eq!(
+            resolve_default_source(&DefaultSourceSnapshot {
+                audio_source: None,
+                configured_audio_source: Some("stored-source".into()),
+            }),
+            Ok("stored-source".into())
+        );
+        assert_eq!(
+            resolve_default_source(&DefaultSourceSnapshot {
+                audio_source: Some("{\"name\":\"\"}".into()),
+                configured_audio_source: Some("{\"name\":\"stored-source\"}".into()),
+            }),
+            Ok("stored-source".into())
+        );
+        assert_eq!(
+            resolve_default_source(&DefaultSourceSnapshot {
+                audio_source: Some(String::new()),
+                configured_audio_source: None,
+            }),
+            Err(DefaultSourceError::Missing)
+        );
+        assert_eq!(
+            resolve_default_source(&DefaultSourceSnapshot::default()),
+            Err(DefaultSourceError::Missing)
+        );
+        assert_eq!(AUDIO_SOURCE_KEY, "default.audio.source");
+        assert_eq!(
+            CONFIGURED_AUDIO_SOURCE_KEY,
+            "default.configured.audio.source"
+        );
     }
 
     #[test]

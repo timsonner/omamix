@@ -14,7 +14,7 @@ use std::time::Duration;
 #[cfg(feature = "gui")]
 use eframe::egui;
 use omamix_core::graph::Scene;
-use omamix_core::route::{RouteKey, SourceKind};
+use omamix_core::route::{RouteKey, SourceKind, StripRequest};
 #[cfg(feature = "gui")]
 use omamix_pw::{AudioEngine, EngineCommand, NullEngine};
 
@@ -32,6 +32,20 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if cli.list {
+        if cli.mix_mic
+            || cli.monitor_mix
+            || cli.tone
+            || cli.duration.is_some()
+            || !cli.strips.is_empty()
+        {
+            eprintln!(
+                "omamix: --list does not take --mix-mic, --strips, --monitor-mix, --tone, or --duration"
+            );
+            return ExitCode::from(2);
+        }
+        return run_list();
+    }
     if cli.headless {
         return run_headless(cli);
     }
@@ -66,9 +80,14 @@ fn main() -> ExitCode {
 fn print_help() {
     println!(
         "\
-omamix [--headless] [--mix-mic] [--duration SECS] [--monitor-mix] [--tone]
-       [--strips other] [--strips device:NODE] [--strips app:NAME:BINARY]
+omamix [--list]
+       [--headless] [--mix-mic] [--duration SECS] [--monitor-mix] [--tone]
+       [--strips other] [--strips default]
+       [--strips device:NODE] [--strips app:NAME:BINARY]
 
+--list prints capture devices and application playback streams.
+It does not open a window. Each line is tab-separated. The last field
+is a --strips value: device:NODE or app:NAME:BINARY. Omamix nodes are omitted.
 --headless does not open a window.
 A build without the gui feature has no window. Pass --headless, or
 rebuild with --features gui.
@@ -78,28 +97,27 @@ connects to nothing.
 --monitor-mix also publishes the monitor playback stream.
 --tone writes a 440 Hz sine on Mix Mic so a recorder aimed at that node
 can measure it. It does not retarget the default source or another device.
---strips may be repeated. device: is an ALSA node.name. app: is
-application.name and application.process.binary."
+--strips may be repeated. default uses default.audio.source, or
+default.configured.audio.source when that name is absent.
+device: is a capture node.name. app: is application.name and
+application.process.binary.
+A missing default or a missing device name exits 2."
     );
 }
 
 struct Cli {
+    list: bool,
     headless: bool,
     mix_mic: bool,
     monitor_mix: bool,
     tone: bool,
     duration: Option<Duration>,
-    strips: Vec<StripArg>,
-}
-
-enum StripArg {
-    Other,
-    Device(String),
-    App { name: String, binary: String },
+    strips: Vec<StripRequest>,
 }
 
 fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut cli = Cli {
+        list: false,
         headless: false,
         mix_mic: false,
         monitor_mix: false,
@@ -111,6 +129,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     while index < args.len() {
         let arg = args[index].as_str();
         match arg {
+            "--list" => cli.list = true,
             "--headless" => cli.headless = true,
             "--mix-mic" => cli.mix_mic = true,
             "--monitor-mix" => cli.monitor_mix = true,
@@ -140,29 +159,8 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     Ok(cli)
 }
 
-fn parse_strip(value: &str) -> Result<StripArg, String> {
-    if value == "other" {
-        return Ok(StripArg::Other);
-    }
-    if let Some(name) = value.strip_prefix("device:") {
-        if name.is_empty() {
-            return Err("--strips device: needs a node.name".into());
-        }
-        return Ok(StripArg::Device(name.to_string()));
-    }
-    if let Some(rest) = value.strip_prefix("app:") {
-        let (name, binary) = rest
-            .split_once(':')
-            .ok_or("--strips app:NAME:BINARY needs both fields")?;
-        if name.is_empty() || binary.is_empty() {
-            return Err("--strips app:NAME:BINARY needs both fields".into());
-        }
-        return Ok(StripArg::App {
-            name: name.to_string(),
-            binary: binary.to_string(),
-        });
-    }
-    Err(format!("unknown --strips value {value}"))
+fn parse_strip(value: &str) -> Result<StripRequest, String> {
+    omamix_core::route::parse_strip_request(value)
 }
 
 fn scene_from_cli(cli: &Cli) -> Scene {
@@ -170,18 +168,20 @@ fn scene_from_cli(cli: &Cli) -> Scene {
     scene.master.monitor_mix = cli.monitor_mix;
     for (index, strip) in cli.strips.iter().enumerate() {
         let source = match strip {
-            StripArg::Other => SourceKind::OtherDesktopAudio,
-            StripArg::Device(node_name) => SourceKind::CaptureDevice {
+            StripRequest::Other => SourceKind::OtherDesktopAudio,
+            StripRequest::Default => SourceKind::DefaultSource,
+            StripRequest::Device(node_name) => SourceKind::CaptureDevice {
                 node_name: node_name.clone(),
             },
-            StripArg::App { name, binary } => {
+            StripRequest::App { name, binary } => {
                 SourceKind::Application(RouteKey::new(name.clone(), binary.clone()))
             }
         };
         let label = match strip {
-            StripArg::Other => "other".to_string(),
-            StripArg::Device(name) => name.clone(),
-            StripArg::App { name, .. } => name.clone(),
+            StripRequest::Other => "other".to_string(),
+            StripRequest::Default => "default".to_string(),
+            StripRequest::Device(name) => name.clone(),
+            StripRequest::App { name, .. } => name.clone(),
         };
         scene
             .strips
@@ -200,11 +200,37 @@ fn run_headless(cli: Cli) -> ExitCode {
     };
     match omamix_pw::run_headless(options) {
         Ok(_report) => ExitCode::SUCCESS,
+        Err(omamix_pw::EngineError::Usage(err)) => {
+            eprintln!("omamix: {err}");
+            ExitCode::from(2)
+        }
         Err(err) => {
             eprintln!("omamix: {err}");
             ExitCode::FAILURE
         }
     }
+}
+
+#[cfg(feature = "pipewire")]
+fn run_list() -> ExitCode {
+    match omamix_pw::run_list() {
+        Ok(text) => {
+            print!("{text}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("omamix: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(feature = "pipewire"))]
+fn run_list() -> ExitCode {
+    eprintln!(
+        "omamix: --list requires a build with --features pipewire; no audio client was opened"
+    );
+    ExitCode::FAILURE
 }
 
 #[cfg(not(feature = "pipewire"))]
@@ -327,5 +353,21 @@ mod cli_tests {
             SourceKind::CaptureDevice { .. }
         ));
         assert!(matches!(scene.strips[2].source, SourceKind::Application(_)));
+    }
+
+    #[test]
+    fn strips_default_is_a_source_kind() {
+        let cli = parse_args(&args(&[
+            "--headless",
+            "--mix-mic",
+            "--strips",
+            "default",
+            "--list",
+        ]))
+        .unwrap();
+        assert!(cli.list);
+        let scene = scene_from_cli(&cli);
+        assert!(matches!(scene.strips[0].source, SourceKind::DefaultSource));
+        assert_eq!(scene.strips[0].name, "default");
     }
 }
