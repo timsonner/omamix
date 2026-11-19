@@ -136,6 +136,213 @@ pub fn resolve_binary(node_binary: &str, client_binary: &str) -> String {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ListedKind {
+    Device,
+    App,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListedNode {
+    pub kind: ListedKind,
+    pub node_name: String,
+    pub description: String,
+    pub application_name: String,
+    pub binary: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogNode {
+    pub node_name: String,
+    pub description: String,
+    pub media_class: String,
+    pub application_name: String,
+    pub binary: String,
+    pub client_id: Option<u32>,
+    pub pid: Option<u32>,
+    pub omamix_owned: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StripRequest {
+    Other,
+    Default,
+    Device(String),
+    App { name: String, binary: String },
+}
+
+pub fn parse_strip_request(value: &str) -> Result<StripRequest, String> {
+    if value == "other" {
+        return Ok(StripRequest::Other);
+    }
+    if value == "default" {
+        return Ok(StripRequest::Default);
+    }
+    if let Some(name) = value.strip_prefix("device:") {
+        if name.is_empty() {
+            return Err("--strips device: needs a node.name".into());
+        }
+        return Ok(StripRequest::Device(name.to_string()));
+    }
+    if let Some(rest) = value.strip_prefix("app:") {
+        let (name, binary) = rest
+            .split_once(':')
+            .ok_or("--strips app:NAME:BINARY needs both fields")?;
+        if name.is_empty() || binary.is_empty() {
+            return Err("--strips app:NAME:BINARY needs both fields".into());
+        }
+        return Ok(StripRequest::App {
+            name: name.to_string(),
+            binary: binary.to_string(),
+        });
+    }
+    Err(format!("unknown --strips value {value}"))
+}
+
+pub fn strips_token(node: &ListedNode) -> String {
+    match node.kind {
+        ListedKind::Device => format!("device:{}", listed_field(&node.node_name)),
+        ListedKind::App => format!(
+            "app:{}:{}",
+            listed_field(&node.application_name),
+            listed_field(&node.binary)
+        ),
+    }
+}
+
+pub fn format_listed_node(node: &ListedNode) -> String {
+    match node.kind {
+        ListedKind::Device => format!(
+            "device\t{}\t{}\t{}",
+            listed_field(&node.node_name),
+            listed_field(&node.description),
+            strips_token(node)
+        ),
+        ListedKind::App => format!(
+            "app\t{}\t{}\t{}\t{}\t{}",
+            listed_field(&node.node_name),
+            listed_field(&node.description),
+            listed_field(&node.application_name),
+            listed_field(&node.binary),
+            strips_token(node)
+        ),
+    }
+}
+
+pub fn format_listed_nodes(nodes: &[ListedNode]) -> String {
+    let mut nodes = nodes.to_vec();
+    nodes.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then(left.node_name.cmp(&right.node_name))
+            .then(left.application_name.cmp(&right.application_name))
+            .then(left.binary.cmp(&right.binary))
+            .then(left.description.cmp(&right.description))
+    });
+    let mut out = String::new();
+    for node in &nodes {
+        out.push_str(&format_listed_node(node));
+        out.push('\n');
+    }
+    out
+}
+
+pub fn parse_listed_line(line: &str) -> Option<ListedNode> {
+    let fields: Vec<&str> = line.split('\t').collect();
+    let node = match fields.as_slice() {
+        ["device", node_name, description, _] if !node_name.is_empty() => ListedNode {
+            kind: ListedKind::Device,
+            node_name: (*node_name).to_string(),
+            description: (*description).to_string(),
+            application_name: String::new(),
+            binary: String::new(),
+        },
+        ["app", node_name, description, application_name, binary, _]
+            if !node_name.is_empty() && !application_name.is_empty() && !binary.is_empty() =>
+        {
+            ListedNode {
+                kind: ListedKind::App,
+                node_name: (*node_name).to_string(),
+                description: (*description).to_string(),
+                application_name: (*application_name).to_string(),
+                binary: (*binary).to_string(),
+            }
+        }
+        _ => return None,
+    };
+    let token = *fields.last()?;
+    if token == strips_token(&node) {
+        Some(node)
+    } else {
+        None
+    }
+}
+
+pub fn listable_nodes(nodes: &[CatalogNode], own: Option<&OwnClient>) -> Vec<ListedNode> {
+    let mut out = Vec::new();
+    for node in nodes {
+        if catalog_is_ours(node, own) || node.node_name.is_empty() {
+            continue;
+        }
+        if is_capture_device_class(&node.media_class) {
+            out.push(ListedNode {
+                kind: ListedKind::Device,
+                node_name: node.node_name.clone(),
+                description: node.description.clone(),
+                application_name: String::new(),
+                binary: String::new(),
+            });
+        } else if is_playback_stream_class(&node.media_class)
+            && !node.application_name.is_empty()
+            && !node.binary.is_empty()
+        {
+            out.push(ListedNode {
+                kind: ListedKind::App,
+                node_name: node.node_name.clone(),
+                description: node.description.clone(),
+                application_name: node.application_name.clone(),
+                binary: node.binary.clone(),
+            });
+        }
+    }
+    out
+}
+
+pub fn absent_device_names<'a>(wanted: &'a [String], nodes: &[CatalogNode]) -> Vec<&'a str> {
+    wanted
+        .iter()
+        .filter(|name| !nodes.iter().any(|node| device_present(node, name)))
+        .map(String::as_str)
+        .collect()
+}
+
+fn device_present(node: &CatalogNode, name: &str) -> bool {
+    node.node_name == *name
+        && is_capture_device_class(&node.media_class)
+        && !node.omamix_owned
+        && node.node_name != MIX_MIC_NODE_NAME
+}
+
+fn catalog_is_ours(node: &CatalogNode, own: Option<&OwnClient>) -> bool {
+    if node.omamix_owned || node.node_name == MIX_MIC_NODE_NAME {
+        return true;
+    }
+    let Some(own) = own else {
+        return false;
+    };
+    node.client_id == Some(own.client_id) || node.pid == Some(own.pid)
+}
+
+fn listed_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            '\t' | '\n' | '\r' => ' ',
+            _ => ch,
+        })
+        .collect()
+}
+
 /// One directed PipeWire link. Samples flow from `output_node` to `input_node`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LinkEdge {
@@ -254,6 +461,7 @@ pub fn tap_allowed(
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NodeIdentity {
     pub node_name: String,
+    pub description: String,
     pub media_class: String,
     pub application_name: String,
     pub binary: String,
@@ -270,6 +478,7 @@ impl NodeIdentity {
         for (key, value) in props {
             match key {
                 "node.name" => identity.node_name = value.to_string(),
+                "node.description" => identity.description = value.to_string(),
                 "media.class" => identity.media_class = value.to_string(),
                 "application.name" => identity.application_name = value.to_string(),
                 "application.process.binary" => identity.binary = value.to_string(),
@@ -288,6 +497,9 @@ impl NodeIdentity {
     pub fn merge_bind(&mut self, bound: &Self) {
         if self.node_name.is_empty() {
             self.node_name.clone_from(&bound.node_name);
+        }
+        if self.description.is_empty() {
+            self.description.clone_from(&bound.description);
         }
         if self.media_class.is_empty() {
             self.media_class.clone_from(&bound.media_class);
@@ -333,7 +545,10 @@ impl NodeIdentity {
 pub enum SourceKind {
     /// A capture device, keyed by `node.name`. The name is whatever that
     /// machine enumerates. The app does not assume a particular device.
-    CaptureDevice { node_name: String },
+    CaptureDevice {
+        node_name: String,
+    },
+    DefaultSource,
     /// One playback app. Re-attached with [`RouteKey`].
     Application(RouteKey),
     /// Each remaining playback stream, tapped on its own.
@@ -404,15 +619,16 @@ pub fn strip_should_attach(
         SourceKind::Application(key) if !key.media_name.is_empty() => TapScope::NamedStream,
         SourceKind::Application(_) => TapScope::SharedClient,
         SourceKind::OtherDesktopAudio => return false,
-        SourceKind::CaptureDevice { .. } => return false,
+        SourceKind::CaptureDevice { .. } | SourceKind::DefaultSource => return false,
     };
     if !tap_allowed(stream, own, graph, scope) {
         return false;
     }
     match &strip.source {
         SourceKind::Application(key) => key.matches_stream(stream),
-        SourceKind::OtherDesktopAudio => false,
-        SourceKind::CaptureDevice { .. } => false,
+        SourceKind::OtherDesktopAudio
+        | SourceKind::CaptureDevice { .. }
+        | SourceKind::DefaultSource => false,
     }
 }
 
@@ -784,5 +1000,164 @@ mod tests {
         native.binary.clear();
         native.binary = resolve_binary(&native.binary, "pw-cat");
         assert!(feeds_mix_mic(&native, None, None));
+    }
+
+    fn catalog(name: &str, class: &str) -> CatalogNode {
+        CatalogNode {
+            node_name: name.to_string(),
+            description: String::new(),
+            media_class: class.to_string(),
+            application_name: String::new(),
+            binary: String::new(),
+            client_id: None,
+            pid: None,
+            omamix_owned: false,
+        }
+    }
+
+    #[test]
+    fn strip_request_parses_default_device_and_app() {
+        assert_eq!(parse_strip_request("other").unwrap(), StripRequest::Other);
+        assert_eq!(
+            parse_strip_request("default").unwrap(),
+            StripRequest::Default
+        );
+        assert_eq!(
+            parse_strip_request("device:node-a").unwrap(),
+            StripRequest::Device("node-a".into())
+        );
+        assert_eq!(
+            parse_strip_request("app:tone app:pw-cat").unwrap(),
+            StripRequest::App {
+                name: "tone app".into(),
+                binary: "pw-cat".into(),
+            }
+        );
+        assert!(parse_strip_request("device:").is_err());
+        assert!(parse_strip_request("app:only").is_err());
+        assert!(parse_strip_request("app::pw-cat").is_err());
+        assert!(parse_strip_request("nope").is_err());
+    }
+
+    #[test]
+    fn listed_lines_round_trip_and_sort_devices_before_apps() {
+        let app = ListedNode {
+            kind: ListedKind::App,
+            node_name: "stream-1".into(),
+            description: "a\ttone\nline".into(),
+            application_name: "tone app".into(),
+            binary: "pw-cat".into(),
+        };
+        let device = ListedNode {
+            kind: ListedKind::Device,
+            node_name: "node-b".into(),
+            description: "Mic".into(),
+            application_name: String::new(),
+            binary: String::new(),
+        };
+        let earlier = ListedNode {
+            kind: ListedKind::Device,
+            node_name: "node-a".into(),
+            description: String::new(),
+            application_name: String::new(),
+            binary: String::new(),
+        };
+        let text = format_listed_nodes(&[app.clone(), device.clone(), earlier.clone()]);
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("device\tnode-a\t"));
+        assert!(lines[1].starts_with("device\tnode-b\t"));
+        assert!(lines[2].starts_with("app\tstream-1\t"));
+        assert!(lines[0].ends_with("\tdevice:node-a"));
+        assert!(lines[2].ends_with("\tapp:tone app:pw-cat"));
+        let parsed: Vec<_> = text
+            .lines()
+            .map(|line| parse_listed_line(line).unwrap())
+            .collect();
+        assert_eq!(parsed[0].node_name, "node-a");
+        assert_eq!(parsed[1].description, "Mic");
+        assert_eq!(parsed[2].application_name, "tone app");
+        assert_eq!(parsed[2].binary, "pw-cat");
+        assert_eq!(parsed[2].description, "a tone line");
+        assert!(parse_listed_line("device\tnode-a\tMic\tdevice:other").is_none());
+        assert!(parse_listed_line("sink\tnode-a\tMic\tdevice:node-a").is_none());
+        let _ = (app, device, earlier);
+    }
+
+    #[test]
+    fn listable_nodes_keep_capture_and_playback_and_drop_ours() {
+        let own = OwnClient {
+            client_id: 7,
+            pid: 42,
+        };
+        let mut sink = catalog("speakers", "Audio/Sink");
+        sink.description = "Speakers".into();
+        let mut source = catalog("node-a", "Audio/Source");
+        source.description = "Mic A".into();
+        let mut virtual_source = catalog("node-b", "Audio/Source/Virtual");
+        virtual_source.description = "Mic B".into();
+        let duplex = catalog("node-c", "Audio/Duplex");
+        let mut mix = catalog(MIX_MIC_NODE_NAME, "Audio/Source/Virtual");
+        mix.omamix_owned = true;
+        let mut owned_app = catalog("our-monitor", "Stream/Output/Audio");
+        owned_app.application_name = "omamix".into();
+        owned_app.binary = "omamix".into();
+        owned_app.client_id = Some(7);
+        let mut foreign = catalog("stream-1", "Stream/Output/Audio");
+        foreign.application_name = "tone app".into();
+        foreign.binary = "pw-cat".into();
+        foreign.description = "Tone".into();
+        foreign.client_id = Some(9);
+        let mut nameless = catalog("stream-2", "Stream/Output/Audio");
+        nameless.binary = "pw-cat".into();
+        let mut same_pid = catalog("stream-3", "Stream/Output/Audio");
+        same_pid.application_name = "tone app".into();
+        same_pid.binary = "pw-cat".into();
+        same_pid.pid = Some(42);
+        let listed = listable_nodes(
+            &[
+                sink,
+                source,
+                virtual_source,
+                duplex,
+                mix,
+                owned_app,
+                foreign,
+                nameless,
+                same_pid,
+            ],
+            Some(&own),
+        );
+        let text = format_listed_nodes(&listed);
+        assert_eq!(
+            text,
+            "\
+device\tnode-a\tMic A\tdevice:node-a
+device\tnode-b\tMic B\tdevice:node-b
+device\tnode-c\t\tdevice:node-c
+app\tstream-1\tTone\ttone app\tpw-cat\tapp:tone app:pw-cat
+"
+        );
+    }
+
+    #[test]
+    fn absent_device_names_ignore_sinks_and_owned_nodes() {
+        let mut sink = catalog("node-a", "Audio/Sink");
+        sink.description = "not a source".into();
+        let source = catalog("node-b", "Audio/Source/Virtual");
+        let mut owned = catalog("node-c", "Audio/Source");
+        owned.omamix_owned = true;
+        let mix = catalog(MIX_MIC_NODE_NAME, "Audio/Source/Virtual");
+        let wanted = vec![
+            "node-a".to_string(),
+            "node-b".to_string(),
+            "node-c".to_string(),
+            MIX_MIC_NODE_NAME.to_string(),
+            "missing".to_string(),
+        ];
+        assert_eq!(
+            absent_device_names(&wanted, &[sink, source, owned, mix]),
+            vec!["node-a", "node-c", MIX_MIC_NODE_NAME, "missing"]
+        );
     }
 }

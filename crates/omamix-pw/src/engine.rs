@@ -115,6 +115,7 @@ struct Ready {
 enum Boot {
     Ready(Ready),
     Failed(String),
+    Usage(String),
 }
 
 /// Open a client only when `publish_mix_mic` is set. Blocks until shutdown.
@@ -137,7 +138,7 @@ pub fn run_headless(options: HeadlessOptions) -> Result<HeadlessReport, EngineEr
         .name("omamix-pw".into())
         .spawn(move || {
             let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                pw_thread(options, pw_rx, ready_tx);
+                pw_thread(options, None, pw_rx, ready_tx);
             }));
         })
         .map_err(|err| EngineError::PipeWire(err.to_string()))?;
@@ -253,6 +254,10 @@ fn wait_until_ready(
                 let _ = pw_tx.send(LoopMsg::Shutdown);
                 return Err(EngineError::PipeWire(message));
             }
+            Ok(Boot::Usage(message)) => {
+                let _ = pw_tx.send(LoopMsg::Shutdown);
+                return Err(EngineError::Usage(message));
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if STOP.load(Ordering::SeqCst) {
                     return Err(EngineError::PipeWire(
@@ -287,8 +292,68 @@ fn arm_signals() {
     }
 }
 
+pub fn run_list() -> Result<String, EngineError> {
+    let (list_tx, list_rx) = std::sync::mpsc::channel();
+    let (ready_tx, _ready_rx) = std::sync::mpsc::channel::<Boot>();
+    let (pw_tx, pw_rx) = pw::channel::channel::<LoopMsg>();
+    arm_signals();
+    let options = HeadlessOptions {
+        scene: Scene::empty("list"),
+        duration: None,
+        publish_mix_mic: false,
+        tone: false,
+    };
+    let thread = std::thread::Builder::new()
+        .name("omamix-pw".into())
+        .spawn(move || {
+            let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                pw_thread(options, Some(list_tx), pw_rx, ready_tx);
+            }));
+        })
+        .map_err(|err| EngineError::PipeWire(err.to_string()))?;
+    let started = Instant::now();
+    loop {
+        if STOP.swap(false, Ordering::SeqCst) {
+            let _ = pw_tx.send(LoopMsg::Shutdown);
+            let _ = thread.join();
+            return Err(EngineError::PipeWire(
+                "stopped before the device list was ready".into(),
+            ));
+        }
+        match list_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(nodes) => {
+                let _ = pw_tx.send(LoopMsg::Shutdown);
+                let _ = thread.join();
+                return Ok(route::format_listed_nodes(&nodes));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if thread.is_finished() {
+                    let _ = thread.join();
+                    return Err(EngineError::PipeWire(
+                        "PipeWire thread stopped before the device list was ready".into(),
+                    ));
+                }
+                if started.elapsed() >= Duration::from_secs(5) {
+                    let _ = pw_tx.send(LoopMsg::Shutdown);
+                    let _ = thread.join();
+                    return Err(EngineError::PipeWire(
+                        "device list was not ready within 5s".into(),
+                    ));
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = thread.join();
+                return Err(EngineError::PipeWire(
+                    "PipeWire thread stopped before the device list was ready".into(),
+                ));
+            }
+        }
+    }
+}
+
 fn pw_thread(
     options: HeadlessOptions,
+    list_tx: Option<std::sync::mpsc::Sender<Vec<route::ListedNode>>>,
     pw_rx: pw::channel::Receiver<LoopMsg>,
     ready_tx: std::sync::mpsc::Sender<Boot>,
 ) {
@@ -341,6 +406,7 @@ fn pw_thread(
 
     let queue = CommandQueue::new();
     let _command_sender = queue.sender();
+    let strips_checked = !scene_needs_device_check(&options.scene);
     let shared_loop = Rc::new(LoopShared {
         pending: Mutex::new(Vec::new()),
         inner: RefCell::new(LoopInner {
@@ -357,6 +423,14 @@ fn pw_thread(
             sink_seen: false,
             default_source: None,
             default_sink: None,
+            configured_source: None,
+            configured_seen: false,
+            settle_round: 0,
+            settle_pending: None,
+            saw_settle_done: false,
+            strips_checked,
+            started: Instant::now(),
+            list_tx,
             published: false,
             engine_linked: false,
             engine_saw_edges: false,
@@ -401,6 +475,26 @@ fn pw_thread(
             })
             .register()
     };
+    let _core_listener = {
+        let on_done = Rc::clone(&shared_loop);
+        core.add_listener_local()
+            .done(move |id, seq| {
+                if let Ok(mut pending) = on_done.pending.lock() {
+                    pending.push(Pending::CoreDone { id, seq });
+                }
+            })
+            .register()
+    };
+    match core.sync(0) {
+        Ok(seq) => {
+            let mut inner = shared_loop.inner.borrow_mut();
+            inner.settle_round = 1;
+            inner.settle_pending = Some(seq);
+        }
+        Err(_) => {
+            shared_loop.inner.borrow_mut().settle_round = 3;
+        }
+    }
 
     let monitor_on = Arc::new(AtomicBool::new(
         shared_loop.inner.borrow().scene.master.monitor_mix,
@@ -443,6 +537,7 @@ fn pw_thread(
     drop(timer);
     drop(_attached);
     drop(listener);
+    drop(_core_listener);
     drop(monitor_keep);
     drop(shared_loop);
     drop(filter);
@@ -639,6 +734,10 @@ enum Pending {
         key: String,
         value: Option<String>,
     },
+    CoreDone {
+        id: u32,
+        seq: pw::spa::utils::result::AsyncSeq,
+    },
 }
 
 struct LoopInner {
@@ -655,6 +754,14 @@ struct LoopInner {
     sink_seen: bool,
     default_source: Option<String>,
     default_sink: Option<String>,
+    configured_source: Option<String>,
+    configured_seen: bool,
+    settle_round: u8,
+    settle_pending: Option<pw::spa::utils::result::AsyncSeq>,
+    saw_settle_done: bool,
+    strips_checked: bool,
+    started: Instant,
+    list_tx: Option<std::sync::mpsc::Sender<Vec<route::ListedNode>>>,
     published: bool,
     engine_linked: bool,
     engine_saw_edges: bool,
@@ -778,6 +885,16 @@ fn tick(
     if shared.inner.borrow().quit {
         return true;
     }
+    advance_settle(shared);
+    if list_if_ready(shared) {
+        return true;
+    }
+    if reject_devices_if_ready(shared) {
+        return true;
+    }
+    if shared.inner.borrow().quit {
+        return true;
+    }
     ensure_published(shared, filter, monitor_keep, monitor_on);
     if shared.inner.borrow().quit {
         return true;
@@ -874,6 +991,7 @@ fn apply_event(shared: &Rc<LoopShared>, event: Pending) {
         Pending::Info { id, props } => note_info(shared, id, &props),
         Pending::LinkState { key, active, error } => note_link_state(shared, key, active, error),
         Pending::Metadata { key, value } => note_metadata(shared, &key, value.as_deref()),
+        Pending::CoreDone { id, seq } => note_core_done(shared, id, seq),
     }
 }
 
@@ -1428,7 +1546,7 @@ fn wanted_peers(inner: &LoopInner) -> Vec<u32> {
                     }
                 }
             }
-            SourceKind::OtherDesktopAudio => {}
+            SourceKind::DefaultSource | SourceKind::OtherDesktopAudio => {}
         }
     }
     if inner
@@ -1956,7 +2074,7 @@ fn silent_unlink_peer(inner: &mut LoopInner, peer: u32) {
 fn note_metadata(shared: &LoopShared, key: &str, value: Option<&str>) {
     let name = value.and_then(metadata::metadata_node_name);
     let mut inner = shared.inner.borrow_mut();
-    if key == "default.audio.source" {
+    if key == metadata::AUDIO_SOURCE_KEY {
         if name.as_deref() == Some(MIX_MIC_NODE_NAME) {
             eprintln!(
                 "omamix: warning: Mix Mic is the default source, so the Mix Mic node is being removed. A stored choice of Mix Mic does this on every start. Pick another source, then start omamix again."
@@ -1981,6 +2099,9 @@ fn note_metadata(shared: &LoopShared, key: &str, value: Option<&str>) {
         }
         inner.source_seen = true;
         inner.default_source = name;
+    } else if key == metadata::CONFIGURED_AUDIO_SOURCE_KEY {
+        inner.configured_seen = true;
+        inner.configured_source = name;
     } else if key == "default.audio.sink" {
         if inner.sink_seen
             && let DefaultDeviceObservation::Changed { now } =
@@ -1990,6 +2111,202 @@ fn note_metadata(shared: &LoopShared, key: &str, value: Option<&str>) {
         }
         inner.sink_seen = true;
         inner.default_sink = name;
+    }
+}
+
+fn scene_needs_device_check(scene: &Scene) -> bool {
+    scene.strips.iter().any(|strip| {
+        matches!(
+            strip.source,
+            SourceKind::CaptureDevice { .. } | SourceKind::DefaultSource
+        )
+    })
+}
+
+fn advance_settle(shared: &LoopShared) {
+    let timed_out = {
+        let inner = shared.inner.borrow();
+        inner.settle_round < 3 && inner.started.elapsed() >= Duration::from_secs(2)
+    };
+    if timed_out {
+        shared.inner.borrow_mut().settle_round = 3;
+        return;
+    }
+    let round = {
+        let mut inner = shared.inner.borrow_mut();
+        if !inner.saw_settle_done {
+            return;
+        }
+        inner.saw_settle_done = false;
+        inner.settle_round
+    };
+    if round == 1 {
+        match issue_sync(shared) {
+            Some(seq) => {
+                let mut inner = shared.inner.borrow_mut();
+                inner.settle_round = 2;
+                inner.settle_pending = Some(seq);
+            }
+            None => shared.inner.borrow_mut().settle_round = 3,
+        }
+    } else if round == 2 {
+        shared.inner.borrow_mut().settle_round = 3;
+    }
+}
+
+fn issue_sync(shared: &LoopShared) -> Option<pw::spa::utils::result::AsyncSeq> {
+    let core_ptr = shared.inner.borrow().core;
+    let core = unsafe { &*core_ptr.cast::<pw::core::Core>() };
+    core.sync(0).ok()
+}
+
+fn note_core_done(shared: &LoopShared, id: u32, seq: pw::spa::utils::result::AsyncSeq) {
+    if id != pw::core::PW_ID_CORE {
+        return;
+    }
+    let mut inner = shared.inner.borrow_mut();
+    if inner.settle_pending == Some(seq) {
+        inner.saw_settle_done = true;
+        inner.settle_pending = None;
+    }
+}
+
+fn list_if_ready(shared: &LoopShared) -> bool {
+    let mut inner = shared.inner.borrow_mut();
+    if inner.list_tx.is_none() || inner.settle_round < 3 {
+        return false;
+    }
+    let listed = listed_nodes(&inner);
+    if let Some(tx) = inner.list_tx.take() {
+        let _ = tx.send(listed);
+    }
+    true
+}
+
+fn reject_devices_if_ready(shared: &LoopShared) -> bool {
+    let ready = {
+        let inner = shared.inner.borrow();
+        inner.list_tx.is_none() && !inner.strips_checked && inner.settle_round >= 3
+    };
+    if !ready {
+        return false;
+    }
+    let result = {
+        let mut inner = shared.inner.borrow_mut();
+        resolve_requested_devices(&mut inner)
+    };
+    match result {
+        Ok(()) => {
+            shared.inner.borrow_mut().strips_checked = true;
+            false
+        }
+        Err(message) => {
+            fail_usage(shared, &message);
+            true
+        }
+    }
+}
+
+fn resolve_requested_devices(inner: &mut LoopInner) -> Result<(), String> {
+    let wants_default = inner
+        .scene
+        .strips
+        .iter()
+        .any(|strip| matches!(strip.source, SourceKind::DefaultSource));
+    if wants_default {
+        let snapshot = metadata::DefaultSourceSnapshot {
+            audio_source: if inner.source_seen {
+                inner.default_source.clone()
+            } else {
+                None
+            },
+            configured_audio_source: if inner.configured_seen {
+                inner.configured_source.clone()
+            } else {
+                None
+            },
+        };
+        let name = metadata::resolve_default_source(&snapshot)
+            .map_err(|_| "no default audio source".to_string())?;
+        if !inner.source_seen {
+            inner.source_seen = true;
+        }
+        for strip in &mut inner.scene.strips {
+            if matches!(strip.source, SourceKind::DefaultSource) {
+                strip.name.clone_from(&name);
+                strip.source = SourceKind::CaptureDevice {
+                    node_name: name.clone(),
+                };
+            }
+        }
+    }
+    let catalog = catalog_nodes(inner);
+    let wanted: Vec<String> = inner
+        .scene
+        .strips
+        .iter()
+        .filter_map(|strip| match &strip.source {
+            SourceKind::CaptureDevice { node_name } => Some(node_name.clone()),
+            _ => None,
+        })
+        .collect();
+    let missing = route::absent_device_names(&wanted, &catalog);
+    if missing.is_empty() {
+        Ok(())
+    } else if missing.len() == 1 {
+        Err(format!("device strip '{}' was not found", missing[0]))
+    } else {
+        let names = missing
+            .iter()
+            .map(|name| format!("'{name}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(format!("device strips {names} were not found"))
+    }
+}
+
+fn catalog_nodes(inner: &LoopInner) -> Vec<route::CatalogNode> {
+    inner
+        .nodes
+        .values()
+        .map(|node| {
+            let mut application_name = node.identity.application_name.clone();
+            let mut binary = node.identity.binary.clone();
+            if let Some(client) = node
+                .identity
+                .client_id
+                .and_then(|id| inner.clients.get(&id))
+            {
+                if application_name.is_empty() {
+                    application_name.clone_from(&client.application_name);
+                }
+                if binary.is_empty() {
+                    binary = route::resolve_binary("", &client.binary);
+                }
+            }
+            route::CatalogNode {
+                node_name: node.identity.node_name.clone(),
+                description: node.identity.description.clone(),
+                media_class: node.identity.media_class.clone(),
+                application_name,
+                binary,
+                client_id: node.identity.client_id,
+                pid: node.identity.pid,
+                omamix_owned: node.identity.omamix_owned,
+            }
+        })
+        .collect()
+}
+
+fn listed_nodes(inner: &LoopInner) -> Vec<route::ListedNode> {
+    route::listable_nodes(&catalog_nodes(inner), inner.own.as_ref())
+}
+
+fn fail_usage(shared: &LoopShared, message: &str) {
+    let mut inner = shared.inner.borrow_mut();
+    inner.quit = true;
+    if let Some(tx) = inner.ready_tx.take() {
+        let _ = tx.send(Boot::Usage(message.to_string()));
     }
 }
 
@@ -2009,7 +2326,11 @@ fn ensure_published(
 ) {
     let ready = {
         let inner = shared.inner.borrow();
-        inner.source_seen && !inner.published && !inner.quit
+        inner.list_tx.is_none()
+            && inner.source_seen
+            && inner.strips_checked
+            && !inner.published
+            && !inner.quit
     };
     if !ready || filter.borrow().is_some() {
         return;

@@ -15,7 +15,7 @@ mod engine;
 mod filter;
 
 #[cfg(feature = "pipewire")]
-pub use engine::{HeadlessOptions, run_headless};
+pub use engine::{HeadlessOptions, run_headless, run_list};
 
 use std::fmt;
 
@@ -142,6 +142,7 @@ pub enum EngineError {
     /// The feature is compiled, but no client has been opened.
     NotConnected,
     PipeWire(String),
+    Usage(String),
 }
 
 impl fmt::Display for EngineError {
@@ -149,6 +150,7 @@ impl fmt::Display for EngineError {
         match self {
             EngineError::NotConnected => write!(f, "PipeWire client is not connected"),
             EngineError::PipeWire(message) => write!(f, "PipeWire error: {message}"),
+            EngineError::Usage(message) => write!(f, "{message}"),
         }
     }
 }
