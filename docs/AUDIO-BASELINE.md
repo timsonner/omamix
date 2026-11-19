@@ -1,6 +1,6 @@
-# Audio baseline: XPS15-OMARCHY
+# Audio baseline (example host only)
 
-Read-only inspection on 2026-10-11, about 01:23–01:30 America/Denver (MDT). Host `XPS15-OMARCHY`. This file is that machine's baseline, an example. Other systems may have none of these devices. omamix does not assume these names or these levels. Defaults, volumes, mutes, and config files were not changed. There was no persistent graph change (`pw-record` briefly linked to that machine's capture ports; that link ended when the process exited).
+Read-only inspection on 2026-10-11, about 01:23-01:30 America/Denver (MDT). Example hostname: `XPS15-OMARCHY`. This file is one machine's baseline, not a target configuration. Other systems may have none of these devices. omamix does not assume these names or these levels. Defaults, volumes, mutes, and config files were not changed. There was no persistent graph change (`pw-record` briefly linked to that machine's capture ports; that link ended when the process exited).
 
 Each fact below names the command that produced it.
 

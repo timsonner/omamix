@@ -11,6 +11,9 @@ use std::ptr::{self, NonNull};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
+use omamix_core::comp::{CompReader, CompUpdate, CompWriter, open as open_comp};
+use omamix_core::eq::{EqReader, EqUpdate, EqWriter, open};
+use omamix_core::limit::{LimitReader, LimitUpdate, LimitWriter, open as open_limit};
 use omamix_core::params::{
     STRIP_SLOT_COUNT, StripBlockInput, StripMeterBank, StripMixer, StripParamBank,
 };
@@ -24,6 +27,7 @@ use pw::sys as pw_sys;
 use crate::rt::{AtomicMeter, AtomicParams, MIX_SLOT_CAP, MixSlot};
 
 const PW_FILTER_FLAG_RT_PROCESS: u32 = 1 << 2;
+const PW_FILTER_FLAG_CUSTOM_LATENCY: u32 = 1 << 3;
 const PW_FILTER_PORT_FLAG_MAP_BUFFERS: u32 = 1 << 0;
 const PW_VERSION_FILTER_EVENTS: u32 = 1;
 
@@ -145,6 +149,12 @@ unsafe extern "C" {
     fn pw_filter_remove_port(port_data: *mut c_void) -> i32;
     fn pw_filter_disconnect(filter: *mut c_void) -> i32;
     fn pw_filter_get_data_loop(filter: *mut c_void) -> *mut PwLoopHead;
+    fn pw_filter_update_params(
+        filter: *mut c_void,
+        port_data: *mut c_void,
+        params: *const *const c_void,
+        n_params: u32,
+    ) -> i32;
 }
 
 /// Smoother state. Only the data loop (`process` and `clear_tap_slot`) mutates it.
@@ -249,13 +259,81 @@ impl RtScopes {
 // and does not touch either cell.
 unsafe impl Sync for RtScopes {}
 
+/// EQ publications for the data loop. The producer is [`EqWriter`], which
+/// is not stored here and is not `Sync`.
+struct RtEq {
+    reader: UnsafeCell<EqReader>,
+}
+
+impl RtEq {
+    /// Pointer to the reader cell. The caller turns it into one `&mut EqReader`.
+    ///
+    /// A reference tied to `&self` would borrow all of `ProcessShared` and
+    /// could not sit next to `&shared.strips` in `process`.
+    fn reader_ptr(&self) -> *mut EqReader {
+        self.reader.get()
+    }
+}
+
+// SAFETY: `reader` is polled only on the data loop, through one `&mut EqReader`
+// per callback. `EqReader` is not `Sync` and not `Clone`. This wrapper is what
+// lets `ProcessShared` be shared. The producer is a separate `EqWriter` owned
+// by the loop thread, not a field of this struct.
+unsafe impl Sync for RtEq {}
+
+/// Compressor publications for the data loop. The producer is [`CompWriter`],
+/// which is not stored here and is not `Sync`.
+struct RtComp {
+    reader: UnsafeCell<CompReader>,
+}
+
+impl RtComp {
+    /// Pointer to the reader cell. The caller turns it into one `&mut CompReader`.
+    ///
+    /// A reference tied to `&self` would borrow all of `ProcessShared` and
+    /// could not sit next to `&shared.strips` in `process`.
+    fn reader_ptr(&self) -> *mut CompReader {
+        self.reader.get()
+    }
+}
+
+// SAFETY: `reader` is polled only on the data loop, through one `&mut CompReader` per callback. `CompReader` is not `Sync` and not `Clone`.
+// SAFETY: This wrapper is what lets `ProcessShared` be shared. The producer is a separate `CompWriter` owned by the loop thread, not a field of this struct.
+unsafe impl Sync for RtComp {}
+
+/// Limiter publications for the data loop. The producer is [`LimitWriter`],
+/// which is not stored here and is not `Sync`.
+struct RtLimit {
+    reader: UnsafeCell<LimitReader>,
+}
+
+impl RtLimit {
+    fn reader_ptr(&self) -> *mut LimitReader {
+        self.reader.get()
+    }
+}
+
+// SAFETY: `reader` is polled only on the data loop, through one `&mut LimitReader` per callback. `LimitReader` is not `Sync` and not `Clone`. This wrapper is what lets `ProcessShared` be shared. The producer is a separate `LimitWriter` owned by the loop thread, not a field of this struct.
+unsafe impl Sync for RtLimit {}
+
 /// Shared with `process()`. The loop thread writes params and port pointers.
-/// `process()` writes the meters, the scope rings, and the monitor slot.
-/// No channel receive.
+/// `process()` writes the meters, the gain-reduction atomics, the scope rings,
+/// and the monitor slot. No channel receive. EQ coefficients and compressor
+/// blocks are not published from this struct.
 pub struct ProcessShared {
     pub params: AtomicParams,
     /// Per-strip trim, fader, pan, mute, solo, and enable. The loop thread writes.
     pub strips: StripParamBank,
+    /// High-pass and graphic EQ publications. `process` only loads them.
+    eq: RtEq,
+    /// Compressor publications. `process` loads them through `&mut CompReader`
+    /// and writes gain reduction back.
+    comp: RtComp,
+    /// Master limiter publications. `process` loads them through `&mut LimitReader`.
+    limit: RtLimit,
+    /// Sample rate from the last `process`, so the loop thread can rebuild.
+    /// Zero until the first callback.
+    pub observed_rate: AtomicU32,
     /// Smoother state. Only the data loop (`process` and `clear_tap_slot`) touches it.
     mixer: RtMixer,
     /// Master block peak and RMS, after the master fader.
@@ -277,30 +355,150 @@ pub struct ProcessShared {
     pub tone: AtomicBool,
     /// Oscillator phase in cycles, `0.0..1.0`, stored as bits.
     pub tone_phase: AtomicU32,
+    /// Master lookahead in samples. The loop thread publishes it.
+    own_latency: AtomicU32,
+    upstream_fl: [AtomicU32; MAX_TAP_PORTS],
+    upstream_fr: [AtomicU32; MAX_TAP_PORTS],
+    /// Max upstream peer rate. The filter main loop stores it from
+    /// `on_param_changed` and reads it in `write_known_port_latency`.
+    /// The audio callback does not read it.
+    upstream_rate: AtomicU32,
 }
 
 impl ProcessShared {
+    #[cfg(test)]
     fn new() -> Self {
-        Self {
-            params: AtomicParams::new(),
-            strips: StripParamBank::new(),
-            mixer: RtMixer::new(48_000),
-            meter: AtomicMeter::new(),
-            strip_meters: StripMeterBank::new(),
-            scopes: RtScopes::new(),
-            slot: MixSlot::new(),
-            filter: AtomicPtr::new(ptr::null_mut()),
-            node_id: AtomicU32::new(u32::MAX),
-            state: AtomicI32::new(0),
-            out_fl: AtomicPtr::new(ptr::null_mut()),
-            out_fr: AtomicPtr::new(ptr::null_mut()),
-            inputs_fl: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
-            inputs_fr: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
-            input_count: AtomicUsize::new(0),
-            tone: AtomicBool::new(false),
-            tone_phase: AtomicU32::new(0),
+        Self::pair().0
+    }
+
+    /// Readers stay in the shared state. The writers are the loop thread's.
+    fn pair() -> (Self, EqWriter, CompWriter, LimitWriter) {
+        let (eq_writer, eq_reader) = open();
+        let (comp_writer, comp_reader) = open_comp();
+        let (limit_writer, limit_reader) = open_limit();
+        let own = limit_writer.reported_latency_samples();
+        (
+            Self {
+                params: AtomicParams::new(),
+                strips: StripParamBank::new(),
+                eq: RtEq {
+                    reader: UnsafeCell::new(eq_reader),
+                },
+                comp: RtComp {
+                    reader: UnsafeCell::new(comp_reader),
+                },
+                limit: RtLimit {
+                    reader: UnsafeCell::new(limit_reader),
+                },
+                observed_rate: AtomicU32::new(0),
+                mixer: RtMixer::new(48_000),
+                meter: AtomicMeter::new(),
+                strip_meters: StripMeterBank::new(),
+                scopes: RtScopes::new(),
+                slot: MixSlot::new(),
+                filter: AtomicPtr::new(ptr::null_mut()),
+                node_id: AtomicU32::new(u32::MAX),
+                state: AtomicI32::new(0),
+                out_fl: AtomicPtr::new(ptr::null_mut()),
+                out_fr: AtomicPtr::new(ptr::null_mut()),
+                inputs_fl: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
+                inputs_fr: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
+                input_count: AtomicUsize::new(0),
+                tone: AtomicBool::new(false),
+                tone_phase: AtomicU32::new(0),
+                own_latency: AtomicU32::new(own),
+                upstream_fl: std::array::from_fn(|_| AtomicU32::new(0)),
+                upstream_fr: std::array::from_fn(|_| AtomicU32::new(0)),
+                upstream_rate: AtomicU32::new(0),
+            },
+            eq_writer,
+            comp_writer,
+            limit_writer,
+        )
+    }
+
+    fn recompute_upstream(&self) -> u32 {
+        let mut max_rate = 0u32;
+        for slot in 0..MAX_TAP_PORTS {
+            max_rate = max_rate.max(self.upstream_fl[slot].load(Ordering::Acquire));
+            max_rate = max_rate.max(self.upstream_fr[slot].load(Ordering::Acquire));
+        }
+        self.upstream_rate.store(max_rate, Ordering::Release);
+        max_rate
+    }
+
+    fn clear_upstream_slot(&self, slot: usize) {
+        if slot >= MAX_TAP_PORTS {
+            return;
+        }
+        self.upstream_fl[slot].store(0, Ordering::Release);
+        self.upstream_fr[slot].store(0, Ordering::Release);
+        self.recompute_upstream();
+    }
+
+    /// Store one input port's peer rate and return the output-direction sum.
+    ///
+    /// `port` is the filter port userdata. An unknown port is ignored so an
+    /// output-port event cannot wipe the upstream rate.
+    fn note_peer_latency(&self, port: *mut c_void, rate: u32) -> Option<u32> {
+        if port.is_null() {
+            return None;
+        }
+        let mut found = false;
+        for slot in 0..MAX_TAP_PORTS {
+            if self.inputs_fl[slot].load(Ordering::Acquire) == port {
+                self.upstream_fl[slot].store(rate, Ordering::Release);
+                found = true;
+                break;
+            }
+            if self.inputs_fr[slot].load(Ordering::Acquire) == port {
+                self.upstream_fr[slot].store(rate, Ordering::Release);
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return None;
+        }
+        let upstream = self.recompute_upstream();
+        let own = self.own_latency.load(Ordering::Acquire);
+        let output = output_direction_latency(upstream, own);
+        self.rewrite_output_ports(output);
+        Some(output)
+    }
+
+    fn rewrite_output_ports(&self, samples: u32) {
+        let filter = self.filter.load(Ordering::Acquire);
+        if filter.is_null() {
+            return;
+        }
+        let bytes = port_latency_pod(samples, pw::spa::sys::SPA_DIRECTION_OUTPUT);
+        let Some(pod) = pw::spa::pod::Pod::from_bytes(&bytes) else {
+            return;
+        };
+        let params = [pod.as_raw_ptr() as *const c_void];
+        for port in [
+            self.out_fl.load(Ordering::Acquire),
+            self.out_fr.load(Ordering::Acquire),
+        ] {
+            if port.is_null() {
+                continue;
+            }
+            // SAFETY: `filter` is the pw_filter stored on this ProcessShared and is non-null. `port` is one of its output ports and is non-null. `params` holds one spa_pod built from `bytes`, which stays alive for this call. PipeWire copies the pod before returning. `on_param_changed` runs this on the filter main loop, not from `process`.
+            unsafe {
+                pw_filter_update_params(filter, port, params.as_ptr(), 1);
+            }
         }
     }
+}
+
+/// Output-direction latency is the upstream peer's max rate plus this node's lookahead.
+///
+/// Only that rate is carried. Peer `ns` and quantum are not added, and the
+/// pod this node writes sets both to 0. Input-direction latency stays the
+/// lookahead alone.
+fn output_direction_latency(upstream: u32, own: u32) -> u32 {
+    upstream.saturating_add(own)
 }
 
 pub struct MixFilter {
@@ -308,7 +506,38 @@ pub struct MixFilter {
     events: Box<PwFilterEvents>,
     hook: Box<pw::spa::sys::spa_hook>,
     shared: Arc<ProcessShared>,
+    /// The only EQ producer. Not shared with `process`.
+    eq: EqWriter,
+    /// The only compressor producer. Not shared with `process`.
+    comp: CompWriter,
+    /// The only limiter producer. Not shared with `process`.
+    limit: LimitWriter,
     destroyed: bool,
+    /// True after `pw_filter_connect`. Param updates stay off the unit-test
+    /// filter, which has no PipeWire object.
+    live: bool,
+    /// Last `(samples, rate)` passed to `pw_filter_update_params` for `ProcessLatency`.
+    latency_sent: Option<(u32, u32)>,
+    /// Last `(input samples, output samples)` written to port `Latency`.
+    ports_latency_sent: Option<(u32, u32)>,
+    /// Last `(samples, rate)` the loop decided to publish. Set even when the
+    /// filter is not live, so a unit test can see a reset without PipeWire.
+    #[cfg(test)]
+    latency_queued: Option<(u32, u32)>,
+    /// Output-direction samples the last port write used. Set even when the
+    /// filter is not live, so a unit test can see upstream plus lookahead.
+    #[cfg(test)]
+    output_latency_written: Option<u32>,
+    /// Input-direction samples the last port write used. This stays the
+    /// lookahead and does not include the upstream rate.
+    #[cfg(test)]
+    input_latency_written: Option<u32>,
+    /// How many times the port sample counts actually changed.
+    #[cfg(test)]
+    port_latency_writes: u32,
+    /// Loop-thread lines for a master cap demotion. `process` does not push.
+    #[cfg(test)]
+    demotion_lines: Vec<String>,
     /// Unit tests set this so [`Self::add_tap_ports`] can run without a filter.
     /// A real connect leaves it false and adds the port.
     #[cfg(test)]
@@ -322,7 +551,8 @@ impl MixFilter {
         tone: bool,
     ) -> Result<Self, pw::Error> {
         let name = CString::new("omamix mix engine").expect("name");
-        let shared = Arc::new(ProcessShared::new());
+        let (shared, eq, comp, limit) = ProcessShared::pair();
+        let shared = Arc::new(shared);
         shared.tone.store(tone, Ordering::Release);
         let raw = unsafe { pw_filter_new(core.as_raw_ptr(), name.as_ptr(), props.into_raw()) };
         let raw = NonNull::new(raw).ok_or(pw::Error::CreationFailed)?;
@@ -333,7 +563,7 @@ impl MixFilter {
             destroy: None,
             state_changed: Some(on_state),
             io_changed: None,
-            param_changed: None,
+            param_changed: Some(on_param_changed),
             add_buffer: None,
             remove_buffer: None,
             process: Some(on_process),
@@ -355,34 +585,225 @@ impl MixFilter {
             events,
             hook,
             shared,
+            eq,
+            comp,
+            limit,
             destroyed: false,
+            live: false,
+            latency_sent: None,
+            ports_latency_sent: None,
+            #[cfg(test)]
+            latency_queued: None,
+            #[cfg(test)]
+            output_latency_written: None,
+            #[cfg(test)]
+            input_latency_written: None,
+            #[cfg(test)]
+            port_latency_writes: 0,
+            #[cfg(test)]
+            demotion_lines: Vec::new(),
             #[cfg(test)]
             reject_ports: false,
         };
         filter.add_output_ports()?;
-        // Advertised Props. `process` writes the samples directly and does not
-        // multiply by this gain; 1.0 is what `wpctl` reads for the node.
-        // `pw_filter_connect` copies the pod.
+        let samples = filter.reported_latency_samples();
+        let rate = filter.limit.sample_rate();
         let props_bytes = unity_props_pod();
+        let latency_bytes = process_latency_pod(samples, rate);
         let props_pod =
             pw::spa::pod::Pod::from_bytes(&props_bytes).ok_or(pw::Error::CreationFailed)?;
-        let params = [props_pod.as_raw_ptr() as *const c_void];
+        let latency_pod =
+            pw::spa::pod::Pod::from_bytes(&latency_bytes).ok_or(pw::Error::CreationFailed)?;
+        let params = [
+            props_pod.as_raw_ptr() as *const c_void,
+            latency_pod.as_raw_ptr() as *const c_void,
+        ];
         let rc = unsafe {
             pw_filter_connect(
                 filter.raw.as_ptr(),
-                PW_FILTER_FLAG_RT_PROCESS,
+                PW_FILTER_FLAG_RT_PROCESS | PW_FILTER_FLAG_CUSTOM_LATENCY,
                 params.as_ptr(),
-                1,
+                params.len() as u32,
             )
         };
         if rc < 0 {
             return Err(pw::Error::CreationFailed);
         }
+        filter.live = true;
+        filter.latency_sent = Some((samples, rate));
+        filter.write_known_port_latency(samples);
         Ok(filter)
     }
 
     pub fn shared(&self) -> Arc<ProcessShared> {
         Arc::clone(&self.shared)
+    }
+
+    pub(crate) fn apply_strip_eq(&mut self, slot: u16, update: EqUpdate) -> bool {
+        self.eq.apply(slot, update)
+    }
+
+    pub(crate) fn apply_master_eq(&mut self, update: EqUpdate) -> bool {
+        self.eq.apply_master(update)
+    }
+
+    pub(crate) fn set_eq_rate(&mut self, rate: u32) -> bool {
+        self.eq.set_sample_rate(rate)
+    }
+
+    pub(crate) fn apply_strip_comp(&mut self, slot: u16, update: CompUpdate) -> bool {
+        self.comp.apply(slot, update)
+    }
+
+    pub(crate) fn apply_master_comp(&mut self, update: CompUpdate) -> bool {
+        self.comp.apply_master(update)
+    }
+
+    pub(crate) fn set_comp_rate(&mut self, rate: u32) -> bool {
+        self.comp.set_sample_rate(rate)
+    }
+
+    pub(crate) fn apply_master_limit(&mut self, update: LimitUpdate) -> bool {
+        let applied = self.limit.apply_master(update);
+        if applied.demoted() {
+            self.log_cap_demotion();
+        }
+        self.note_process_latency();
+        applied.accepted()
+    }
+
+    pub(crate) fn set_limit_rate(&mut self, rate: u32) -> bool {
+        let applied = self.limit.set_sample_rate(rate);
+        self.log_recorded_demotions();
+        self.note_process_latency();
+        applied
+    }
+
+    /// Copy the callback quantum into the 0 ms cap and publish latency if
+    /// that quantum demoted the master.
+    pub(crate) fn sync_limit_quantum(&mut self) {
+        let frames = self.limit.callback_quantum();
+        if frames == 0 {
+            return;
+        }
+        if self.limit.set_processing_quantum(frames) {
+            self.log_recorded_demotions();
+            self.note_process_latency();
+        }
+    }
+
+    fn log_recorded_demotions(&mut self) {
+        for _slot in self.limit.drain_cap_demotions() {
+            self.log_cap_demotion();
+        }
+    }
+
+    fn log_cap_demotion(&mut self) {
+        let line = "omamix: limiter master stored 5 ms lookahead; the 0 ms clipper is off and the delay is 5 ms";
+        eprintln!("{line}");
+        #[cfg(test)]
+        self.demotion_lines.push(line.to_string());
+    }
+
+    /// Publish `ProcessLatency` on the loop thread.
+    ///
+    /// `process` does not call this. Port latency is rewritten when the
+    /// lookahead or the upstream rate changes. Storing a port pointer clears
+    /// the cached sample counts, so a newly added strip is written even when
+    /// those counts match the previous pair.
+    fn note_process_latency(&mut self) {
+        let samples = self.reported_latency_samples();
+        let rate = self.limit.sample_rate();
+        self.write_known_port_latency(samples);
+        if self.latency_sent == Some((samples, rate)) {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.latency_queued = Some((samples, rate));
+        }
+        if !self.live {
+            return;
+        }
+        let bytes = process_latency_pod(samples, rate);
+        let Some(pod) = pw::spa::pod::Pod::from_bytes(&bytes) else {
+            return;
+        };
+        let params = [pod.as_raw_ptr() as *const c_void];
+        // SAFETY: `self.raw` is the live pw_filter owned by this MixFilter. A null port updates the filter object. `params` holds one spa_pod built from `bytes`, alive for this call, and PipeWire copies it before returning. Called on the loop thread. `process` does not call this.
+        let rc = unsafe {
+            pw_filter_update_params(self.raw.as_ptr(), ptr::null_mut(), params.as_ptr(), 1)
+        };
+        if rc == 0 {
+            self.latency_sent = Some((samples, rate));
+        }
+    }
+
+    /// Input ports carry `samples`. Output ports carry upstream + `samples`.
+    fn write_known_port_latency(&mut self, samples: u32) {
+        self.shared.own_latency.store(samples, Ordering::Release);
+        let upstream = self.shared.upstream_rate.load(Ordering::Acquire);
+        let output_samples = output_direction_latency(upstream, samples);
+        if self.ports_latency_sent == Some((samples, output_samples)) {
+            return;
+        }
+        self.ports_latency_sent = Some((samples, output_samples));
+        #[cfg(test)]
+        {
+            self.output_latency_written = Some(output_samples);
+            self.input_latency_written = Some(samples);
+            self.port_latency_writes = self.port_latency_writes.saturating_add(1);
+        }
+        if !self.live {
+            return;
+        }
+        let output = pw::spa::sys::SPA_DIRECTION_OUTPUT;
+        let input = pw::spa::sys::SPA_DIRECTION_INPUT;
+        self.write_port_latency(
+            self.shared.out_fl.load(Ordering::Acquire),
+            output_samples,
+            output,
+        );
+        self.write_port_latency(
+            self.shared.out_fr.load(Ordering::Acquire),
+            output_samples,
+            output,
+        );
+        for slot in 0..MAX_TAP_PORTS {
+            self.write_port_latency(
+                self.shared.inputs_fl[slot].load(Ordering::Acquire),
+                samples,
+                input,
+            );
+            self.write_port_latency(
+                self.shared.inputs_fr[slot].load(Ordering::Acquire),
+                samples,
+                input,
+            );
+        }
+    }
+
+    fn write_port_latency(&self, port: *mut c_void, samples: u32, direction: u32) {
+        if !self.live || port.is_null() {
+            return;
+        }
+        let bytes = port_latency_pod(samples, direction);
+        let Some(pod) = pw::spa::pod::Pod::from_bytes(&bytes) else {
+            return;
+        };
+        let params = [pod.as_raw_ptr() as *const c_void];
+        // SAFETY: `self.raw` is the live pw_filter. `port` is a non-null port of that filter. `params` holds one spa_pod built from `bytes`, alive for this call. PipeWire copies the pod before returning. Called on the loop thread from `note_process_latency`.
+        unsafe {
+            pw_filter_update_params(self.raw.as_ptr(), port, params.as_ptr(), 1);
+        }
+    }
+
+    /// Samples of lookahead in the mix. A bypassed master counts as 0.
+    ///
+    /// This is the delay `process` inserts. `node.latency` stays the quantum
+    /// contract and is not this number.
+    pub fn reported_latency_samples(&self) -> u32 {
+        self.limit.reported_latency_samples()
     }
 
     pub fn node_id(&self) -> Option<u32> {
@@ -407,16 +828,16 @@ impl MixFilter {
                         .is_null()
             })
             .ok_or(())?;
-        // Neutral before either new port pointer is stored. `clear_tap_slot`
-        // already resets on free; a control-thread write after that free must
-        // not ride into the next input.
-        prepare_tap_slot(&self.shared, slot);
+        // Neutral before either new port pointer is stored. The coefficient
+        // publish is here, on the loop thread. `clear_tap_slot` only clears
+        // filter memory on the data loop.
+        prepare_tap_slot(&self.shared, &mut self.eq, &mut self.comp, slot);
         let fl = self.add_port(
             pw::spa::utils::Direction::Input,
             &format!("in-{peer}-FL"),
             "FL",
         )?;
-        self.shared.inputs_fl[slot].store(fl, Ordering::Release);
+        self.store_input_port(slot, true, fl);
         let fr = match self.add_port(
             pw::spa::utils::Direction::Input,
             &format!("in-{peer}-FR"),
@@ -431,11 +852,12 @@ impl MixFilter {
                 return Err(());
             }
         };
-        self.shared.inputs_fr[slot].store(fr, Ordering::Release);
+        self.store_input_port(slot, false, fr);
         let count = self.shared.input_count.load(Ordering::Acquire);
         if slot >= count {
             self.shared.input_count.store(slot + 1, Ordering::Release);
         }
+        self.note_process_latency();
         Ok(slot)
     }
 
@@ -453,6 +875,15 @@ impl MixFilter {
     /// free. The invoke-then-free order is what keeps the pointer valid.
     pub fn remove_tap_ports(&mut self, slot: usize) {
         if slot >= MAX_TAP_PORTS {
+            return;
+        }
+        // Flat coefficients are built here, off the data loop. The invoke
+        // below only clears filter memory and the port pointers.
+        self.eq.reset_slot(slot);
+        self.comp.reset_slot(slot);
+        self.shared.clear_upstream_slot(slot);
+        self.note_process_latency();
+        if !self.live {
             return;
         }
         let mut job = ClearJob {
@@ -517,9 +948,34 @@ impl MixFilter {
         let fr = self
             .add_port(pw::spa::utils::Direction::Output, "capture_FR", "FR")
             .map_err(|_| pw::Error::CreationFailed)?;
-        self.shared.out_fl.store(fl, Ordering::Release);
-        self.shared.out_fr.store(fr, Ordering::Release);
+        self.store_output_port(true, fl);
+        self.store_output_port(false, fr);
         Ok(())
+    }
+
+    /// Store one tap pointer and drop the cached port-latency pair.
+    ///
+    /// A later [`Self::note_process_latency`] writes the new port even when
+    /// the sample counts are unchanged.
+    fn store_input_port(&mut self, slot: usize, left: bool, port: *mut c_void) {
+        if slot >= MAX_TAP_PORTS {
+            return;
+        }
+        if left {
+            self.shared.inputs_fl[slot].store(port, Ordering::Release);
+        } else {
+            self.shared.inputs_fr[slot].store(port, Ordering::Release);
+        }
+        self.ports_latency_sent = None;
+    }
+
+    fn store_output_port(&mut self, left: bool, port: *mut c_void) {
+        if left {
+            self.shared.out_fl.store(port, Ordering::Release);
+        } else {
+            self.shared.out_fr.store(port, Ordering::Release);
+        }
+        self.ports_latency_sent = None;
     }
 
     /// No PipeWire filter. `add_tap_ports` resets the claimed slot, then the
@@ -527,6 +983,7 @@ impl MixFilter {
     /// `destroyed` is already set.
     #[cfg(test)]
     fn without_filter() -> Self {
+        let (shared, eq, comp, limit) = ProcessShared::pair();
         Self {
             raw: NonNull::dangling(),
             events: Box::new(PwFilterEvents {
@@ -545,8 +1002,19 @@ impl MixFilter {
             // hook. This value is never registered, and Drop returns before
             // any PipeWire call because `destroyed` is already true.
             hook: Box::new(unsafe { std::mem::zeroed() }),
-            shared: Arc::new(ProcessShared::new()),
+            shared: Arc::new(shared),
+            eq,
+            comp,
+            limit,
             destroyed: true,
+            live: false,
+            latency_sent: None,
+            ports_latency_sent: None,
+            latency_queued: None,
+            output_latency_written: None,
+            input_latency_written: None,
+            port_latency_writes: 0,
+            demotion_lines: Vec::new(),
             reject_ports: true,
         }
     }
@@ -635,20 +1103,64 @@ unsafe extern "C" fn clear_tap_slot(
     shared.input_count.store(count, Ordering::Release);
     // Same data loop as `process`. Put the slot back to the neutral smoother
     // and the neutral parameters so the next tap does not inherit a mute.
-    prepare_tap_slot(shared, slot);
+    reset_slot_atomics(shared, slot);
     unsafe { (*shared.mixer.get()).reset_slot(slot) };
     0
 }
 
 /// Neutral strip parameters and a silent meter for a slot that is about to
-/// be claimed or was just freed.
+/// be claimed.
 ///
-/// Atomics only. The smoother reset stays in `clear_tap_slot`, which runs on
-/// the data loop. `add_tap_ports` calls this before either port pointer is stored.
-fn prepare_tap_slot(shared: &ProcessShared, slot: usize) {
+/// The EQ publication is built here, on the loop thread. The smoother reset
+/// and the filter-memory clear stay in `clear_tap_slot`, which runs on the
+/// data loop and does not build coefficients.
+fn prepare_tap_slot(shared: &ProcessShared, eq: &mut EqWriter, comp: &mut CompWriter, slot: usize) {
+    reset_slot_atomics(shared, slot);
+    eq.reset_slot(slot);
+    comp.reset_slot(slot);
+}
+
+/// Atomics only. Safe on the data loop: no coefficient design.
+fn reset_slot_atomics(shared: &ProcessShared, slot: usize) {
     shared.strips.reset_slot(slot);
     shared.strip_meters.reset_slot(slot);
     shared.scopes.request_discard(slot);
+}
+
+unsafe extern "C" fn on_param_changed(
+    data: *mut c_void,
+    port_data: *mut c_void,
+    id: u32,
+    param: *const c_void,
+) {
+    if data.is_null() || param.is_null() || id != pw::spa::sys::SPA_PARAM_Latency {
+        return;
+    }
+    let Some(bytes) = pod_bytes(param) else {
+        return;
+    };
+    let Some((direction, rate)) = latency_direction_and_rate(&bytes) else {
+        return;
+    };
+    if direction != pw::spa::sys::SPA_DIRECTION_OUTPUT {
+        return;
+    }
+    // SAFETY: `data` is the ProcessShared pointer passed to `pw_filter_add_listener`. MixFilter keeps that Arc alive until the filter is destroyed. PipeWire runs this callback on the filter main loop, the thread that drops the filter, so the pointer stays valid for the call.
+    let shared = unsafe { &*(data as *const ProcessShared) };
+    let _ = shared.note_peer_latency(port_data, rate);
+}
+
+/// Copy a spa_pod, header included. `size` is the body size.
+fn pod_bytes(param: *const c_void) -> Option<Vec<u8>> {
+    // SAFETY: `param` is non-null. PipeWire passes a complete spa_pod. The first u32 is the body size, and the header may be unaligned, so the size word is read unaligned.
+    let size = unsafe { (param as *const u32).read_unaligned() } as usize;
+    let total = size.checked_add(8)?;
+    if total > 8192 {
+        return None;
+    }
+    // SAFETY: PipeWire's spa_pod is complete, so the object is the declared body size plus the 8-byte header. The 8192 bound refuses a larger declared total. Those bytes stay readable for this callback, and the copy ends the borrow.
+    let bytes = unsafe { std::slice::from_raw_parts(param as *const u8, total) };
+    Some(bytes.to_vec())
 }
 
 unsafe extern "C" fn on_state(data: *mut c_void, _old: i32, state: i32, _error: *const c_char) {
@@ -728,12 +1240,12 @@ fn render(shared: &ProcessShared, position: &SpaIoPosition) {
     shared.slot.write(&out_l[..frames], &out_r[..frames]);
 }
 
-/// Strip mix, optional tone, then the master fader, then the master meter.
+/// Strip mix, master limiter, optional tone, then the master fader, then the master meter.
 ///
-/// `render` calls this after the port pointers are resolved. A default bank
-/// (tone off, master gain 1, neutral strips) leaves a finite stereo block
-/// unchanged, except a -0.0 sample, which is written as +0.0 because the sum
-/// starts at +0.0. The mixer cell is the data loop's, or a single-threaded test's.
+/// `render` calls this after the port pointers are resolved. The master
+/// limiter is on at 5 ms, so a short block comes out as the delay line, not
+/// the current input. Tone and the master fader run after that limiter. The
+/// mixer cell is the data loop's, or a single-threaded test's.
 fn mix_resolved_strips(
     shared: &ProcessShared,
     inputs: &[Option<StripBlockInput<'_>>],
@@ -744,13 +1256,21 @@ fn mix_resolved_strips(
     denom: u32,
 ) {
     let rate = negotiated_rate(num, denom);
+    shared.observed_rate.store(rate, Ordering::Relaxed);
     // Safety: `RtMixer`'s Sync bound is the data-loop mutator. This call is
     // that mutator, or a test that does not share the cell.
     let mixer = unsafe { &mut *shared.mixer.get() };
     // Safety: same data-loop mutator as the mixer cell.
     let scopes = unsafe { &mut *shared.scopes.writers() };
+    // SAFETY: one `&mut EqReader`, one `&mut CompReader`, and one `&mut LimitReader` for this callback. The cells are not borrowed again until `process` returns. They do not alias `strips` or the meters.
+    let eq = unsafe { &mut *shared.eq.reader_ptr() };
+    let comp = unsafe { &mut *shared.comp.reader_ptr() };
+    let limit = unsafe { &mut *shared.limit.reader_ptr() };
     mixer.process(
         &shared.strips,
+        eq,
+        comp,
+        limit,
         &shared.strip_meters,
         scopes,
         inputs,
@@ -919,6 +1439,143 @@ fn unity_props_pod() -> Vec<u8> {
         .into_inner()
 }
 
+/// `SPA_PARAM_ProcessLatency` for the mix filter.
+///
+/// `rate` is the delay in samples. `ns` is 0. `spa_process_latency_info_add`
+/// sums those fields, so a matching `ns` would make the graph count the
+/// lookahead twice. `quantum` stays 0. `sample_rate` is the rate the graph
+/// would use to convert `ns` into samples; it is not written into the pod.
+/// The loop thread passes this pod to `pw_filter_update_params`.
+pub(crate) fn process_latency_pod(samples: u32, sample_rate: u32) -> Vec<u8> {
+    use pw::spa::pod::serialize::PodSerializer;
+    use pw::spa::pod::{Object, Property, PropertyFlags, Value};
+
+    debug_assert!(sample_rate > 0 || samples == 0);
+    let object = Value::Object(Object {
+        type_: pw::spa::sys::SPA_TYPE_OBJECT_ParamProcessLatency,
+        id: pw::spa::sys::SPA_PARAM_ProcessLatency,
+        properties: vec![
+            Property {
+                key: pw::spa::sys::SPA_PARAM_PROCESS_LATENCY_quantum,
+                flags: PropertyFlags::empty(),
+                value: Value::Float(0.0),
+            },
+            Property {
+                key: pw::spa::sys::SPA_PARAM_PROCESS_LATENCY_rate,
+                flags: PropertyFlags::empty(),
+                value: Value::Int(i32::try_from(samples).unwrap_or(i32::MAX)),
+            },
+            Property {
+                key: pw::spa::sys::SPA_PARAM_PROCESS_LATENCY_ns,
+                flags: PropertyFlags::empty(),
+                value: Value::Long(0),
+            },
+        ],
+    });
+    PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &object)
+        .expect("ProcessLatency pod")
+        .0
+        .into_inner()
+}
+
+/// `SPA_PARAM_Latency` for one filter port.
+///
+/// `direction` is `SPA_DIRECTION_OUTPUT` or `SPA_DIRECTION_INPUT`. `rate` is
+/// the lookahead in samples on both min and max. `ns` is 0, same as
+/// [`process_latency_pod`], so the link does not add the delay twice.
+pub(crate) fn port_latency_pod(samples: u32, direction: u32) -> Vec<u8> {
+    use pw::spa::pod::serialize::PodSerializer;
+    use pw::spa::pod::{Object, Property, PropertyFlags, Value};
+    use pw::spa::utils::Id;
+
+    let rate = i32::try_from(samples).unwrap_or(i32::MAX);
+    let object = Value::Object(Object {
+        type_: pw::spa::sys::SPA_TYPE_OBJECT_ParamLatency,
+        id: pw::spa::sys::SPA_PARAM_Latency,
+        properties: vec![
+            Property {
+                key: pw::spa::sys::SPA_PARAM_LATENCY_direction,
+                flags: PropertyFlags::empty(),
+                value: Value::Id(Id(direction)),
+            },
+            Property {
+                key: pw::spa::sys::SPA_PARAM_LATENCY_minQuantum,
+                flags: PropertyFlags::empty(),
+                value: Value::Float(0.0),
+            },
+            Property {
+                key: pw::spa::sys::SPA_PARAM_LATENCY_maxQuantum,
+                flags: PropertyFlags::empty(),
+                value: Value::Float(0.0),
+            },
+            Property {
+                key: pw::spa::sys::SPA_PARAM_LATENCY_minRate,
+                flags: PropertyFlags::empty(),
+                value: Value::Int(rate),
+            },
+            Property {
+                key: pw::spa::sys::SPA_PARAM_LATENCY_maxRate,
+                flags: PropertyFlags::empty(),
+                value: Value::Int(rate),
+            },
+            Property {
+                key: pw::spa::sys::SPA_PARAM_LATENCY_minNs,
+                flags: PropertyFlags::empty(),
+                value: Value::Long(0),
+            },
+            Property {
+                key: pw::spa::sys::SPA_PARAM_LATENCY_maxNs,
+                flags: PropertyFlags::empty(),
+                value: Value::Long(0),
+            },
+        ],
+    });
+    PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &object)
+        .expect("Latency pod")
+        .0
+        .into_inner()
+}
+
+/// Direction and max rate from a `SPA_PARAM_Latency` pod.
+///
+/// Peer `ns` and quantum are ignored. Only the upstream rate is stored.
+fn latency_direction_and_rate(bytes: &[u8]) -> Option<(u32, u32)> {
+    use pw::spa::pod::Value;
+    use pw::spa::pod::deserialize::PodDeserializer;
+
+    let (_, value) = PodDeserializer::deserialize_any_from(bytes).ok()?;
+    let Value::Object(object) = value else {
+        return None;
+    };
+    if object.id != pw::spa::sys::SPA_PARAM_Latency {
+        return None;
+    }
+    let mut direction = None;
+    let mut max_rate = None;
+    let mut min_rate = None;
+    for prop in &object.properties {
+        match prop.key {
+            pw::spa::sys::SPA_PARAM_LATENCY_direction => {
+                if let Value::Id(id) = &prop.value {
+                    direction = Some(id.0);
+                }
+            }
+            pw::spa::sys::SPA_PARAM_LATENCY_maxRate => {
+                if let Value::Int(rate) = prop.value {
+                    max_rate = Some(u32::try_from(rate).unwrap_or(0));
+                }
+            }
+            pw::spa::sys::SPA_PARAM_LATENCY_minRate => {
+                if let Value::Int(rate) = prop.value {
+                    min_rate = Some(u32::try_from(rate).unwrap_or(0));
+                }
+            }
+            _ => {}
+        }
+    }
+    Some((direction?, max_rate.or(min_rate)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1042,43 +1699,100 @@ mod tests {
     }
 
     #[test]
-    fn default_strip_mix_leaves_a_stereo_block_unchanged() {
-        let shared = ProcessShared::new();
+    fn default_strip_mix_still_delays_when_the_publication_rate_differs() {
+        let (shared, _eq, _comp, limit) = ProcessShared::pair();
         assert!(!shared.tone.load(Ordering::Acquire));
         assert_eq!(shared.params.master_linear(), 1.0);
-        // Index 5 is -0.0. The sum starts at +0.0, so it is stored as +0.0.
+        assert!(limit.master_settings().enabled());
+        assert_eq!(limit.sample_rate(), 48_000);
         let samples_l = [0.1f32, -0.25, 0.5, 1.0, -1.0, -0.0, 0.70710677, -0.003];
         let samples_r = [-0.1f32, 0.25, -0.5, 0.125, 0.5, -1.0, 0.0, 0.003];
-        assert_eq!(samples_l[5].to_bits(), (-0.0f32).to_bits());
         let inputs = [Some(StripBlockInput {
             left: &samples_l,
             right: &samples_r,
         })];
-        for rate in [44_100, 48_000] {
-            let mut left = [0.0f32; 8];
-            let mut right = [0.0f32; 8];
-            mix_resolved_strips(&shared, &inputs, &mut left, &mut right, 8, rate, 1);
-            assert_eq!(left, samples_l);
-            assert_eq!(right, samples_r);
-            assert_eq!(left[5].to_bits(), 0.0f32.to_bits());
-            mix_resolved_strips(&shared, &inputs, &mut left, &mut right, 8, rate, 1);
-            assert_eq!(left, samples_l);
-            assert_eq!(right, samples_r);
-            assert_eq!(left[5].to_bits(), 0.0f32.to_bits());
-        }
+        let mut left = [0.0f32; 8];
+        let mut right = [0.0f32; 8];
+        mix_resolved_strips(&shared, &inputs, &mut left, &mut right, 8, 44_100, 1);
+        assert!(left.iter().chain(right.iter()).all(|sample| *sample == 0.0));
+    }
+
+    #[test]
+    fn default_strip_mix_delays_when_the_rate_matches_the_master_limiter() {
+        let (shared, _eq, _comp, limit) = ProcessShared::pair();
+        let delay = limit.master_latency_samples() as usize;
+        assert_eq!(
+            delay,
+            omamix_core::limit::lookahead_samples(48_000, 5.0) as usize
+        );
+        let quiet_l = [0.1f32, -0.2, 0.05, 0.15, -0.15, -0.0, 0.08, -0.003];
+        let quiet_r = [-0.1f32, 0.2, -0.05, 0.12, 0.05, -0.08, 0.0, 0.003];
+        assert_eq!(quiet_l[5].to_bits(), (-0.0f32).to_bits());
+        let inputs = [Some(StripBlockInput {
+            left: &quiet_l,
+            right: &quiet_r,
+        })];
+        let mut left = [0.0f32; 8];
+        let mut right = [0.0f32; 8];
+        mix_resolved_strips(&shared, &inputs, &mut left, &mut right, 8, 48_000, 1);
+        assert!(left.iter().chain(right.iter()).all(|sample| *sample == 0.0));
+    }
+
+    #[test]
+    fn master_lookahead_returns_the_quiet_block_after_the_delay() {
+        let (shared, _eq, _comp, limit) = ProcessShared::pair();
+        let delay = limit.master_latency_samples() as usize;
+        let quiet_l = [0.1f32, -0.2, 0.05, 0.15, -0.15, -0.0, 0.08, -0.003];
+        let quiet_r = [-0.1f32, 0.2, -0.05, 0.12, 0.05, -0.08, 0.0, 0.003];
+        let mut expect_l = quiet_l;
+        expect_l[5] = 0.0;
+        let frames = delay + quiet_l.len();
+        let mut src_l = vec![0.0f32; frames];
+        let mut src_r = vec![0.0f32; frames];
+        src_l[..quiet_l.len()].copy_from_slice(&quiet_l);
+        src_r[..quiet_r.len()].copy_from_slice(&quiet_r);
+        let long = [Some(StripBlockInput {
+            left: src_l.as_slice(),
+            right: src_r.as_slice(),
+        })];
+        let mut out_l = vec![0.0f32; frames];
+        let mut out_r = vec![0.0f32; frames];
+        mix_resolved_strips(
+            &shared,
+            &long,
+            &mut out_l,
+            &mut out_r,
+            frames as u32,
+            48_000,
+            1,
+        );
+        assert!(out_l[..delay].iter().all(|sample| *sample == 0.0));
+        assert!(out_r[..delay].iter().all(|sample| *sample == 0.0));
+        assert_eq!(&out_l[delay..delay + quiet_l.len()], &expect_l);
+        assert_eq!(&out_r[delay..delay + quiet_r.len()], &quiet_r);
+        assert_eq!(out_l[delay + 5].to_bits(), 0.0f32.to_bits());
     }
 
     #[test]
     fn claiming_a_tap_slot_resets_inherited_strip_params() {
         use omamix_core::params::StripParamUpdate;
-        let shared = ProcessShared::new();
+        let (shared, mut eq, mut comp, _limit) = ProcessShared::pair();
         assert!(shared.strips.apply(3, StripParamUpdate::Mute(true)));
         assert!(shared.strips.apply(3, StripParamUpdate::Solo(true)));
         assert!(shared.strips.apply(3, StripParamUpdate::Enabled(false)));
         assert!(shared.strips.apply(3, StripParamUpdate::Pan(0.4)));
         assert!(shared.strips.apply(3, StripParamUpdate::FaderDb(-12.0)));
         assert!(shared.strips.apply(3, StripParamUpdate::TrimDb(6.0)));
-        prepare_tap_slot(&shared, 3);
+        assert!(eq.apply(
+            3,
+            EqUpdate::Band {
+                index: 4,
+                gain_db: 6.0,
+            },
+        ));
+        assert!(comp.apply(3, CompUpdate::Enabled(true)));
+        assert!(comp.apply(3, CompUpdate::MakeupDb(6.0)));
+        prepare_tap_slot(&shared, &mut eq, &mut comp, 3);
         assert!(!shared.strips.mute(3));
         assert!(!shared.strips.solo(3));
         assert!(shared.strips.enabled(3));
@@ -1086,6 +1800,13 @@ mod tests {
         assert_eq!(shared.strips.fader_db(3), 0.0);
         assert_eq!(shared.strips.trim_db(3), 0.0);
         assert!((shared.strips.target_gain(3, false) - 1.0).abs() < 1.0e-6);
+        let stored = eq.settings(3).expect("slot 3");
+        assert!(!stored.hpf_enabled());
+        assert_eq!(stored.band_db(), [0.0; omamix_core::eq::EQ_BANDS]);
+        let stored_comp = comp.settings(3).expect("slot 3");
+        assert!(!stored_comp.enabled());
+        assert_eq!(stored_comp.makeup_db(), 0.0);
+        assert_eq!(comp.gain_reduction_db(3), 0.0);
     }
 
     #[test]
@@ -1227,6 +1948,22 @@ mod tests {
             48_000,
             1,
         );
+        let mut drain_l = vec![0.0f32; frames];
+        let mut drain_r = vec![0.0f32; frames];
+        assert_eq!(
+            shared.scopes.pop_strip(0, &mut drain_l, &mut drain_r),
+            frames
+        );
+        assert_eq!(shared.scopes.pop_master(&mut drain_l, &mut drain_r), frames);
+        mix_resolved_strips(
+            &shared,
+            &inputs,
+            &mut left,
+            &mut right,
+            frames as u32,
+            48_000,
+            1,
+        );
         let (strip_peak, strip_rms) = shared.strip_meters.load(0);
         assert_minus_20_sine(strip_peak, strip_rms);
         let (peak, rms) = shared.meter.load();
@@ -1240,7 +1977,9 @@ mod tests {
         assert_eq!(scope_l, sine);
         assert_eq!(shared.scopes.pop_master(&mut scope_l, &mut scope_r), frames);
         assert_eq!(shared.scopes.master_dropped_frames(), 0);
-        assert_eq!(scope_l, sine);
+        for (got, want) in scope_l.iter().zip(sine.iter()) {
+            assert!((got - want).abs() <= 1.0e-5, "master {got} sine {want}");
+        }
 
         shared.params.set_master_db(-6.0);
         mix_resolved_strips(
@@ -1309,5 +2048,242 @@ mod tests {
         assert_eq!(negotiated_rate(1, 48_000), 48_000);
         assert_eq!(negotiated_rate(48_000, 1), 48_000);
         assert_eq!(negotiated_rate(1, 1), 48_000);
+    }
+
+    #[test]
+    fn reported_latency_is_the_master_lookahead() {
+        let filter = MixFilter::without_filter();
+        assert_eq!(
+            filter.reported_latency_samples(),
+            omamix_core::limit::lookahead_samples(48_000, 5.0)
+        );
+    }
+
+    #[test]
+    fn process_latency_pod_is_the_lookahead() {
+        let samples = omamix_core::limit::lookahead_samples(48_000, 5.0);
+        assert_eq!(samples, 240);
+        let bytes = process_latency_pod(samples, 48_000);
+        let (_, value) =
+            pw::spa::pod::deserialize::PodDeserializer::deserialize_any_from(&bytes).unwrap();
+        let pw::spa::pod::Value::Object(object) = value else {
+            panic!("ProcessLatency pod is an object");
+        };
+        assert_eq!(
+            object.type_,
+            pw::spa::sys::SPA_TYPE_OBJECT_ParamProcessLatency
+        );
+        assert_eq!(object.id, pw::spa::sys::SPA_PARAM_ProcessLatency);
+        let mut rate = false;
+        let mut ns = false;
+        let mut quantum = false;
+        for prop in &object.properties {
+            match prop.key {
+                pw::spa::sys::SPA_PARAM_PROCESS_LATENCY_rate => {
+                    assert_eq!(prop.value, pw::spa::pod::Value::Int(240));
+                    rate = true;
+                }
+                pw::spa::sys::SPA_PARAM_PROCESS_LATENCY_ns => {
+                    assert_eq!(prop.value, pw::spa::pod::Value::Long(0));
+                    ns = true;
+                }
+                pw::spa::sys::SPA_PARAM_PROCESS_LATENCY_quantum => {
+                    assert_eq!(prop.value, pw::spa::pod::Value::Float(0.0));
+                    quantum = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(rate && ns && quantum);
+        assert_eq!(
+            summed_process_latency_samples(0.0, 240, 0, 48_000),
+            i64::from(samples)
+        );
+        let off = process_latency_pod(0, 48_000);
+        let (_, off_value) =
+            pw::spa::pod::deserialize::PodDeserializer::deserialize_any_from(&off).unwrap();
+        let pw::spa::pod::Value::Object(off_object) = off_value else {
+            panic!("zero ProcessLatency pod is an object");
+        };
+        let zero = off_object.properties.iter().any(|prop| {
+            prop.key == pw::spa::sys::SPA_PARAM_PROCESS_LATENCY_rate
+                && prop.value == pw::spa::pod::Value::Int(0)
+        });
+        assert!(zero);
+        assert_eq!(summed_process_latency_samples(0.0, 0, 0, 48_000), 0);
+
+        let port = port_latency_pod(samples, pw::spa::sys::SPA_DIRECTION_OUTPUT);
+        let (_, port_value) =
+            pw::spa::pod::deserialize::PodDeserializer::deserialize_any_from(&port).unwrap();
+        let pw::spa::pod::Value::Object(port_object) = port_value else {
+            panic!("port Latency pod is an object");
+        };
+        assert_eq!(
+            port_object.type_,
+            pw::spa::sys::SPA_TYPE_OBJECT_ParamLatency
+        );
+        assert_eq!(port_object.id, pw::spa::sys::SPA_PARAM_Latency);
+        let mut saw_direction = false;
+        let mut saw_rate = false;
+        let mut saw_ns = false;
+        for prop in &port_object.properties {
+            match prop.key {
+                pw::spa::sys::SPA_PARAM_LATENCY_direction => {
+                    assert_eq!(
+                        prop.value,
+                        pw::spa::pod::Value::Id(pw::spa::utils::Id(
+                            pw::spa::sys::SPA_DIRECTION_OUTPUT
+                        ))
+                    );
+                    saw_direction = true;
+                }
+                pw::spa::sys::SPA_PARAM_LATENCY_minRate
+                | pw::spa::sys::SPA_PARAM_LATENCY_maxRate => {
+                    assert_eq!(prop.value, pw::spa::pod::Value::Int(240));
+                    saw_rate = true;
+                }
+                pw::spa::sys::SPA_PARAM_LATENCY_minNs | pw::spa::sys::SPA_PARAM_LATENCY_maxNs => {
+                    assert_eq!(prop.value, pw::spa::pod::Value::Long(0));
+                    saw_ns = true;
+                }
+                pw::spa::sys::SPA_PARAM_LATENCY_minQuantum
+                | pw::spa::sys::SPA_PARAM_LATENCY_maxQuantum => {
+                    assert_eq!(prop.value, pw::spa::pod::Value::Float(0.0));
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_direction && saw_rate && saw_ns);
+    }
+
+    /// Samples after `spa_process_latency_info_add`.
+    ///
+    /// `rate` is already samples. `ns` converts at `sample_rate`. `quantum`
+    /// is a fraction of the buffer; 0 contributes no samples.
+    fn summed_process_latency_samples(quantum: f32, rate: i32, ns: i64, sample_rate: u32) -> i64 {
+        assert_eq!(quantum, 0.0);
+        let from_ns = i128::from(ns) * i128::from(sample_rate) / 1_000_000_000;
+        i64::from(rate) + i64::try_from(from_ns).unwrap_or(i64::MAX)
+    }
+
+    #[test]
+    fn lookahead_change_while_linked_keeps_upstream_plus_own() {
+        let mut filter = MixFilter::without_filter();
+        let port = std::ptr::without_provenance_mut::<c_void>(0x1264);
+        let other = std::ptr::without_provenance_mut::<c_void>(0x1265);
+        filter.shared.inputs_fl[0].store(port, Ordering::Release);
+        filter.shared.inputs_fr[0].store(other, Ordering::Release);
+        filter.shared.own_latency.store(240, Ordering::Release);
+        let peer = port_latency_pod(1024, pw::spa::sys::SPA_DIRECTION_OUTPUT);
+        // SAFETY: `data` is the live ProcessShared in `filter.shared`. `peer` is a complete latency pod that outlives the call. The callback only reads that pod and stores an atomic rate.
+        unsafe {
+            on_param_changed(
+                Arc::as_ptr(&filter.shared) as *mut c_void,
+                port,
+                pw::spa::sys::SPA_PARAM_Latency,
+                peer.as_ptr() as *const c_void,
+            );
+        }
+        assert_eq!(filter.shared.upstream_rate.load(Ordering::Acquire), 1024);
+        assert_eq!(output_direction_latency(1024, 240), 1264);
+        let quieter = port_latency_pod(100, pw::spa::sys::SPA_DIRECTION_OUTPUT);
+        // SAFETY: `data` is the live ProcessShared in `filter.shared`. `quieter` is a complete latency pod that outlives the call. The callback only reads that pod and stores an atomic rate.
+        unsafe {
+            on_param_changed(
+                Arc::as_ptr(&filter.shared) as *mut c_void,
+                other,
+                pw::spa::sys::SPA_PARAM_Latency,
+                quieter.as_ptr() as *const c_void,
+            );
+        }
+        assert_eq!(filter.shared.upstream_rate.load(Ordering::Acquire), 1024);
+        let inbound = port_latency_pod(240, pw::spa::sys::SPA_DIRECTION_INPUT);
+        // SAFETY: `data` is the live ProcessShared in `filter.shared`. `inbound` is a complete latency pod that outlives the call. The callback only reads that pod and stores an atomic rate.
+        unsafe {
+            on_param_changed(
+                Arc::as_ptr(&filter.shared) as *mut c_void,
+                port,
+                pw::spa::sys::SPA_PARAM_Latency,
+                inbound.as_ptr() as *const c_void,
+            );
+        }
+        assert_eq!(filter.shared.upstream_rate.load(Ordering::Acquire), 1024);
+        assert!(filter.apply_master_limit(omamix_core::limit::LimitUpdate::LookaheadMs(20.0)));
+        assert_eq!(filter.reported_latency_samples(), 960);
+        assert_eq!(filter.output_latency_written, Some(1024 + 960));
+        assert_eq!(filter.input_latency_written, Some(960));
+        assert!(filter.apply_master_limit(omamix_core::limit::LimitUpdate::LookaheadMs(5.0)));
+        assert_eq!(filter.reported_latency_samples(), 240);
+        assert_eq!(filter.output_latency_written, Some(1264));
+        assert_eq!(filter.input_latency_written, Some(240));
+        assert_eq!(output_direction_latency(1024, 0), 1024);
+        assert_eq!(output_direction_latency(1024, 480), 1504);
+    }
+
+    #[test]
+    fn removing_a_disabled_tap_clears_its_upstream_latency() {
+        let mut filter = MixFilter::without_filter();
+        let port = std::ptr::without_provenance_mut::<c_void>(0x2401);
+        filter.shared.inputs_fl[1].store(port, Ordering::Release);
+        filter.shared.upstream_fl[1].store(1024, Ordering::Release);
+        filter.shared.recompute_upstream();
+        assert_eq!(filter.shared.upstream_rate.load(Ordering::Acquire), 1024);
+        let own = filter.reported_latency_samples();
+        assert_eq!(own, 240);
+        filter.note_process_latency();
+        assert_eq!(filter.output_latency_written, Some(1024 + own));
+        assert_eq!(filter.input_latency_written, Some(own));
+        filter.remove_tap_ports(1);
+        assert_eq!(filter.shared.upstream_rate.load(Ordering::Acquire), 0);
+        assert_eq!(filter.reported_latency_samples(), own);
+        assert_eq!(filter.output_latency_written, Some(own));
+        assert_eq!(filter.input_latency_written, Some(own));
+    }
+
+    #[test]
+    fn unchanged_port_latency_is_not_rewritten() {
+        let mut filter = MixFilter::without_filter();
+        filter.note_process_latency();
+        let writes = filter.port_latency_writes;
+        assert_eq!(writes, 1);
+        filter.note_process_latency();
+        assert_eq!(filter.port_latency_writes, writes);
+        let port = std::ptr::without_provenance_mut::<c_void>(0x2402);
+        filter.shared.inputs_fl[0].store(port, Ordering::Release);
+        filter.shared.upstream_fl[0].store(1024, Ordering::Release);
+        filter.shared.recompute_upstream();
+        filter.note_process_latency();
+        assert!(filter.port_latency_writes > writes);
+        assert_eq!(filter.output_latency_written, Some(1024 + 240));
+    }
+
+    #[test]
+    fn adding_a_strip_writes_port_latency_when_the_counts_stay_put() {
+        let mut filter = MixFilter::without_filter();
+        filter.note_process_latency();
+        let writes = filter.port_latency_writes;
+        assert_eq!(writes, 1);
+        let own = filter.reported_latency_samples();
+        let fl = std::ptr::without_provenance_mut::<c_void>(0x2403);
+        let fr = std::ptr::without_provenance_mut::<c_void>(0x2404);
+        filter.store_input_port(0, true, fl);
+        filter.store_input_port(0, false, fr);
+        filter.note_process_latency();
+        assert!(filter.port_latency_writes > writes);
+        assert_eq!(filter.input_latency_written, Some(own));
+        assert_eq!(filter.output_latency_written, Some(own));
+    }
+
+    #[test]
+    fn master_cap_demotion_is_logged_on_the_loop_thread() {
+        let mut filter = MixFilter::without_filter();
+        assert!(filter.limit.set_processing_quantum(1));
+        assert!(filter.demotion_lines.is_empty());
+        assert!(filter.apply_master_limit(omamix_core::limit::LimitUpdate::LookaheadMs(0.0)));
+        assert!(filter.demotion_lines.iter().any(|line| {
+            line.contains("limiter master") && line.contains("stored 5 ms lookahead")
+        }));
+        assert_eq!(filter.limit.master_settings().lookahead_ms(), 5.0);
+        assert!(filter.limit.master_cap_demoted());
     }
 }

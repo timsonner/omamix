@@ -1,7 +1,7 @@
 # omamix: PipeWire live mixer with a virtual mic
 
 Requested by Tim, 2026-10-11 ~1:08 AM MT, via Kit. Owner: Coda (Software Dev). Language: Rust (Tim's pick).
-Target: Tim's XPS15-OMARCHY (Arch-based Omarchy, Hyprland/Wayland, PipeWire + WirePlumber, pipewire-pulse). Local dev and test on that laptop.
+**Platform:** any Linux workstation with PipeWire (plus WirePlumber or another session manager where needed) and working capture/playback. **Example dev host (not a product requirement):** XPS15-OMARCHY (Arch-based Omarchy, Hyprland/Wayland, PipeWire + WirePlumber, pipewire-pulse). Local UI and graph checks may still run on that laptop.
 
 The working name pw-mixer is **omamix**.
 
@@ -23,7 +23,7 @@ Tim records screen videos and streams (YouTube, X, Rumble browser studio) with h
 1. Channel strips. Add a source as a strip: any capture device (mic) or any playback app/stream (captured per app, not whole-desktop). Optional "all other desktop audio" strip, which attaches each remaining playback stream on its own and never monitors the sink. Streams that already have a strip, and every node omamix owns, stay out of that strip so they are not mixed twice and headphone sends do not feed Mix Mic.
 2. Per strip: fader in dB, mute, solo, peak + RMS meter, pan, input gain (±24 dB).
 3. Per strip effects (in this order, each toggleable): noise reduction (mic), high-pass, 10-band graphic EQ, compressor, limiter.
-4. Master bus: EQ, compressor, limiter (default ON, ceiling −1 dBTP), loudness meter (momentary/short-term LUFS) plus peak.
+4. Master bus: EQ, compressor, limiter (default ON, ceiling −1 dBTP, lookahead 5 ms, range 0 to 20 ms; 0 ms is a clipper on the master and is stored as 5 ms when the scaled 0 ms cap is 0; that cap is 27 at 48 kHz and 256 frames and reaches 0 only on a tiny quantum; the demotion is logged and is not restored when the quantum grows; ProcessLatency is the master delay in samples with ns 0; output port Latency is the upstream rate plus that delay; input port Latency is the delay alone), loudness meter (momentary/short-term LUFS) plus peak.
 5. Output: the master appears as a virtual mic ("Mix Mic") usable as the default source. Per-strip "send to my headphones" so he can hear the music without hearing himself, and a "monitor final mix" toggle.
 6. Visuals: live waveform/oscilloscope and spectrum per strip and for master.
 7. Presets: save/load a full scene (sources, levels, effects), e.g. "Voice + OST", "Strudel live". Restore on launch; auto re-attach apps when they start playing.
@@ -52,7 +52,7 @@ Package: plain cargo build for dev. The Arch package is `omamix-git` (`PKGBUILD`
 
 ## Machine / dev setup
 
-- Cloud agents can write and unit-test the code anywhere, but real PipeWire + Hyprland testing needs Tim's laptop.
-- Cursor My Machines: once the repo exists, Tim clones it on the XPS and runs `agent worker start --name xps15-omarchy` in that folder (add `--computer` if the agent should drive the desktop for UI checks). Then cloud agents can be pointed at that machine.
-- Do NOT touch Tim's audio defaults, Easy Effects config, or Hyprland binds without asking Tim. No sudo without Tim (floating-terminal password prompt).
-- Note: Kit retired a previous script approach; parked at ~/.local/share/stream-mix-retired-2026-10-11 on the XPS for reference only.
+- Cloud agents can write and unit-test the code anywhere. Real PipeWire graph checks need a machine with a live session (any Linux host; one example is Tim's XPS15-OMARCHY).
+- Cursor My Machines (optional): Tim may clone the repo on a physical dev laptop and run `agent worker start --name xps15-omarchy` in that folder (add `--computer` if the agent should drive the desktop for UI checks). That worker name is an example, not a requirement.
+- Do NOT touch a user's audio defaults, Easy Effects config, or desktop binds without asking. No sudo without the machine owner (floating-terminal password prompt).
+- Note: Kit retired a previous script approach; an old copy may exist on a dev machine for reference only, outside this repo.
