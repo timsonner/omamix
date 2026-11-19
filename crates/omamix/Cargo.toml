@@ -12,11 +12,12 @@ name = "omamix"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["gui"]
+gui = ["dep:eframe", "dep:egui"]
 pipewire = ["omamix-pw/pipewire"]
 
 [dependencies]
-eframe = "0.36.2"
-egui = "0.36.2"
+eframe = { version = "0.36.2", optional = true }
+egui = { version = "0.36.2", optional = true }
 omamix-core = { workspace = true }
 omamix-pw = { workspace = true }
