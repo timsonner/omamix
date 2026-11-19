@@ -2,11 +2,16 @@
 //!
 //! `--headless` never opens a window. Without `--features pipewire` it exits
 //! before touching the audio graph. `--headless` without `--mix-mic` also
-//! leaves the graph alone. The GUI path still uses [`NullEngine`] and does
-//! not publish Mix Mic.
+//! leaves the graph alone. A window built with `--features pipewire` opens
+//! the PipeWire engine and publishes Mix Mic until the window closes. A
+//! window built without that feature keeps the null engine.
 
 #[cfg(feature = "gui")]
+mod picker;
+#[cfg(feature = "gui")]
 mod ui;
+#[cfg(feature = "gui")]
+mod window;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -16,8 +21,6 @@ use std::time::Duration;
 use eframe::egui;
 use omamix_core::graph::Scene;
 use omamix_core::route::{RouteKey, SourceKind, StripRequest};
-#[cfg(feature = "gui")]
-use omamix_pw::{AudioEngine, EngineCommand, NullEngine};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -332,62 +335,33 @@ fn start_headless(cli: Cli, scene: Scene, fallback_missing_devices: bool) -> Exi
 
 #[cfg(feature = "gui")]
 fn run_gui() -> eframe::Result {
+    let (scene, scene_path) = load_window_scene();
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("omamix")
-            .with_inner_size([980.0, 560.0]),
+            .with_inner_size([1100.0, 640.0]),
         ..Default::default()
     };
-
-    eframe::run_native(
-        "omamix",
-        native_options,
-        Box::new(|_cc| Ok(Box::new(OmamixApp::new()))),
-    )
+    let host = window::WindowHost::new(scene, scene_path);
+    eframe::run_native("omamix", native_options, Box::new(|_cc| Ok(Box::new(host))))
 }
 
 #[cfg(feature = "gui")]
-struct OmamixApp {
-    scene: Scene,
-    /// The window does not open a PipeWire client.
-    engine: Box<dyn AudioEngine>,
-}
-
-#[cfg(feature = "gui")]
-impl OmamixApp {
-    fn new() -> Self {
-        Self {
-            scene: Scene::placeholder(),
-            engine: Box::new(NullEngine::new()),
+fn load_window_scene() -> (Scene, Option<PathBuf>) {
+    let path = match omamix_core::default_scene_path() {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("omamix: warning: {err}");
+            return (Scene::empty("window"), None);
         }
-    }
-}
-
-#[cfg(feature = "gui")]
-impl eframe::App for OmamixApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("omamix");
-                ui.label("pre-alpha");
-                ui.separator();
-                ui.label(format!("engine: {}", self.engine.name()));
-                ui.label("virtual mic not published");
-            });
-            ui.separator();
-            ui.label("Click a fader, then scroll while the pointer is still on it.");
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if let Some(strip) = self.scene.strips.first_mut() {
-                    ui::strip_panel(ui, strip);
-                }
-            });
-        });
-    }
-
-    fn on_exit(&mut self) {
-        // Enqueue only. The audio thread applies Shutdown; this call does not.
-        self.engine.command_sender().submit(EngineCommand::Shutdown);
+    };
+    match omamix_core::load_scene_file(&path) {
+        Ok(scene) => (scene, Some(path)),
+        Err(err) if err.is_missing() => (Scene::empty("window"), Some(path)),
+        Err(err) => {
+            eprintln!("omamix: warning: {err}");
+            (Scene::empty("window"), Some(path))
+        }
     }
 }
 
