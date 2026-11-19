@@ -17,19 +17,31 @@ These rules have unit tests that do not connect to PipeWire.
 ## Prerequisites
 
 - Rust **1.95** or newer. [`rust-toolchain.toml`](rust-toolchain.toml) selects the 1.95 channel, and `rust-version` is 1.95 because eframe 0.36 requires it. Edition 2024 itself needs 1.85.
-- A display for the window. On X11 the process loads `libxkbcommon-x11.so.0` before the window opens. It also loads Wayland, libxkbcommon, and EGL (`libEGL.so.1`).
+- A display for the GUI build. On X11 the process loads `libxkbcommon-x11.so.0` before the window opens. It also loads Wayland, libxkbcommon, and EGL (`libEGL.so.1`). The headless build does not need a display or those libraries.
 - For `--features pipewire`: `pkg-config`, clang, libclang, and **libpipewire >= 1.2** (`pkg-config --atleast-version=1.2 libpipewire-0.3`). pipewire-rs 0.10 with feature `v1_2_0` fails on libspa 1.0.x. [`crates/omamix-pw/build.rs`](crates/omamix-pw/build.rs) runs that check. Ubuntu 24.04 apt ships `libpipewire-0.3-dev` 1.0.5, which is too old. `cargo test --workspace` leaves the feature off, so it needs neither the library nor a running daemon.
 
-Arch:
+Arch, GUI build:
 
 ```sh
 sudo pacman -S rustup clang pkgconf pipewire libpipewire wayland libxkbcommon libxkbcommon-x11 mesa
 ```
 
-Debian/Ubuntu (install `libpipewire-0.3-dev` only when that package is >= 1.2):
+Arch, headless build:
+
+```sh
+sudo pacman -S rustup clang pkgconf pipewire libpipewire
+```
+
+Debian/Ubuntu, GUI build (install `libpipewire-0.3-dev` only when that package is >= 1.2):
 
 ```sh
 sudo apt install clang libclang-dev pkg-config libwayland-dev libxkbcommon-dev libxkbcommon-x11-0 libegl1 libgl1-mesa-dev
+```
+
+Debian/Ubuntu, headless build (same libpipewire rule):
+
+```sh
+sudo apt install clang libclang-dev pkg-config libpipewire-0.3-dev
 ```
 
 ## Build, test, and run
@@ -45,7 +57,16 @@ cargo build -p omamix
 cargo run -p omamix
 ```
 
-`cargo run -p omamix` opens the window. It does not publish Mix Mic. `--help` exits before any window:
+The `gui` feature is the default, so a normal build still links the window. A server build turns it off and links no eframe, egui, winit, or Wayland crates.
+
+| Build | Command | System packages |
+| --- | --- | --- |
+| GUI (default) | `cargo build -p omamix` | Wayland, libxkbcommon, and EGL/Mesa. Add the PipeWire packages below when you also pass `--features pipewire`. |
+| Headless | `cargo build -p omamix --no-default-features --features pipewire` | pkg-config, clang, libclang, and libpipewire >= 1.2. No Wayland, libxkbcommon, or Mesa dev packages. |
+
+`cargo build -p omamix --features pipewire` keeps the default `gui` feature. That is the build the Arch package runs. `cargo build -p omamix --no-default-features` is the same headless binary with no PipeWire client, for a machine whose libpipewire is older than 1.2.
+
+`cargo run -p omamix` opens the window. It does not publish Mix Mic. A binary built without `gui` has no window: running it with no arguments prints an error and exits. `--help` exits before any window:
 
 ```sh
 cargo run -p omamix -- --help
@@ -75,7 +96,7 @@ omamix [--headless] [--mix-mic] [--duration SECS] [--monitor-mix] [--tone]
        [--strips other] [--strips device:NODE] [--strips app:NAME:BINARY]
 ```
 
-`--headless` does not open a window. On a build without `--features pipewire` it exits and opens no audio client. `--mix-mic`, `--strips`, `--monitor-mix`, `--tone`, and `--duration` require `--headless`. `--duration 2` stops the process after two seconds. `--tone` writes a 440 Hz sine on Mix Mic for a recorder aimed at that node. `--monitor-mix` also publishes the monitor playback stream. `--strips` may be repeated: `device:` is an ALSA `node.name`, and `app:NAME:BINARY` is `application.name` and `application.process.binary`.
+`--headless` does not open a window. A binary built without the `gui` feature is headless only, and starting it without `--headless` prints an error. On a build without `--features pipewire` it exits and opens no audio client. `--mix-mic`, `--strips`, `--monitor-mix`, `--tone`, and `--duration` require `--headless`. `--duration 2` stops the process after two seconds. `--tone` writes a 440 Hz sine on Mix Mic for a recorder aimed at that node. `--monitor-mix` also publishes the monitor playback stream. `--strips` may be repeated: `device:` is an ALSA `node.name`, and `app:NAME:BINARY` is `application.name` and `application.process.binary`.
 
 ```sh
 cargo run -p omamix --features pipewire -- --headless --mix-mic --duration 2
@@ -98,7 +119,7 @@ In the window, click a fader, then scroll while the pointer is still on it. One 
 ```text
 crates/omamix-core/   scene, dB math, fader, meters, DSP (no PipeWire)
 crates/omamix-pw/     audio engine; PipeWire filter and headless loop behind the feature
-crates/omamix/        eframe binary
+crates/omamix/        binary; eframe window behind the gui feature (default on)
 docs/                 spec, architecture, testing, audio baseline
 scripts/prove.sh      private PipeWire procedure
 scripts/true-peak-proof.sh  limiter ceiling check

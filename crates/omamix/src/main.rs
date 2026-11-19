@@ -5,14 +5,17 @@
 //! leaves the graph alone. The GUI path still uses [`NullEngine`] and does
 //! not publish Mix Mic.
 
+#[cfg(feature = "gui")]
 mod ui;
 
 use std::process::ExitCode;
 use std::time::Duration;
 
+#[cfg(feature = "gui")]
 use eframe::egui;
 use omamix_core::graph::Scene;
 use omamix_core::route::{RouteKey, SourceKind};
+#[cfg(feature = "gui")]
 use omamix_pw::{AudioEngine, EngineCommand, NullEngine};
 
 fn main() -> ExitCode {
@@ -43,12 +46,20 @@ fn main() -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    match run_gui() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("omamix: {err}");
-            ExitCode::FAILURE
+    #[cfg(feature = "gui")]
+    {
+        match run_gui() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("omamix: {err}");
+                ExitCode::FAILURE
+            }
         }
+    }
+    #[cfg(not(feature = "gui"))]
+    {
+        eprintln!("omamix: the window requires a build with --features gui; no window was opened");
+        ExitCode::FAILURE
     }
 }
 
@@ -59,6 +70,8 @@ omamix [--headless] [--mix-mic] [--duration SECS] [--monitor-mix] [--tone]
        [--strips other] [--strips device:NODE] [--strips app:NAME:BINARY]
 
 --headless does not open a window.
+A build without the gui feature has no window. Pass --headless, or
+rebuild with --features gui.
 --mix-mic publishes the Mix Mic Audio/Source/Virtual. Without it, --headless
 connects to nothing.
 --duration stops the process after that many seconds (headless only).
@@ -204,6 +217,7 @@ fn run_headless(cli: Cli) -> ExitCode {
     ExitCode::FAILURE
 }
 
+#[cfg(feature = "gui")]
 fn run_gui() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -219,12 +233,14 @@ fn run_gui() -> eframe::Result {
     )
 }
 
+#[cfg(feature = "gui")]
 struct OmamixApp {
     scene: Scene,
     /// The window does not open a PipeWire client.
     engine: Box<dyn AudioEngine>,
 }
 
+#[cfg(feature = "gui")]
 impl OmamixApp {
     fn new() -> Self {
         Self {
@@ -234,6 +250,7 @@ impl OmamixApp {
     }
 }
 
+#[cfg(feature = "gui")]
 impl eframe::App for OmamixApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ui, |ui| {
