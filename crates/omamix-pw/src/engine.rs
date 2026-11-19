@@ -40,10 +40,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use omamix_core::comp::CompUpdate;
-use omamix_core::eq::EqUpdate;
-use omamix_core::graph::Scene;
-use omamix_core::limit::{LIMIT_LOOKAHEAD_MAX_MS, LIMIT_LOOKAHEAD_MIN_MS, LimitUpdate};
+use omamix_core::comp::{
+    COMP_ATTACK_DEFAULT_MS, COMP_KNEE_DEFAULT_DB, COMP_MAKEUP_DEFAULT_DB, COMP_RATIO_DEFAULT,
+    COMP_RELEASE_DEFAULT_MS, COMP_THRESHOLD_DEFAULT_DB, CompSettings, CompUpdate,
+};
+use omamix_core::eq::{EqSettings, EqUpdate, HPF_DEFAULT_HZ};
+use omamix_core::graph::{MasterBus, Scene, Strip};
+use omamix_core::limit::{
+    LIMIT_CEILING_DEFAULT_DB, LIMIT_LOOKAHEAD_DEFAULT_MS, LIMIT_LOOKAHEAD_MAX_MS,
+    LIMIT_LOOKAHEAD_MIN_MS, LimitSettings, LimitUpdate,
+};
 use omamix_core::link::{self, LinkPhase, PortEndpoint};
 use omamix_core::metadata::{self, DefaultDeviceObservation};
 use omamix_core::params::StripParamUpdate;
@@ -73,6 +79,7 @@ pub struct HeadlessOptions {
     /// 440 Hz sine written by Mix Mic's `process`. Opt-in, so a recorder can
     /// measure this node. Off leaves the mix as the sum of the taps.
     pub tone: bool,
+    pub fallback_missing_devices: bool,
 }
 
 /// Identifiers printed once the filter node is in the graph.
@@ -302,6 +309,7 @@ pub fn run_list() -> Result<String, EngineError> {
         duration: None,
         publish_mix_mic: false,
         tone: false,
+        fallback_missing_devices: false,
     };
     let thread = std::thread::Builder::new()
         .name("omamix-pw".into())
@@ -413,6 +421,7 @@ fn pw_thread(
             instance,
             scene: options.scene,
             tone: options.tone,
+            fallback_missing_devices: options.fallback_missing_devices,
             queue,
             ready_tx: Some(ready_tx),
             ready_sent: false,
@@ -744,6 +753,7 @@ struct LoopInner {
     instance: String,
     scene: Scene,
     tone: bool,
+    fallback_missing_devices: bool,
     queue: CommandQueue,
     ready_tx: Option<std::sync::mpsc::Sender<Boot>>,
     ready_sent: bool,
@@ -1657,6 +1667,15 @@ fn ensure_tap(shared: &Rc<LoopShared>, filter: &Rc<RefCell<Option<MixFilter>>>, 
                 return;
             }
         }
+        let saved = strip_for_peer(&inner, peer);
+        let slot = inner.taps.get(&peer).and_then(|tap| tap.slot);
+        drop(inner);
+        if let Some(slot) = slot
+            && let Some(strip) = saved
+            && let Some(engine) = filter.borrow_mut().as_mut()
+        {
+            apply_saved_strip(engine, &strip, slot);
+        }
     }
 
     let ports_ready = peer_ports.is_some() && our_ports.is_some();
@@ -2208,6 +2227,15 @@ fn reject_devices_if_ready(shared: &LoopShared) -> bool {
 }
 
 fn resolve_requested_devices(inner: &mut LoopInner) -> Result<(), String> {
+    if inner.fallback_missing_devices {
+        let catalog = catalog_nodes(inner);
+        let missing = route::retarget_absent_devices(&mut inner.scene.strips, &catalog);
+        for name in missing {
+            eprintln!(
+                "omamix: warning: device strip '{name}' is not on this machine, using the default source"
+            );
+        }
+    }
     let wants_default = inner
         .scene
         .strips
@@ -2263,6 +2291,117 @@ fn resolve_requested_devices(inner: &mut LoopInner) -> Result<(), String> {
             .join(", ");
         Err(format!("device strips {names} were not found"))
     }
+}
+
+fn strip_for_peer(inner: &LoopInner, peer: u32) -> Option<Strip> {
+    let name = inner
+        .nodes
+        .get(&peer)
+        .map(|node| node.identity.node_name.as_str())
+        .unwrap_or("");
+    if let Some(strip) = inner.scene.strips.iter().find(|strip| {
+        matches!(&strip.source, SourceKind::CaptureDevice { node_name } if node_name == name)
+    }) {
+        return Some(strip.clone());
+    }
+    let stream = playback_of(inner, peer);
+    if let Some(strip) = inner.scene.strips.iter().find(|strip| {
+        matches!(&strip.source, SourceKind::Application(key) if key.matches_stream(&stream))
+    }) {
+        return Some(strip.clone());
+    }
+    if inner
+        .scene
+        .is_in_other_desktop(&stream, inner.own.as_ref(), None)
+    {
+        inner
+            .scene
+            .strips
+            .iter()
+            .find(|strip| matches!(strip.source, SourceKind::OtherDesktopAudio))
+            .cloned()
+    } else {
+        None
+    }
+}
+
+fn apply_saved_strip(engine: &mut MixFilter, strip: &Strip, slot: usize) {
+    let Ok(slot) = u16::try_from(slot) else {
+        return;
+    };
+    let bank = engine.shared();
+    if strip.fader_db != 0.0 {
+        let _ = bank
+            .strips
+            .apply(slot, StripParamUpdate::FaderDb(strip.fader_db));
+    }
+    if strip.input_gain_db != 0.0 {
+        let _ = bank
+            .strips
+            .apply(slot, StripParamUpdate::TrimDb(strip.input_gain_db));
+    }
+    if strip.mute {
+        let _ = bank.strips.apply(slot, StripParamUpdate::Mute(true));
+    }
+    if strip.solo {
+        let _ = bank.strips.apply(slot, StripParamUpdate::Solo(true));
+    }
+    if strip.pan != 0.0 {
+        let _ = bank.strips.apply(slot, StripParamUpdate::Pan(strip.pan));
+    }
+    if !strip.enabled {
+        let _ = bank.strips.apply(slot, StripParamUpdate::Enabled(false));
+    }
+    if !eq_is_flat(strip.eq) {
+        let _ = engine.apply_saved_eq(slot, strip.eq);
+    }
+    if !comp_is_bypass(strip.comp) {
+        let _ = engine.apply_saved_comp(slot, strip.comp);
+    }
+}
+
+fn apply_saved_master(engine: &mut MixFilter, master: &MasterBus) {
+    if master.fader_db() != 0.0 {
+        engine.shared().params.set_master_db(master.fader_db());
+    }
+    if !eq_is_flat(master.eq) {
+        engine.apply_saved_master_eq(master.eq);
+    }
+    if !comp_is_bypass(master.comp) {
+        engine.apply_saved_master_comp(master.comp);
+    }
+    let mut limit = master.limit;
+    if limit.enabled() != master.limiter_enabled {
+        limit.set_enabled(master.limiter_enabled);
+    }
+    if limit.ceiling_db() != master.limiter_ceiling_dbtp {
+        limit.set_ceiling_db(master.limiter_ceiling_dbtp);
+    }
+    if !limit_is_factory(limit) {
+        engine.apply_saved_master_limit(limit);
+    }
+}
+
+fn eq_is_flat(settings: EqSettings) -> bool {
+    !settings.hpf_enabled()
+        && settings.hpf_hz() == HPF_DEFAULT_HZ
+        && settings.band_db().iter().all(|band| *band == 0.0)
+}
+
+fn comp_is_bypass(settings: CompSettings) -> bool {
+    !settings.enabled()
+        && settings.threshold_db() == COMP_THRESHOLD_DEFAULT_DB
+        && settings.ratio() == COMP_RATIO_DEFAULT
+        && settings.attack_ms() == COMP_ATTACK_DEFAULT_MS
+        && settings.release_ms() == COMP_RELEASE_DEFAULT_MS
+        && settings.knee_db() == COMP_KNEE_DEFAULT_DB
+        && settings.makeup_db() == COMP_MAKEUP_DEFAULT_DB
+}
+
+fn limit_is_factory(settings: LimitSettings) -> bool {
+    settings.enabled()
+        && settings.ceiling_db() == LIMIT_CEILING_DEFAULT_DB
+        && settings.lookahead_ms() == LIMIT_LOOKAHEAD_DEFAULT_MS
 }
 
 fn catalog_nodes(inner: &LoopInner) -> Vec<route::CatalogNode> {
@@ -2342,7 +2481,7 @@ fn ensure_published(
     for (key, value) in contract::filter_properties() {
         filter_props.insert(key, value);
     }
-    let engine = match MixFilter::create(core, filter_props, tone) {
+    let mut engine = match MixFilter::create(core, filter_props, tone) {
         Ok(engine) => engine,
         Err(err) => {
             eprintln!("omamix: filter: {err}");
@@ -2350,6 +2489,8 @@ fn ensure_published(
             return;
         }
     };
+    let master = shared.inner.borrow().scene.master.clone();
+    apply_saved_master(&mut engine, &master);
     let _ = engine.events_version();
     let shared_audio = engine.shared();
     let filter_id = engine.node_id();
