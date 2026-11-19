@@ -1718,206 +1718,6 @@ mod tests {
         }
     }
 
-    fn fnv_mix(mut hash: u64, sample: f32) -> u64 {
-        let scaled = (f64::from(sample) * f64::from(1u32 << 20)).round();
-        let grid = if scaled.is_nan() {
-            0
-        } else {
-            scaled.clamp(i64::MIN as f64, i64::MAX as f64) as i64
-        };
-        for byte in grid.to_le_bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        hash
-    }
-
-    fn strip_phasor(slot: usize, len: usize, rate: u32) -> Vec<f32> {
-        let freq = 180.0 + slot as f64 * 37.0;
-        let step = std::f64::consts::TAU * freq / f64::from(rate);
-        let (sin_d, cos_d) = step.sin_cos();
-        let mut sin_p = 0.0f64;
-        let mut cos_p = 1.0f64;
-        let amp = 0.25118864f32;
-        let mut out = Vec::with_capacity(len);
-        for _ in 0..len {
-            out.push((sin_p as f32) * amp);
-            let next_sin = sin_p * cos_d + cos_p * sin_d;
-            let next_cos = cos_p * cos_d - sin_p * sin_d;
-            sin_p = next_sin;
-            cos_p = next_cos;
-        }
-        out
-    }
-
-    fn mix_fingerprint(rate: u32, frames: usize) -> u64 {
-        let warmup = 4096usize.div_ceil(frames).max(8);
-        let blocks = warmup + 32;
-        let len = blocks * frames;
-        let waves: Vec<Vec<f32>> = (0..STRIP_SLOT_COUNT)
-            .map(|slot| strip_phasor(slot, len, rate))
-            .collect();
-        let (mut eq_w, mut eq_r) = open();
-        let (mut comp_w, mut comp_r) = open_comp();
-        let mut limit_r = LimitReader::bypassed();
-        assert!(eq_w.set_sample_rate(rate));
-        assert!(comp_w.set_sample_rate(rate));
-        arm_eq_and_comp(&mut eq_w, &mut comp_w);
-        let mut mixer = StripMixer::new(rate);
-        let bank = StripParamBank::new();
-        let meters = StripMeterBank::new();
-        let mut scopes = ScopeBank::with_capacity(frames);
-        let mut left = vec![0.0f32; frames];
-        let mut right = vec![0.0f32; frames];
-        let mut hash = 0xcbf29ce484222325u64;
-        let mut cursor = 0usize;
-        for block in 0..blocks {
-            let inputs: Vec<Option<StripBlockInput<'_>>> = waves
-                .iter()
-                .map(|wave| {
-                    Some(StripBlockInput {
-                        left: &wave[cursor..cursor + frames],
-                        right: &wave[cursor..cursor + frames],
-                    })
-                })
-                .collect();
-            mixer.process(
-                &bank,
-                &mut eq_r,
-                &mut comp_r,
-                &mut limit_r,
-                &meters,
-                &mut scopes,
-                &inputs,
-                &mut left,
-                &mut right,
-                rate,
-            );
-            if block >= warmup {
-                for sample in left.iter().chain(right.iter()) {
-                    hash = fnv_mix(hash, *sample);
-                }
-                hash = fnv_mix(hash, comp_r.master_gain_reduction_db());
-            }
-            cursor += frames;
-        }
-        hash
-    }
-
-    fn transition_fingerprint() -> u64 {
-        let rate = 48_000u32;
-        let frames = 96usize;
-        let lead = 2usize;
-        let after = 4usize;
-        let blocks = lead + after + 2 + after + after + 2;
-        let len = blocks * frames;
-        let waves: Vec<Vec<f32>> = (0..STRIP_SLOT_COUNT)
-            .map(|slot| strip_phasor(slot, len, rate))
-            .collect();
-        let (mut eq_w, mut eq_r) = open();
-        let (mut comp_w, mut comp_r) = open_comp();
-        let mut limit_r = LimitReader::bypassed();
-        assert!(eq_w.set_sample_rate(rate));
-        assert!(comp_w.set_sample_rate(rate));
-        let mut mixer = StripMixer::new(rate);
-        let bank = StripParamBank::new();
-        let meters = StripMeterBank::new();
-        let mut scopes = ScopeBank::with_capacity(frames);
-        let mut left = vec![0.0f32; frames];
-        let mut right = vec![0.0f32; frames];
-        let mut hash = 0xcbf29ce484222325u64;
-        let mut cursor = 0usize;
-        let mut step = |mixer: &mut StripMixer,
-                        eq_w: &mut crate::eq::EqWriter,
-                        comp_w: &mut crate::comp::CompWriter,
-                        eq_hot: bool,
-                        comp_on: bool,
-                        count: usize| {
-            for slot in 0..STRIP_SLOT_COUNT as u16 {
-                assert!(eq_w.apply(slot, EqUpdate::HighPassEnabled(eq_hot)));
-                assert!(eq_w.apply(
-                    slot,
-                    EqUpdate::Band {
-                        index: 4,
-                        gain_db: if eq_hot { 6.0 } else { 0.0 },
-                    },
-                ));
-                assert!(comp_w.apply(slot, CompUpdate::Enabled(comp_on)));
-            }
-            assert!(eq_w.apply_master(EqUpdate::HighPassEnabled(eq_hot)));
-            assert!(eq_w.apply_master(EqUpdate::Band {
-                index: 4,
-                gain_db: if eq_hot { 6.0 } else { 0.0 },
-            }));
-            assert!(comp_w.apply_master(CompUpdate::Enabled(comp_on)));
-            for _ in 0..count {
-                let inputs: Vec<Option<StripBlockInput<'_>>> = waves
-                    .iter()
-                    .map(|wave| {
-                        Some(StripBlockInput {
-                            left: &wave[cursor..cursor + frames],
-                            right: &wave[cursor..cursor + frames],
-                        })
-                    })
-                    .collect();
-                mixer.process(
-                    &bank,
-                    &mut eq_r,
-                    &mut comp_r,
-                    &mut limit_r,
-                    &meters,
-                    &mut scopes,
-                    &inputs,
-                    &mut left,
-                    &mut right,
-                    rate,
-                );
-                for sample in left.iter().chain(right.iter()) {
-                    hash = fnv_mix(hash, *sample);
-                }
-                hash = fnv_mix(hash, comp_r.master_gain_reduction_db());
-                cursor += frames;
-            }
-        };
-        step(&mut mixer, &mut eq_w, &mut comp_w, false, false, lead);
-        step(&mut mixer, &mut eq_w, &mut comp_w, true, false, after);
-        for slot in 0..STRIP_SLOT_COUNT {
-            mixer.eq.reset_slot(slot);
-        }
-        step(&mut mixer, &mut eq_w, &mut comp_w, false, false, 2);
-        step(&mut mixer, &mut eq_w, &mut comp_w, true, false, after);
-        step(&mut mixer, &mut eq_w, &mut comp_w, false, false, after);
-        step(&mut mixer, &mut eq_w, &mut comp_w, false, true, 1);
-        step(&mut mixer, &mut eq_w, &mut comp_w, false, false, 1);
-        hash
-    }
-
-    #[test]
-    fn eq_transition_fingerprint_matches_the_locked_hash() {
-        let got = transition_fingerprint();
-        let want = 0x12cc1fdb795cc826u64;
-        assert_eq!(got, want, "transition fingerprint {got:016x}");
-    }
-
-    #[test]
-    fn settled_38_strip_mix_matches_the_locked_fingerprint() {
-        let locked = [
-            (48_000u32, 64usize, 0xe366faf01b3233d8u64),
-            (48_000, 256, 0xd3d1b3988810bcd9),
-            (48_000, 1024, 0x6b57e13a766beb51),
-            (96_000, 64, 0x045df505f303fd21),
-            (96_000, 256, 0x8745f8aa1f0aa4e6),
-            (96_000, 1024, 0xe6085cb96e975618),
-        ];
-        for (rate, frames, want) in locked {
-            let got = mix_fingerprint(rate, frames);
-            assert_eq!(
-                got, want,
-                "fingerprint at {rate} Hz, {frames} frames, {got:016x} != {want:016x}"
-            );
-        }
-    }
-
     /// One averaged block of the 38-strip EQ and compressor mix.
     fn time_eq_comp_mix(rate: u32, frames: usize) -> std::time::Duration {
         let reps = if cfg!(debug_assertions) { 4u32 } else { 100 };
@@ -2107,5 +1907,185 @@ mod tests {
         print_stage("eq_only", stage_block_us(true, false, blocks));
         print_stage("comp_only", stage_block_us(false, true, blocks));
         print_stage("bypass", stage_block_us(false, false, blocks));
+    }
+
+    fn capture_settled(rate: u32, frames: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let warmup = 4096usize.div_ceil(frames).max(8);
+        let blocks = warmup + 32;
+        let len = blocks * frames;
+        let waves: Vec<Vec<f32>> = (0..STRIP_SLOT_COUNT)
+            .map(|slot| crate::scene_check::strip_wave(slot, len, rate))
+            .collect();
+        let (mut eq_w, mut eq_r) = open();
+        let (mut comp_w, mut comp_r) = open_comp();
+        let mut limit_r = LimitReader::bypassed();
+        assert!(eq_w.set_sample_rate(rate));
+        assert!(comp_w.set_sample_rate(rate));
+        arm_eq_and_comp(&mut eq_w, &mut comp_w);
+        let mut mixer = StripMixer::new(rate);
+        let bank = StripParamBank::new();
+        let meters = StripMeterBank::new();
+        let mut scopes = ScopeBank::with_capacity(frames);
+        let mut left_out = Vec::with_capacity(len);
+        let mut right_out = Vec::with_capacity(len);
+        let mut gr = Vec::with_capacity(blocks);
+        let mut cursor = 0usize;
+        let mut left = vec![0.0f32; frames];
+        let mut right = vec![0.0f32; frames];
+        for _ in 0..blocks {
+            let inputs: Vec<Option<StripBlockInput<'_>>> = waves
+                .iter()
+                .map(|wave| {
+                    Some(StripBlockInput {
+                        left: &wave[cursor..cursor + frames],
+                        right: &wave[cursor..cursor + frames],
+                    })
+                })
+                .collect();
+            mixer.process(
+                &bank,
+                &mut eq_r,
+                &mut comp_r,
+                &mut limit_r,
+                &meters,
+                &mut scopes,
+                &inputs,
+                &mut left,
+                &mut right,
+                rate,
+            );
+            left_out.extend_from_slice(&left);
+            right_out.extend_from_slice(&right);
+            gr.push(comp_r.master_gain_reduction_db());
+            cursor += frames;
+        }
+        (left_out, right_out, gr)
+    }
+
+    fn capture_transition() -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let rate = 48_000u32;
+        let frames = 96usize;
+        let lead = 2usize;
+        let after = 4usize;
+        let blocks = lead + after + 2 + after + after + 2;
+        let len = blocks * frames;
+        let waves: Vec<Vec<f32>> = (0..STRIP_SLOT_COUNT)
+            .map(|slot| crate::scene_check::strip_wave(slot, len, rate))
+            .collect();
+        let (mut eq_w, mut eq_r) = open();
+        let (mut comp_w, mut comp_r) = open_comp();
+        let mut limit_r = LimitReader::bypassed();
+        assert!(eq_w.set_sample_rate(rate));
+        assert!(comp_w.set_sample_rate(rate));
+        let mut mixer = StripMixer::new(rate);
+        let bank = StripParamBank::new();
+        let meters = StripMeterBank::new();
+        let mut scopes = ScopeBank::with_capacity(frames);
+        let mut left_out = Vec::with_capacity(len);
+        let mut right_out = Vec::with_capacity(len);
+        let mut gr = Vec::with_capacity(blocks);
+        let mut cursor = 0usize;
+        let mut left = vec![0.0f32; frames];
+        let mut right = vec![0.0f32; frames];
+        let mut run = |mixer: &mut StripMixer,
+                       eq_w: &mut crate::eq::EqWriter,
+                       comp_w: &mut crate::comp::CompWriter,
+                       eq_hot: bool,
+                       comp_on: bool,
+                       count: usize| {
+            for slot in 0..STRIP_SLOT_COUNT as u16 {
+                assert!(eq_w.apply(slot, EqUpdate::HighPassEnabled(eq_hot)));
+                assert!(eq_w.apply(
+                    slot,
+                    EqUpdate::Band {
+                        index: 4,
+                        gain_db: if eq_hot { 6.0 } else { 0.0 },
+                    },
+                ));
+                assert!(comp_w.apply(slot, CompUpdate::Enabled(comp_on)));
+            }
+            assert!(eq_w.apply_master(EqUpdate::HighPassEnabled(eq_hot)));
+            assert!(eq_w.apply_master(EqUpdate::Band {
+                index: 4,
+                gain_db: if eq_hot { 6.0 } else { 0.0 },
+            }));
+            assert!(comp_w.apply_master(CompUpdate::Enabled(comp_on)));
+            for _ in 0..count {
+                let inputs: Vec<Option<StripBlockInput<'_>>> = waves
+                    .iter()
+                    .map(|wave| {
+                        Some(StripBlockInput {
+                            left: &wave[cursor..cursor + frames],
+                            right: &wave[cursor..cursor + frames],
+                        })
+                    })
+                    .collect();
+                mixer.process(
+                    &bank,
+                    &mut eq_r,
+                    &mut comp_r,
+                    &mut limit_r,
+                    &meters,
+                    &mut scopes,
+                    &inputs,
+                    &mut left,
+                    &mut right,
+                    rate,
+                );
+                left_out.extend_from_slice(&left);
+                right_out.extend_from_slice(&right);
+                gr.push(comp_r.master_gain_reduction_db());
+                cursor += frames;
+            }
+        };
+        run(&mut mixer, &mut eq_w, &mut comp_w, false, false, lead);
+        run(&mut mixer, &mut eq_w, &mut comp_w, true, false, after);
+        for slot in 0..STRIP_SLOT_COUNT {
+            mixer.eq.reset_slot(slot);
+        }
+        run(&mut mixer, &mut eq_w, &mut comp_w, false, false, 2);
+        run(&mut mixer, &mut eq_w, &mut comp_w, true, false, after);
+        run(&mut mixer, &mut eq_w, &mut comp_w, false, false, after);
+        run(&mut mixer, &mut eq_w, &mut comp_w, false, true, 1);
+        run(&mut mixer, &mut eq_w, &mut comp_w, false, false, 1);
+        (left_out, right_out, gr)
+    }
+
+    #[test]
+    fn eq_transition_stays_near_the_reference_mix() {
+        let (left, right, gr) = capture_transition();
+        let reference = crate::scene_check::render_transition();
+        crate::scene_check::assert_near(
+            "eq transition",
+            (&left, &right, &gr),
+            &reference,
+            (0, 96, 48_000.0),
+            6.0e-7,
+            2.0e-6,
+        );
+    }
+
+    #[test]
+    fn settled_38_strip_mix_stays_near_the_reference_mix() {
+        for (rate, frames) in [
+            (48_000u32, 64usize),
+            (48_000, 256),
+            (48_000, 1024),
+            (96_000, 64),
+            (96_000, 256),
+            (96_000, 1024),
+        ] {
+            let (left, right, gr) = capture_settled(rate, frames);
+            let reference = crate::scene_check::render_settled(rate, frames);
+            let warmup = 4096usize.div_ceil(frames).max(8);
+            crate::scene_check::assert_near(
+                &format!("settled {rate} Hz {frames} frames"),
+                (&left, &right, &gr),
+                &reference,
+                (warmup * frames, frames, f64::from(rate)),
+                5.0e-6,
+                1.0e-4,
+            );
+        }
     }
 }
