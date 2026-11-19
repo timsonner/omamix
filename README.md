@@ -122,6 +122,7 @@ crates/omamix-pw/     audio engine; PipeWire filter and headless loop behind the
 crates/omamix/        binary; eframe window behind the gui feature (default on)
 docs/                 spec, architecture, testing, audio baseline
 scripts/prove.sh      private PipeWire procedure
+scripts/rate-matrix.sh  Mix Mic at 44100, 48000, and 96000 and quanta 64, 256, and 1024
 scripts/true-peak-proof.sh  limiter ceiling check
 scripts/check-agnostic.sh   CI guard against machine-specific names in code
 PKGBUILD              Arch package omamix-git
