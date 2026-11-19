@@ -18,6 +18,8 @@ pub mod route;
 pub mod scope;
 
 #[cfg(test)]
+mod scene_check;
+#[cfg(test)]
 mod test_alloc;
 
 /// Print one measured line with the Cargo profile and where it ran.
