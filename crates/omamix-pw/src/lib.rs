@@ -2,7 +2,7 @@
 //!
 //! The default build has no libpipewire dependency. `--features pipewire`
 //! compiles the filter backend in [`backend`] and [`engine`]. Unit tests do
-//! not connect to the daemon. [`run_headless`] is what opens a client.
+//! not connect to the daemon. [`run_headless`] and the window engine open a client.
 
 pub mod contract;
 pub mod rt;
@@ -15,7 +15,7 @@ mod engine;
 mod filter;
 
 #[cfg(feature = "pipewire")]
-pub use engine::{HeadlessOptions, run_headless, run_list};
+pub use engine::{HeadlessOptions, WindowEngine, run_headless, run_list};
 
 use std::fmt;
 
@@ -82,6 +82,7 @@ impl NullEngine {
                 EngineCommand::SetMasterLimit(update) => {
                     self.limit.apply_master(update);
                 }
+                EngineCommand::ReplaceScene(_) => {}
             }
         }
         Ok(())

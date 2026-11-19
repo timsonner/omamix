@@ -54,6 +54,7 @@ pub enum EngineCommand {
     /// Master limiter. The loop thread publishes the block. `process` only
     /// loads it.
     SetMasterLimit(LimitUpdate),
+    ReplaceScene(Box<omamix_core::Scene>),
 }
 
 /// Clone of the sending half. Safe to hold on the UI thread.

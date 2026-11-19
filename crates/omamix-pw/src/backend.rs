@@ -1,13 +1,19 @@
-//! Property bags and the monitor stream format.
+//! Property bags, the monitor stream format, and the window engine opener.
 //!
 //! Compiled only with `--features pipewire`. The public Mix Mic node is an
-//! adapter. The mix runs in the `pw_filter` in [`crate::filter`]. This module
-//! does not open a client. Unit tests build property objects and do not connect.
+//! adapter. The mix runs in the `pw_filter` in [`crate::filter`]. Unit tests
+//! build property objects and do not connect. [`open_window_engine`] does.
 
 use pipewire as pw;
 use pw::properties::PropertiesBox;
 
+use crate::EngineError;
 use crate::contract;
+use crate::engine::WindowEngine;
+
+pub fn open_window_engine(scene: omamix_core::graph::Scene) -> Result<WindowEngine, EngineError> {
+    crate::engine::open_window_engine(scene)
+}
 
 pub fn mix_mic_properties() -> PropertiesBox {
     let mut props = PropertiesBox::new();

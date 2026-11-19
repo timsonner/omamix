@@ -100,8 +100,8 @@ enum LoopMsg {
     SetMasterLimit(LimitUpdate),
 }
 
-fn engine_command_msg(command: EngineCommand) -> LoopMsg {
-    match command {
+fn engine_command_msg(command: EngineCommand) -> Option<LoopMsg> {
+    Some(match command {
         EngineCommand::Shutdown => LoopMsg::Shutdown,
         EngineCommand::SetMasterFaderDb(db) => LoopMsg::SetMasterFaderDb(db),
         EngineCommand::SetMonitorMix(on) => LoopMsg::SetMonitorMix(on),
@@ -111,7 +111,8 @@ fn engine_command_msg(command: EngineCommand) -> LoopMsg {
         EngineCommand::SetStripComp { slot, update } => LoopMsg::SetStripComp { slot, update },
         EngineCommand::SetMasterComp(update) => LoopMsg::SetMasterComp(update),
         EngineCommand::SetMasterLimit(update) => LoopMsg::SetMasterLimit(update),
-    }
+        EngineCommand::ReplaceScene(_) => return None,
+    })
 }
 
 struct Ready {
@@ -123,6 +124,156 @@ enum Boot {
     Ready(Ready),
     Failed(String),
     Usage(String),
+}
+
+pub struct WindowSnapshot {
+    pub catalog: Vec<route::ListedNode>,
+    pub default_source: Option<String>,
+    pub catalog_ready: bool,
+    pub published: bool,
+    pub failure: Option<String>,
+    pub master_peak: f32,
+    pub master_rms: f32,
+    pub strips: Vec<(u64, f32, f32)>,
+}
+
+struct WindowView {
+    catalog: Mutex<Vec<route::ListedNode>>,
+    default_source: Mutex<Option<String>>,
+    catalog_ready: AtomicBool,
+    published: AtomicBool,
+    failure: Mutex<Option<String>>,
+    master_peak: Mutex<f32>,
+    master_rms: Mutex<f32>,
+    strips: Mutex<Vec<(u64, f32, f32)>>,
+}
+
+impl WindowView {
+    fn new() -> Self {
+        Self {
+            catalog: Mutex::new(Vec::new()),
+            default_source: Mutex::new(None),
+            catalog_ready: AtomicBool::new(false),
+            published: AtomicBool::new(false),
+            failure: Mutex::new(None),
+            master_peak: Mutex::new(f32::NEG_INFINITY),
+            master_rms: Mutex::new(f32::NEG_INFINITY),
+            strips: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn note_failure(&self, message: &str) {
+        let mut slot = lock_mutex(&self.failure);
+        if slot.is_none() {
+            *slot = Some(message.to_string());
+        }
+    }
+
+    fn publish(&self, snap: WindowSnapshot) {
+        *lock_mutex(&self.catalog) = snap.catalog;
+        *lock_mutex(&self.default_source) = snap.default_source;
+        self.catalog_ready
+            .store(snap.catalog_ready, Ordering::Relaxed);
+        self.published.store(snap.published, Ordering::Relaxed);
+        *lock_mutex(&self.master_peak) = snap.master_peak;
+        *lock_mutex(&self.master_rms) = snap.master_rms;
+        *lock_mutex(&self.strips) = snap.strips;
+    }
+}
+
+fn lock_mutex<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+pub struct WindowEngine {
+    commands: crate::rt::CommandSender,
+    pw_tx: pw::channel::Sender<LoopMsg>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    view: Arc<WindowView>,
+}
+
+impl WindowEngine {
+    pub fn snapshot(&self) -> WindowSnapshot {
+        WindowSnapshot {
+            catalog: lock_mutex(&self.view.catalog).clone(),
+            default_source: lock_mutex(&self.view.default_source).clone(),
+            catalog_ready: self.view.catalog_ready.load(Ordering::Relaxed),
+            published: self.view.published.load(Ordering::Relaxed),
+            failure: lock_mutex(&self.view.failure).clone(),
+            master_peak: *lock_mutex(&self.view.master_peak),
+            master_rms: *lock_mutex(&self.view.master_rms),
+            strips: lock_mutex(&self.view.strips).clone(),
+        }
+    }
+
+    pub fn published(&self) -> bool {
+        self.view.published.load(Ordering::Relaxed)
+    }
+
+    pub fn failure(&self) -> Option<String> {
+        lock_mutex(&self.view.failure).clone()
+    }
+
+    pub fn submit_scene(&self, scene: &Scene) {
+        self.commands
+            .submit(EngineCommand::ReplaceScene(Box::new(scene.clone())));
+    }
+
+    pub fn shutdown(&mut self) {
+        let _ = self.pw_tx.send(LoopMsg::Shutdown);
+        self.commands.submit(EngineCommand::Shutdown);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for WindowEngine {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+const WINDOW_ENGINE_NAME: &str = concat!("pipe", "wire");
+
+impl crate::AudioEngine for WindowEngine {
+    fn name(&self) -> &'static str {
+        WINDOW_ENGINE_NAME
+    }
+
+    fn command_sender(&self) -> crate::rt::CommandSender {
+        self.commands.clone()
+    }
+}
+
+pub fn open_window_engine(scene: Scene) -> Result<WindowEngine, EngineError> {
+    let queue = CommandQueue::new();
+    let commands = queue.sender();
+    let view = Arc::new(WindowView::new());
+    let (ready_tx, _ready_rx) = std::sync::mpsc::channel::<Boot>();
+    let (pw_tx, pw_rx) = pw::channel::channel::<LoopMsg>();
+    let options = HeadlessOptions {
+        scene,
+        duration: None,
+        publish_mix_mic: true,
+        tone: false,
+        fallback_missing_devices: true,
+    };
+    let view_thread = Arc::clone(&view);
+    let thread = std::thread::Builder::new()
+        .name("omamix-pw".into())
+        .spawn(move || {
+            let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                pw_thread(options, None, pw_rx, ready_tx, queue, Some(view_thread));
+            }));
+        })
+        .map_err(|err| EngineError::PipeWire(err.to_string()))?;
+    Ok(WindowEngine {
+        commands,
+        pw_tx,
+        thread: Some(thread),
+        view,
+    })
 }
 
 /// Open a client only when `publish_mix_mic` is set. Blocks until shutdown.
@@ -137,6 +288,7 @@ pub fn run_headless(options: HeadlessOptions) -> Result<HeadlessReport, EngineEr
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Boot>();
     let (pw_tx, pw_rx) = pw::channel::channel::<LoopMsg>();
+    let queue = CommandQueue::new();
     arm_signals();
 
     let duration = options.duration;
@@ -145,7 +297,7 @@ pub fn run_headless(options: HeadlessOptions) -> Result<HeadlessReport, EngineEr
         .name("omamix-pw".into())
         .spawn(move || {
             let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                pw_thread(options, None, pw_rx, ready_tx);
+                pw_thread(options, None, pw_rx, ready_tx, queue, None);
             }));
         })
         .map_err(|err| EngineError::PipeWire(err.to_string()))?;
@@ -303,6 +455,7 @@ pub fn run_list() -> Result<String, EngineError> {
     let (list_tx, list_rx) = std::sync::mpsc::channel();
     let (ready_tx, _ready_rx) = std::sync::mpsc::channel::<Boot>();
     let (pw_tx, pw_rx) = pw::channel::channel::<LoopMsg>();
+    let queue = CommandQueue::new();
     arm_signals();
     let options = HeadlessOptions {
         scene: Scene::empty("list"),
@@ -315,7 +468,7 @@ pub fn run_list() -> Result<String, EngineError> {
         .name("omamix-pw".into())
         .spawn(move || {
             let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                pw_thread(options, Some(list_tx), pw_rx, ready_tx);
+                pw_thread(options, Some(list_tx), pw_rx, ready_tx, queue, None);
             }));
         })
         .map_err(|err| EngineError::PipeWire(err.to_string()))?;
@@ -364,11 +517,20 @@ fn pw_thread(
     list_tx: Option<std::sync::mpsc::Sender<Vec<route::ListedNode>>>,
     pw_rx: pw::channel::Receiver<LoopMsg>,
     ready_tx: std::sync::mpsc::Sender<Boot>,
+    queue: CommandQueue,
+    view: Option<Arc<WindowView>>,
 ) {
+    let report = view.clone();
+    let fail = move |message: &str| {
+        if let Some(view) = &report {
+            view.note_failure(message);
+        }
+    };
     let mainloop = match pw::main_loop::MainLoopRc::new(None) {
         Ok(loop_) => loop_,
         Err(err) => {
             eprintln!("omamix: main loop: {err}");
+            fail("PipeWire main loop did not start");
             return;
         }
     };
@@ -376,6 +538,7 @@ fn pw_thread(
         Ok(context) => context,
         Err(err) => {
             eprintln!("omamix: context: {err}");
+            fail("PipeWire context did not start");
             return;
         }
     };
@@ -398,6 +561,7 @@ fn pw_thread(
         Ok(core) => core,
         Err(err) => {
             eprintln!("omamix: connect: {err}");
+            fail("PipeWire client did not connect");
             return;
         }
     };
@@ -405,6 +569,7 @@ fn pw_thread(
         Ok(registry) => registry,
         Err(err) => {
             eprintln!("omamix: registry: {err}");
+            fail("PipeWire registry did not open");
             return;
         }
     };
@@ -412,11 +577,10 @@ fn pw_thread(
     let filter: Rc<RefCell<Option<MixFilter>>> = Rc::new(RefCell::new(None));
     let monitor_keep: Rc<RefCell<Option<MonitorKeep>>> = Rc::new(RefCell::new(None));
 
-    let queue = CommandQueue::new();
-    let _command_sender = queue.sender();
     let strips_checked = !scene_needs_device_check(&options.scene);
     let shared_loop = Rc::new(LoopShared {
         pending: Mutex::new(Vec::new()),
+        view,
         inner: RefCell::new(LoopInner {
             instance,
             scene: options.scene,
@@ -724,6 +888,7 @@ fn interleaved_dest(data: &mut pw::spa::buffer::Data, copied: usize) -> Option<(
 
 struct LoopShared {
     pending: Mutex<Vec<Pending>>,
+    view: Option<Arc<WindowView>>,
     inner: RefCell<LoopInner>,
 }
 
@@ -912,7 +1077,60 @@ fn tick(
     link_engine(shared);
     reconcile(shared, filter);
     publish_ready(shared);
+    publish_view(shared, filter);
     quit || shared.inner.borrow().quit
+}
+
+fn publish_view(shared: &LoopShared, filter: &RefCell<Option<MixFilter>>) {
+    let Some(view) = &shared.view else {
+        return;
+    };
+    let inner = shared.inner.borrow();
+    let catalog = listed_nodes(&inner);
+    let default_source = resolved_default_name(&inner);
+    let ready = inner.settle_round >= 3;
+    let published = inner.published;
+    let (master_peak, master_rms, strips) = if let Some(engine) = filter.borrow().as_ref() {
+        let audio = engine.shared();
+        let mut best: HashMap<u64, (f32, f32)> = HashMap::new();
+        for (peer, tap) in &inner.taps {
+            let Some(slot) = tap.slot else {
+                continue;
+            };
+            let Some(strip) = strip_for_peer(&inner, *peer) else {
+                continue;
+            };
+            let (peak, rms) = audio.strip_meters.load(slot);
+            let entry = best
+                .entry(strip.id.0)
+                .or_insert((f32::NEG_INFINITY, f32::NEG_INFINITY));
+            if peak > entry.0 {
+                entry.0 = peak;
+            }
+            if rms > entry.1 {
+                entry.1 = rms;
+            }
+        }
+        let mut strips = Vec::new();
+        for (id, (peak, rms)) in best {
+            strips.push((id, peak, rms));
+        }
+        let (master_peak, master_rms) = audio.meter.load();
+        (master_peak, master_rms, strips)
+    } else {
+        (f32::NEG_INFINITY, f32::NEG_INFINITY, Vec::new())
+    };
+    drop(inner);
+    view.publish(WindowSnapshot {
+        catalog,
+        default_source,
+        catalog_ready: ready,
+        published,
+        failure: None,
+        master_peak,
+        master_rms,
+        strips,
+    });
 }
 
 /// Rebuild EQ coefficients when the callback's rate is not the published one.
@@ -986,12 +1204,65 @@ fn drain_commands(
     }
     let mut quit = false;
     for command in commands {
-        let msg = engine_command_msg(command);
-        if apply_loop_msg(&msg, filter, monitor_on) {
-            quit = true;
+        match command {
+            EngineCommand::ReplaceScene(scene) => {
+                shared.inner.borrow_mut().scene = *scene;
+                reapply_strip_controls(shared, filter);
+            }
+            other => {
+                if let Some(msg) = engine_command_msg(other)
+                    && apply_loop_msg(&msg, filter, monitor_on)
+                {
+                    quit = true;
+                }
+            }
         }
     }
     quit
+}
+
+fn reapply_strip_controls(shared: &LoopShared, filter: &RefCell<Option<MixFilter>>) {
+    let (master_db, pairs) = {
+        let inner = shared.inner.borrow();
+        let mut pairs = Vec::new();
+        for (peer, tap) in &inner.taps {
+            let Some(slot) = tap.slot else {
+                continue;
+            };
+            let Some(strip) = strip_for_peer(&inner, *peer) else {
+                continue;
+            };
+            pairs.push((strip, slot));
+        }
+        (inner.scene.master.fader_db(), pairs)
+    };
+    let borrowed = filter.borrow();
+    let Some(engine) = borrowed.as_ref() else {
+        return;
+    };
+    engine.shared().params.set_master_db(master_db);
+    for (strip, slot) in pairs {
+        apply_live_strip(engine, &strip, slot);
+    }
+}
+
+fn apply_live_strip(engine: &MixFilter, strip: &Strip, slot: usize) {
+    let Ok(slot) = u16::try_from(slot) else {
+        return;
+    };
+    let bank = engine.shared();
+    let _ = bank
+        .strips
+        .apply(slot, StripParamUpdate::FaderDb(strip.fader_db));
+    let _ = bank
+        .strips
+        .apply(slot, StripParamUpdate::TrimDb(strip.input_gain_db));
+    let _ = bank.strips.apply(slot, StripParamUpdate::Mute(strip.mute));
+    let _ = bank.strips.apply(slot, StripParamUpdate::Solo(strip.solo));
+    let _ = bank.strips.apply(slot, StripParamUpdate::Pan(strip.pan));
+    let _ = bank
+        .strips
+        .apply(slot, StripParamUpdate::Enabled(strip.enabled));
 }
 
 fn apply_event(shared: &Rc<LoopShared>, event: Pending) {
@@ -1523,26 +1794,15 @@ fn wanted_peers(inner: &LoopInner) -> Vec<u32> {
         links: &edges,
     };
     let mut peers = Vec::new();
+    let default_name = resolved_default_name(inner);
     for strip in &inner.scene.strips {
         match &strip.source {
             SourceKind::CaptureDevice { node_name } => {
-                for (id, node) in &inner.nodes {
-                    if *id == mix || node.identity.node_name != *node_name {
-                        continue;
-                    }
-                    if !route::is_capture_device_class(&node.identity.media_class) {
-                        continue;
-                    }
-                    if node.identity.omamix_owned || node.identity.node_name == MIX_MIC_NODE_NAME {
-                        continue;
-                    }
-                    if inner.filter_node == Some(*id) {
-                        continue;
-                    }
-                    if route::upstream_includes_mix_mic(*id, &graph) {
-                        continue;
-                    }
-                    peers.push(*id);
+                push_named_device(&mut peers, inner, &graph, mix, node_name);
+            }
+            SourceKind::DefaultSource => {
+                if let Some(name) = default_name.as_deref() {
+                    push_named_device(&mut peers, inner, &graph, mix, name);
                 }
             }
             SourceKind::Application(_) => {
@@ -1556,7 +1816,7 @@ fn wanted_peers(inner: &LoopInner) -> Vec<u32> {
                     }
                 }
             }
-            SourceKind::DefaultSource | SourceKind::OtherDesktopAudio => {}
+            SourceKind::OtherDesktopAudio => {}
         }
     }
     if inner
@@ -1582,6 +1842,33 @@ fn wanted_peers(inner: &LoopInner) -> Vec<u32> {
     peers.sort_unstable();
     peers.dedup();
     peers
+}
+
+fn push_named_device(
+    peers: &mut Vec<u32>,
+    inner: &LoopInner,
+    graph: &LoopGraph<'_>,
+    mix: u32,
+    node_name: &str,
+) {
+    for (id, node) in &inner.nodes {
+        if *id == mix || node.identity.node_name != node_name {
+            continue;
+        }
+        if !route::is_capture_device_class(&node.identity.media_class) {
+            continue;
+        }
+        if node.identity.omamix_owned || node.identity.node_name == MIX_MIC_NODE_NAME {
+            continue;
+        }
+        if inner.filter_node == Some(*id) {
+            continue;
+        }
+        if route::upstream_includes_mix_mic(*id, graph) {
+            continue;
+        }
+        peers.push(*id);
+    }
 }
 
 fn ensure_tap(shared: &Rc<LoopShared>, filter: &Rc<RefCell<Option<MixFilter>>>, peer: u32) {
@@ -2310,6 +2597,15 @@ fn strip_for_peer(inner: &LoopInner, peer: u32) -> Option<Strip> {
     }) {
         return Some(strip.clone());
     }
+    if resolved_default_name(inner).is_some_and(|default_name| default_name == name)
+        && let Some(strip) = inner
+            .scene
+            .strips
+            .iter()
+            .find(|strip| matches!(strip.source, SourceKind::DefaultSource))
+    {
+        return Some(strip.clone());
+    }
     if inner
         .scene
         .is_in_other_desktop(&stream, inner.own.as_ref(), None)
@@ -2449,11 +2745,32 @@ fn fail_usage(shared: &LoopShared, message: &str) {
     }
 }
 
+fn resolved_default_name(inner: &LoopInner) -> Option<String> {
+    let snapshot = metadata::DefaultSourceSnapshot {
+        audio_source: if inner.source_seen {
+            inner.default_source.clone()
+        } else {
+            None
+        },
+        configured_audio_source: if inner.configured_seen {
+            inner.configured_source.clone()
+        } else {
+            None
+        },
+    };
+    metadata::resolve_default_source(&snapshot).ok()
+}
+
 fn fail_closed(shared: &LoopShared, message: &str) {
-    let mut inner = shared.inner.borrow_mut();
-    inner.quit = true;
-    if let Some(tx) = inner.ready_tx.take() {
-        let _ = tx.send(Boot::Failed(message.to_string()));
+    {
+        let mut inner = shared.inner.borrow_mut();
+        inner.quit = true;
+        if let Some(tx) = inner.ready_tx.take() {
+            let _ = tx.send(Boot::Failed(message.to_string()));
+        }
+    }
+    if let Some(view) = &shared.view {
+        view.note_failure(message);
     }
 }
 

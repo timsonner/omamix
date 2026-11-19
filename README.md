@@ -1,6 +1,6 @@
 # omamix
 
-omamix is a PipeWire live mixer (version 0.1.0) for combining a capture device and per-app playback into one virtual microphone, Mix Mic, that other programs can record. The window is pre-alpha: it draws one placeholder strip and does not publish that node. A build with `--features pipewire`, run as `omamix --headless --mix-mic`, publishes Mix Mic (`media.class` `Audio/Source/Virtual`, `node.name` `omamix.mix-mic`, `priority.session` 1) and removes it on exit. If that name is the default source, including a choice already stored at startup, omamix destroys the node. If the default source cannot be read, Mix Mic is not published.
+omamix is a PipeWire live mixer (version 0.1.0) for combining a capture device and per-app playback into one virtual microphone, Mix Mic, that other programs can record. The window loads the saved scene, edits strips, and, when built with `--features pipewire`, publishes Mix Mic until it closes. A window built without that feature keeps the null engine and says so. A build with `--features pipewire`, run as `omamix --headless --mix-mic`, publishes Mix Mic (`media.class` `Audio/Source/Virtual`, `node.name` `omamix.mix-mic`, `priority.session` 1) and removes it on exit. If that name is the default source, including a choice already stored at startup, omamix destroys the node. If the default source cannot be read, Mix Mic is not published.
 
 omamix targets any Linux workstation with PipeWire and working sound drivers. It does not assume a particular microphone, interface, or laptop. The hostnames, devices, and levels in [docs/AUDIO-BASELINE.md](docs/AUDIO-BASELINE.md) come from one example machine and are not defaults.
 
@@ -66,7 +66,7 @@ The `gui` feature is the default, so a normal build still links the window. A se
 
 `cargo build -p omamix --features pipewire` keeps the default `gui` feature. That is the build the Arch package runs. `cargo build -p omamix --no-default-features` is the same headless binary with no PipeWire client, for a machine whose libpipewire is older than 1.2.
 
-`cargo run -p omamix` opens the window. It does not publish Mix Mic. A binary built without `gui` has no window: running it with no arguments prints an error and exits. `--help` exits before any window:
+`cargo run -p omamix` opens the window. That build has no PipeWire client, so the window says the null engine is in use and Mix Mic is not published. `cargo run -p omamix --features pipewire` opens the same window on the PipeWire engine and publishes Mix Mic until the window closes. A binary built without `gui` has no window: running it with no arguments prints an error and exits. `--help` exits before any window:
 
 ```sh
 cargo run -p omamix -- --help
