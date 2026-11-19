@@ -15,6 +15,7 @@ pub mod metadata;
 pub mod meter;
 pub mod params;
 pub mod route;
+pub mod scene_file;
 pub mod scope;
 
 #[cfg(test)]
@@ -48,3 +49,7 @@ pub use db::{cubic_to_db, db_to_cubic, db_to_linear, linear_to_db};
 pub use eq::response_db;
 pub use graph::{MasterBus, Scene, Strip, StripId};
 pub use route::{PlaybackStream, RouteKey, SourceKind};
+pub use scene_file::{
+    SceneFileError, default_scene_path, load_scene_file, save_scene_file, scene_config_path,
+    scene_from_toml, scene_to_toml,
+};

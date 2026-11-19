@@ -3,8 +3,11 @@
 //! This is the data the UI edits and the audio engine will apply. It has no
 //! PipeWire types.
 
+use crate::comp::CompSettings;
 use crate::db::{self, BelowMin};
+use crate::eq::EqSettings;
 use crate::fader;
+use crate::limit::LimitSettings;
 use crate::route::{self, OwnClient, PlaybackStream, SourceKind};
 
 /// Input trim range from the v1 spec. Independent of any measured mic level.
@@ -32,6 +35,8 @@ pub struct Strip {
     pub enabled: bool,
     /// Hear this strip in the headphones without requiring it on the virtual mic.
     pub monitor_headphones: bool,
+    pub eq: EqSettings,
+    pub comp: CompSettings,
 }
 
 impl Strip {
@@ -47,6 +52,8 @@ impl Strip {
             input_gain_db: 0.0,
             enabled: true,
             monitor_headphones: false,
+            eq: EqSettings::flat(48_000),
+            comp: CompSettings::bypass(48_000),
         }
     }
 
@@ -72,6 +79,9 @@ pub struct MasterBus {
     pub limiter_enabled: bool,
     pub limiter_ceiling_dbtp: f32,
     pub monitor_mix: bool,
+    pub eq: EqSettings,
+    pub comp: CompSettings,
+    pub limit: LimitSettings,
 }
 
 impl MasterBus {
@@ -94,6 +104,9 @@ impl Default for MasterBus {
             limiter_enabled: true,
             limiter_ceiling_dbtp: LIMITER_CEILING_DBTP,
             monitor_mix: false,
+            eq: EqSettings::flat(48_000),
+            comp: CompSettings::bypass(48_000),
+            limit: LimitSettings::master(48_000),
         }
     }
 }

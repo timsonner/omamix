@@ -308,6 +308,22 @@ pub fn listable_nodes(nodes: &[CatalogNode], own: Option<&OwnClient>) -> Vec<Lis
     out
 }
 
+pub fn retarget_absent_devices(strips: &mut [Strip], nodes: &[CatalogNode]) -> Vec<String> {
+    let mut missing = Vec::new();
+    for strip in strips {
+        let SourceKind::CaptureDevice { node_name } = &strip.source else {
+            continue;
+        };
+        let wanted = [node_name.clone()];
+        if absent_device_names(&wanted, nodes).is_empty() {
+            continue;
+        }
+        missing.push(node_name.clone());
+        strip.source = SourceKind::DefaultSource;
+    }
+    missing
+}
+
 pub fn absent_device_names<'a>(wanted: &'a [String], nodes: &[CatalogNode]) -> Vec<&'a str> {
     wanted
         .iter()
@@ -1159,5 +1175,35 @@ app\tstream-1\tTone\ttone app\tpw-cat\tapp:tone app:pw-cat
             absent_device_names(&wanted, &[sink, source, owned, mix]),
             vec!["node-a", "node-c", MIX_MIC_NODE_NAME, "missing"]
         );
+    }
+
+    #[test]
+    fn a_missing_device_strip_becomes_the_default_source() {
+        let present = catalog("node-b", "Audio/Source");
+        let mut strips = vec![
+            Strip::new(
+                1,
+                "gone",
+                SourceKind::CaptureDevice {
+                    node_name: "node-a".into(),
+                },
+            ),
+            Strip::new(
+                2,
+                "here",
+                SourceKind::CaptureDevice {
+                    node_name: "node-b".into(),
+                },
+            ),
+            Strip::new(3, "default", SourceKind::DefaultSource),
+        ];
+        let missing = retarget_absent_devices(&mut strips, &[present]);
+        assert_eq!(missing, vec!["node-a".to_string()]);
+        assert!(matches!(strips[0].source, SourceKind::DefaultSource));
+        assert!(matches!(
+            strips[1].source,
+            SourceKind::CaptureDevice { ref node_name } if node_name == "node-b"
+        ));
+        assert!(matches!(strips[2].source, SourceKind::DefaultSource));
     }
 }

@@ -8,6 +8,7 @@
 #[cfg(feature = "gui")]
 mod ui;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -37,10 +38,12 @@ fn main() -> ExitCode {
             || cli.monitor_mix
             || cli.tone
             || cli.duration.is_some()
+            || cli.save_scene
+            || cli.scene.is_some()
             || !cli.strips.is_empty()
         {
             eprintln!(
-                "omamix: --list does not take --mix-mic, --strips, --monitor-mix, --tone, or --duration"
+                "omamix: --list does not take --mix-mic, --strips, --monitor-mix, --tone, --duration, --save-scene, or --scene"
             );
             return ExitCode::from(2);
         }
@@ -53,10 +56,12 @@ fn main() -> ExitCode {
         || cli.monitor_mix
         || cli.tone
         || cli.duration.is_some()
+        || cli.save_scene
+        || cli.scene.is_some()
         || !cli.strips.is_empty()
     {
         eprintln!(
-            "omamix: --mix-mic, --strips, --monitor-mix, --tone, and --duration need --headless"
+            "omamix: --mix-mic, --strips, --monitor-mix, --tone, --duration, --save-scene, and --scene need --headless"
         );
         return ExitCode::from(2);
     }
@@ -84,6 +89,7 @@ omamix [--list]
        [--headless] [--mix-mic] [--duration SECS] [--monitor-mix] [--tone]
        [--strips other] [--strips default]
        [--strips device:NODE] [--strips app:NAME:BINARY]
+       [--save-scene] [--scene PATH]
 
 --list prints capture devices and application playback streams.
 It does not open a window. Each line is tab-separated. The last field
@@ -101,7 +107,15 @@ can measure it. It does not retarget the default source or another device.
 default.configured.audio.source when that name is absent.
 device: is a capture node.name. app: is application.name and
 application.process.binary.
-A missing default or a missing device name exits 2."
+A missing default or a missing device name on the command line exits 2.
+--save-scene writes the scene that this command will run.
+The file is $XDG_CONFIG_HOME/omamix/scene.toml, or
+$HOME/.config/omamix/scene.toml when XDG_CONFIG_HOME is unset.
+--scene PATH uses that file instead.
+A headless start with no --strips loads the file when it exists.
+An unreadable or invalid file prints a warning and starts without it.
+A saved device name that is not on this machine uses the default source
+and prints a warning."
     );
 }
 
@@ -113,6 +127,8 @@ struct Cli {
     tone: bool,
     duration: Option<Duration>,
     strips: Vec<StripRequest>,
+    save_scene: bool,
+    scene: Option<PathBuf>,
 }
 
 fn parse_args(args: &[String]) -> Result<Cli, String> {
@@ -124,6 +140,8 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         tone: false,
         duration: None,
         strips: Vec::new(),
+        save_scene: false,
+        scene: None,
     };
     let mut index = 0;
     while index < args.len() {
@@ -151,6 +169,15 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                 index += 1;
                 let value = args.get(index).ok_or("--strips needs a value")?;
                 cli.strips.push(parse_strip(value)?);
+            }
+            "--save-scene" => cli.save_scene = true,
+            "--scene" => {
+                index += 1;
+                let value = args.get(index).ok_or("--scene needs a path")?;
+                if value.is_empty() {
+                    return Err("--scene needs a path".into());
+                }
+                cli.scene = Some(PathBuf::from(value));
             }
             other => return Err(format!("unknown argument {other}")),
         }
@@ -190,13 +217,73 @@ fn scene_from_cli(cli: &Cli) -> Scene {
     scene
 }
 
-#[cfg(feature = "pipewire")]
+fn scene_path_for(cli: &Cli) -> Result<PathBuf, omamix_core::SceneFileError> {
+    if let Some(path) = &cli.scene {
+        Ok(path.clone())
+    } else {
+        omamix_core::default_scene_path()
+    }
+}
+
+fn resolve_scene(cli: &Cli) -> Result<(Scene, bool), String> {
+    if !cli.strips.is_empty() {
+        return Ok((scene_from_cli(cli), false));
+    }
+    let path = match scene_path_for(cli) {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("omamix: warning: {err}");
+            return Ok((scene_from_cli(cli), false));
+        }
+    };
+    match omamix_core::load_scene_file(&path) {
+        Ok(mut scene) => {
+            if cli.monitor_mix {
+                scene.master.monitor_mix = true;
+            }
+            Ok((scene, true))
+        }
+        Err(err) if err.is_missing() => Ok((scene_from_cli(cli), false)),
+        Err(err) => {
+            eprintln!("omamix: warning: {err}");
+            Ok((scene_from_cli(cli), false))
+        }
+    }
+}
+
+fn save_requested_scene(cli: &Cli, scene: &Scene) -> Result<(), String> {
+    let path = scene_path_for(cli).map_err(|err| err.to_string())?;
+    omamix_core::save_scene_file(&path, scene)
+        .map_err(|err| format!("{}: {err}", path.display()))?;
+    eprintln!("omamix: saved scene {}", path.display());
+    Ok(())
+}
+
 fn run_headless(cli: Cli) -> ExitCode {
+    let (scene, fallback) = match resolve_scene(&cli) {
+        Ok(pair) => pair,
+        Err(err) => {
+            eprintln!("omamix: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if cli.save_scene
+        && let Err(err) = save_requested_scene(&cli, &scene)
+    {
+        eprintln!("omamix: {err}");
+        return ExitCode::FAILURE;
+    }
+    start_headless(cli, scene, fallback)
+}
+
+#[cfg(feature = "pipewire")]
+fn start_headless(cli: Cli, scene: Scene, fallback_missing_devices: bool) -> ExitCode {
     let options = omamix_pw::HeadlessOptions {
-        scene: scene_from_cli(&cli),
+        scene,
         duration: cli.duration,
         publish_mix_mic: cli.mix_mic,
         tone: cli.tone,
+        fallback_missing_devices,
     };
     match omamix_pw::run_headless(options) {
         Ok(_report) => ExitCode::SUCCESS,
@@ -234,9 +321,9 @@ fn run_list() -> ExitCode {
 }
 
 #[cfg(not(feature = "pipewire"))]
-fn run_headless(cli: Cli) -> ExitCode {
+fn start_headless(cli: Cli, scene: Scene, fallback_missing_devices: bool) -> ExitCode {
     // Parsed so a bad --strips value still fails above. Nothing here connects.
-    let _ = scene_from_cli(&cli);
+    let _ = (cli, scene, fallback_missing_devices);
     eprintln!(
         "omamix: --headless requires a build with --features pipewire; no audio client was opened"
     );
@@ -369,5 +456,88 @@ mod cli_tests {
         let scene = scene_from_cli(&cli);
         assert!(matches!(scene.strips[0].source, SourceKind::DefaultSource));
         assert_eq!(scene.strips[0].name, "default");
+    }
+
+    #[test]
+    fn save_scene_and_scene_path_parse() {
+        let cli = parse_args(&args(&[
+            "--headless",
+            "--save-scene",
+            "--scene",
+            "scene-dir/scene.toml",
+            "--strips",
+            "device:node-a",
+            "--strips",
+            "default",
+        ]))
+        .unwrap();
+        assert!(cli.save_scene);
+        assert_eq!(
+            cli.scene.as_deref(),
+            Some(std::path::Path::new("scene-dir/scene.toml"))
+        );
+        let (scene, fallback) = resolve_scene(&cli).unwrap();
+        assert!(!fallback);
+        assert_eq!(scene.strips.len(), 2);
+        assert!(matches!(
+            scene.strips[0].source,
+            SourceKind::CaptureDevice { .. }
+        ));
+        assert!(matches!(scene.strips[1].source, SourceKind::DefaultSource));
+    }
+
+    #[test]
+    fn a_headless_start_without_strips_loads_the_scene_file() {
+        let dir = std::env::temp_dir().join(format!("omamix-cli-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("scene.toml");
+        let mut stored = Scene::empty("stored");
+        stored.strips.push(omamix_core::Strip::new(
+            3,
+            "mic",
+            SourceKind::CaptureDevice {
+                node_name: "node-a".into(),
+            },
+        ));
+        stored.strips[0].fader_db = -4.0;
+        stored.strips[0].mute = true;
+        omamix_core::save_scene_file(&path, &stored).unwrap();
+        let cli = parse_args(&args(&[
+            "--headless",
+            "--scene",
+            path.to_str().unwrap(),
+            "--monitor-mix",
+        ]))
+        .unwrap();
+        let (scene, fallback) = resolve_scene(&cli).unwrap();
+        assert!(fallback);
+        assert!(scene.master.monitor_mix);
+        assert_eq!(scene.strips.len(), 1);
+        assert_eq!(scene.strips[0].fader_db, -4.0);
+        assert!(scene.strips[0].mute);
+        assert!(matches!(
+            scene.strips[0].source,
+            SourceKind::CaptureDevice { ref node_name } if node_name == "node-a"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bad_scene_file_does_not_fail_the_start() {
+        let dir = std::env::temp_dir().join(format!("omamix-cli-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scene.toml");
+        std::fs::write(&path, "{{{").unwrap();
+        let cli = parse_args(&args(&["--headless", "--scene", path.to_str().unwrap()])).unwrap();
+        let (scene, fallback) = resolve_scene(&cli).unwrap();
+        assert!(!fallback);
+        assert!(scene.strips.is_empty());
+        let missing = dir.join("absent.toml");
+        let cli = parse_args(&args(&["--headless", "--scene", missing.to_str().unwrap()])).unwrap();
+        let (scene, fallback) = resolve_scene(&cli).unwrap();
+        assert!(!fallback);
+        assert!(scene.strips.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

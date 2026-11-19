@@ -2340,6 +2340,10 @@ dependencies = [
 [[package]]
 name = "omamix-core"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "toml",
+]
 
 [[package]]
 name = "omamix-pw"

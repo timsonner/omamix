@@ -672,6 +672,36 @@ impl MixFilter {
         applied.accepted()
     }
 
+    pub(crate) fn apply_saved_eq(
+        &mut self,
+        slot: u16,
+        settings: omamix_core::eq::EqSettings,
+    ) -> bool {
+        self.eq.apply_settings(slot, settings)
+    }
+
+    pub(crate) fn apply_saved_comp(
+        &mut self,
+        slot: u16,
+        settings: omamix_core::comp::CompSettings,
+    ) -> bool {
+        self.comp.apply_settings(slot, settings)
+    }
+
+    pub(crate) fn apply_saved_master_eq(&mut self, settings: omamix_core::eq::EqSettings) {
+        self.eq.apply_master_settings(settings);
+    }
+
+    pub(crate) fn apply_saved_master_comp(&mut self, settings: omamix_core::comp::CompSettings) {
+        self.comp.apply_master_settings(settings);
+    }
+
+    pub(crate) fn apply_saved_master_limit(&mut self, settings: omamix_core::limit::LimitSettings) {
+        self.limit.apply_master_settings(settings);
+        self.log_recorded_demotions();
+        self.note_process_latency();
+    }
+
     pub(crate) fn set_limit_rate(&mut self, rate: u32) -> bool {
         let applied = self.limit.set_sample_rate(rate);
         self.log_recorded_demotions();
