@@ -116,6 +116,7 @@ pub fn strip_panel(
     meters: &StripMeters,
     reduction_db: f32,
     sample_rate: u32,
+    expand_effects: bool,
 ) -> StripEdit {
     let mut edit = StripEdit {
         fader_db: strip.fader_db,
@@ -157,14 +158,19 @@ pub fn strip_panel(
                     edit.remove = true;
                 }
             });
-            egui::CollapsingHeader::new("Effects")
-                .id_salt(("strip-effects", strip.id.0))
-                .show(ui, |ui| {
-                    ui.set_min_width(420.0);
-                    eq_controls(ui, strip.id.0, &mut edit.eq, sample_rate, EqLayout::Strip);
-                    comp_controls(ui, strip.id.0, &mut edit.comp);
-                    ui.label(format!("gain reduction {}", format_db(reduction_db)));
-                });
+            let effects =
+                egui::CollapsingHeader::new("Effects").id_salt(("strip-effects", strip.id.0));
+            let effects = if expand_effects {
+                effects.default_open(true)
+            } else {
+                effects
+            };
+            effects.show(ui, |ui| {
+                ui.set_min_width(420.0);
+                eq_controls(ui, strip.id.0, &mut edit.eq, sample_rate, EqLayout::Strip);
+                comp_controls(ui, strip.id.0, &mut edit.comp);
+                ui.label(format!("gain reduction {}", format_db(reduction_db)));
+            });
         });
     });
     edit

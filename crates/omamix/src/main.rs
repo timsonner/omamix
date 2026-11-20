@@ -110,6 +110,13 @@ can measure it. It does not retarget the default source or another device.
 default.configured.audio.source when that name is absent.
 device: is a capture node.name. app: is application.name and
 application.process.binary.
+A start attaches the current default capture device to a strip when
+the scene has none. That strip follows a later change of the default
+source. A device: strip is linked as well. One capture port is copied
+to both sides. FL and FR are used when both exist. Otherwise the first
+two ports in port id order are used, and further channels are not summed.
+Mix Mic is never linked into the engine.
+OMAMIX_DISABLE_AUTO_ATTACH=1 skips the automatic strip.
 A missing default or a missing device name on the command line exits 2.
 --save-scene writes the scene that this command will run.
 The file is $XDG_CONFIG_HOME/omamix/scene.toml, or
@@ -228,7 +235,23 @@ fn scene_path_for(cli: &Cli) -> Result<PathBuf, omamix_core::SceneFileError> {
     }
 }
 
+fn auto_attach_enabled() -> bool {
+    std::env::var("OMAMIX_DISABLE_AUTO_ATTACH").ok().as_deref() != Some("1")
+}
+
+fn attach_default_if_enabled(scene: &mut Scene) {
+    if auto_attach_enabled() {
+        scene.ensure_default_capture_strip();
+    }
+}
+
 fn resolve_scene(cli: &Cli) -> Result<(Scene, bool), String> {
+    let (mut scene, fallback) = resolve_stored_scene(cli)?;
+    attach_default_if_enabled(&mut scene);
+    Ok((scene, fallback))
+}
+
+fn resolve_stored_scene(cli: &Cli) -> Result<(Scene, bool), String> {
     if !cli.strips.is_empty() {
         return Ok((scene_from_cli(cli), false));
     }
@@ -333,13 +356,33 @@ fn start_headless(cli: Cli, scene: Scene, fallback_missing_devices: bool) -> Exi
 }
 
 #[cfg(feature = "gui")]
+fn window_inner_size() -> [f32; 2] {
+    let Some(raw) = std::env::var("OMAMIX_WINDOW").ok() else {
+        return [1440.0, 980.0];
+    };
+    let Some((width, height)) = raw.split_once('x') else {
+        return [1440.0, 980.0];
+    };
+    let Ok(width) = width.parse::<f32>() else {
+        return [1440.0, 980.0];
+    };
+    let Ok(height) = height.parse::<f32>() else {
+        return [1440.0, 980.0];
+    };
+    if !(640.0..=7680.0).contains(&width) || !(480.0..=4320.0).contains(&height) {
+        return [1440.0, 980.0];
+    }
+    [width, height]
+}
+
 fn run_gui() -> eframe::Result {
     let (scene, scene_path) = load_window_scene();
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("omamix")
-            .with_inner_size([1440.0, 980.0])
-            .with_min_inner_size([crate::ui::WINDOW_MIN_WIDTH, 720.0]),
+            .with_position([0.0, 0.0])
+            .with_inner_size(window_inner_size())
+            .with_min_inner_size([crate::ui::WINDOW_MIN_WIDTH, 480.0]),
         ..Default::default()
     };
     let host = window::WindowHost::new(scene, scene_path);
@@ -348,6 +391,12 @@ fn run_gui() -> eframe::Result {
 
 #[cfg(feature = "gui")]
 fn load_window_scene() -> (Scene, Option<PathBuf>) {
+    let (mut scene, path) = load_window_scene_file();
+    attach_default_if_enabled(&mut scene);
+    (scene, path)
+}
+
+fn load_window_scene_file() -> (Scene, Option<PathBuf>) {
     let path = match omamix_core::default_scene_path() {
         Ok(path) => path,
         Err(err) => {
@@ -486,7 +535,8 @@ mod cli_tests {
         let (scene, fallback) = resolve_scene(&cli).unwrap();
         assert!(fallback);
         assert!(scene.master.monitor_mix);
-        assert_eq!(scene.strips.len(), 1);
+        assert_eq!(scene.strips.len(), 2);
+        assert!(matches!(scene.strips[1].source, SourceKind::DefaultSource));
         assert_eq!(scene.strips[0].fader_db, -4.0);
         assert!(scene.strips[0].mute);
         assert!(matches!(
@@ -506,12 +556,14 @@ mod cli_tests {
         let cli = parse_args(&args(&["--headless", "--scene", path.to_str().unwrap()])).unwrap();
         let (scene, fallback) = resolve_scene(&cli).unwrap();
         assert!(!fallback);
-        assert!(scene.strips.is_empty());
+        assert_eq!(scene.strips.len(), 1);
+        assert!(matches!(scene.strips[0].source, SourceKind::DefaultSource));
         let missing = dir.join("absent.toml");
         let cli = parse_args(&args(&["--headless", "--scene", missing.to_str().unwrap()])).unwrap();
         let (scene, fallback) = resolve_scene(&cli).unwrap();
         assert!(!fallback);
-        assert!(scene.strips.is_empty());
+        assert_eq!(scene.strips.len(), 1);
+        assert!(matches!(scene.strips[0].source, SourceKind::DefaultSource));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
