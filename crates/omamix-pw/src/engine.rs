@@ -705,6 +705,7 @@ fn pw_thread(
             adapter: None,
             core: core.as_raw_ptr(),
             registry: registry.as_raw_ptr(),
+            stats_logged: None,
         }),
     });
 
@@ -781,6 +782,7 @@ fn pw_thread(
     );
 
     mainloop.run();
+    log_callback_stats(&shared_loop, &filter, true);
 
     drop(timer);
     drop(_attached);
@@ -1055,6 +1057,7 @@ struct LoopInner {
     adapter: Option<pw::node::Node>,
     core: *mut pw::sys::pw_core,
     registry: *mut pw::sys::pw_registry,
+    stats_logged: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -1137,6 +1140,7 @@ fn tick(
     sync_comp_rate(filter);
     sync_limit_rate(filter);
     sync_limit_quantum(filter);
+    refresh_live_cap(filter);
     for _ in 0..8 {
         let batch = match shared.pending.lock() {
             Ok(mut pending) => std::mem::take(&mut *pending),
@@ -1170,6 +1174,7 @@ fn tick(
     }
     link_engine(shared);
     reconcile(shared, filter);
+    log_callback_stats(shared, filter, false);
     publish_ready(shared);
     publish_view(shared, filter);
     quit || shared.inner.borrow().quit
@@ -1324,6 +1329,83 @@ fn sync_limit_quantum(filter: &RefCell<Option<MixFilter>>) {
         return;
     };
     filter.sync_limit_quantum();
+}
+
+fn refresh_live_cap(filter: &RefCell<Option<MixFilter>>) {
+    let (rate, quantum, enabled, lookahead) = {
+        let borrowed = filter.borrow();
+        let Some(engine) = borrowed.as_ref() else {
+            return;
+        };
+        let rate = engine.shared().observed_rate.load(Ordering::Relaxed);
+        let quantum = engine.graph_quantum();
+        if rate == 0 || quantum == 0 {
+            return;
+        }
+        let settings = engine.master_limit_settings();
+        if engine.cap_matches(rate, quantum, settings.enabled(), settings.lookahead_ms()) {
+            drop(borrowed);
+            if let Some(engine) = filter.borrow_mut().as_mut() {
+                engine.note_cap_stable();
+            }
+            return;
+        }
+        (rate, quantum, settings.enabled(), settings.lookahead_ms())
+    };
+    let report = omamix_core::live_cap::calibrate_live_cap(rate, quantum, enabled, lookahead);
+    let mut borrowed = filter.borrow_mut();
+    let Some(engine) = borrowed.as_mut() else {
+        return;
+    };
+    let rate_now = engine.shared().observed_rate.load(Ordering::Relaxed);
+    let quantum_now = engine.graph_quantum();
+    if rate_now != rate || quantum_now != quantum {
+        return;
+    }
+    engine.store_live_cap(rate, quantum, enabled, lookahead, report.cap);
+    let budget_us = report.budget.as_micros();
+    eprintln!(
+        "omamix: live cap {} at {rate} Hz quantum {quantum} budget_us {budget_us} master_us {} all_live_us {}",
+        report.cap,
+        join_us(&report.master_tries),
+        join_us(&report.all_live_tries)
+    );
+}
+
+fn join_us(tries: &[Duration]) -> String {
+    let mut out = String::new();
+    for (index, sample) in tries.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&sample.as_micros().to_string());
+    }
+    out
+}
+
+fn log_callback_stats(shared: &LoopShared, filter: &RefCell<Option<MixFilter>>, force: bool) {
+    let due = {
+        let inner = shared.inner.borrow();
+        force
+            || inner
+                .stats_logged
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(2))
+    };
+    if !due {
+        return;
+    }
+    let summary = filter
+        .borrow()
+        .as_ref()
+        .map(|engine| engine.shared().callback_summary());
+    let Some((p50, p99, max, n, over)) = summary else {
+        return;
+    };
+    if n == 0 && !force {
+        return;
+    }
+    shared.inner.borrow_mut().stats_logged = Some(Instant::now());
+    eprintln!("omamix: callback us p50 {p50} p99 {p99} max {max} n {n} over {over}");
 }
 
 fn drain_commands(
@@ -2013,6 +2095,13 @@ fn push_named_device(
 }
 
 fn ensure_tap(shared: &Rc<LoopShared>, filter: &Rc<RefCell<Option<MixFilter>>>, peer: u32) {
+    let open = filter
+        .borrow()
+        .as_ref()
+        .is_some_and(|engine| engine.cap_settled());
+    if !open {
+        return;
+    }
     relink_if_edges_gone(shared, peer);
     let refuse = {
         let inner = shared.inner.borrow();

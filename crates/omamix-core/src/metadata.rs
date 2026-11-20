@@ -308,6 +308,11 @@ mod tests {
         let matrix_text = std::fs::read_to_string(&matrix).expect("scripts/rate-matrix.sh");
         assert!(matrix_text.contains("omamix-private-0"));
         assert_private_script_has_no_login_writes(&matrix_text);
+        let probe = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/load-probe.sh");
+        let probe_text = std::fs::read_to_string(&probe).expect("scripts/load-probe.sh");
+        assert!(probe_text.contains("omamix-private-0"));
+        assert!(probe_text.contains("EXIT INT TERM"));
+        assert_private_script_has_no_login_writes(&probe_text);
     }
 
     fn assert_private_script_has_no_login_writes(text: &str) {
@@ -326,6 +331,7 @@ mod tests {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         assert!(is_private_procedure(&root.join("scripts/prove.sh")));
         assert!(is_private_procedure(&root.join("scripts/rate-matrix.sh")));
+        assert!(is_private_procedure(&root.join("scripts/load-probe.sh")));
         assert!(!is_private_procedure(&root.join("scripts/unplug-watch.sh")));
         assert!(!is_private_procedure(
             &root.join("crates/omamix-core/src/prove.sh")
@@ -1080,9 +1086,13 @@ mod tests {
             return false;
         };
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        ["scripts/prove.sh", "scripts/rate-matrix.sh"]
-            .into_iter()
-            .filter_map(|rel| root.join(rel).canonicalize().ok())
-            .any(|procedure| procedure == path)
+        [
+            "scripts/prove.sh",
+            "scripts/rate-matrix.sh",
+            "scripts/load-probe.sh",
+        ]
+        .into_iter()
+        .filter_map(|rel| root.join(rel).canonicalize().ok())
+        .any(|procedure| procedure == path)
     }
 }

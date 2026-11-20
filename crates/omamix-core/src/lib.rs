@@ -12,6 +12,7 @@ pub mod fader;
 pub mod graph;
 pub mod limit;
 pub mod link;
+pub mod live_cap;
 pub mod metadata;
 pub mod meter;
 pub mod params;
