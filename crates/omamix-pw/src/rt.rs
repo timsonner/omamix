@@ -14,6 +14,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use omamix_core::comp::CompUpdate;
 use omamix_core::db;
+use omamix_core::effect::MasterChain;
 use omamix_core::eq::EqUpdate;
 use omamix_core::fader;
 use omamix_core::limit::LimitUpdate;
@@ -54,6 +55,10 @@ pub enum EngineCommand {
     /// Master limiter. The loop thread publishes the block. `process` only
     /// loads it.
     SetMasterLimit(LimitUpdate),
+    /// Master effect order. The loop thread publishes the snapshot. `process`
+    /// only loads it. Compressor and limiter parameters in the chain are
+    /// published on those writers when they differ.
+    SetMasterChain(Box<MasterChain>),
     ReplaceScene(Box<omamix_core::Scene>),
 }
 

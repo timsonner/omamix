@@ -20,6 +20,7 @@ pub use engine::{HeadlessOptions, WindowEngine, run_headless, run_list};
 use std::fmt;
 
 use omamix_core::comp::{CompWriter, open as open_comp};
+use omamix_core::effect::{ChainWriter, open as open_chain};
 use omamix_core::eq::{EqWriter, open};
 use omamix_core::limit::{LimitWriter, open as open_limit};
 use omamix_core::params::StripParamBank;
@@ -44,6 +45,7 @@ pub struct NullEngine {
     eq: EqWriter,
     comp: CompWriter,
     limit: LimitWriter,
+    chain: ChainWriter,
 }
 
 impl NullEngine {
@@ -55,6 +57,7 @@ impl NullEngine {
             eq: open().0,
             comp: open_comp().0,
             limit: open_limit().0,
+            chain: open_chain().0,
         }
     }
 
@@ -82,7 +85,24 @@ impl NullEngine {
                 EngineCommand::SetMasterLimit(update) => {
                     self.limit.apply_master(update);
                 }
-                EngineCommand::ReplaceScene(_) => {}
+                EngineCommand::SetMasterChain(chain) => {
+                    if let Some(mut settings) = chain.compressor_settings() {
+                        settings.set_sample_rate(self.comp.sample_rate());
+                        if settings != self.comp.master_settings() {
+                            self.comp.apply_master_settings(settings);
+                        }
+                    }
+                    if let Some(mut settings) = chain.limiter_settings() {
+                        settings.set_sample_rate(self.limit.sample_rate());
+                        if settings != self.limit.master_settings() {
+                            self.limit.apply_master_settings(settings);
+                        }
+                    }
+                    self.chain.publish(&chain);
+                }
+                EngineCommand::ReplaceScene(scene) => {
+                    self.chain.publish(&scene.master.chain);
+                }
             }
         }
         Ok(())

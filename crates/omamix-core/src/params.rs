@@ -41,7 +41,9 @@
 //! compressor. Its block is loaded from [`crate::limit::LimitReader`], which
 //! owns its own consumer index. `process` takes `&mut LimitReader`. A bypassed
 //! master limiter does not touch the buffers. The limiter from
-//! [`crate::limit::open`] is on and delays the block by its lookahead. A
+//! [`crate::limit::open`] is on and delays the block by its lookahead. The
+//! master compressor and that limiter run as a chain, in that order, unless
+//! a published chain says otherwise. The chain keeps the limiter last. A
 //! default bank is an identity bypass aside from that delay, so samples are
 //! unchanged, including the sign bit of a zero that this sum does not itself
 //! preserve. Gain reduction is one atomic per strip and one for the master.
@@ -66,6 +68,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use crate::comp::{CompReader, CompRuntime};
 use crate::db::{self, BelowMin};
 use crate::dsp::balance_gains;
+use crate::effect::{self, ChainReader, ChainSnap};
 use crate::eq::{EqReader, EqRuntime};
 use crate::fader;
 use crate::graph::{INPUT_GAIN_MAX_DB, INPUT_GAIN_MIN_DB};
@@ -446,6 +449,8 @@ pub struct StripMixer {
     comp: CompRuntime,
     /// Master limiter delay and gain. The bank is shared; this is not.
     limit: LimitRuntime,
+    /// Last chain snapshot. The standard chain is compressor then limiter.
+    chain: ChainSnap,
     sample_rate: u32,
 }
 
@@ -462,7 +467,19 @@ impl StripMixer {
             eq: EqRuntime::new(),
             comp: CompRuntime::new(),
             limit: LimitRuntime::new(),
+            chain: ChainSnap::standard(),
             sample_rate,
+        }
+    }
+
+    /// Copy a published chain. No allocation.
+    ///
+    /// The audio callback calls this before [`Self::process`]. A reader with
+    /// nothing new leaves the previous snapshot, which starts as the standard
+    /// chain.
+    pub fn load_chain(&mut self, reader: &mut ChainReader) {
+        if let Some(snap) = reader.poll() {
+            self.chain = snap;
         }
     }
 
@@ -516,10 +533,10 @@ impl StripMixer {
     /// The sum starts at +0.0, so a -0.0 sample is stored as +0.0.
     ///
     /// `comp` is exclusive for the call, the same way `eq` is. After the
-    /// strip sum, the master EQ runs, then the master compressor, then the
-    /// master limiter. The caller applies the master fader after that. A
-    /// flat EQ, a bypassed compressor, and a bypassed limiter do not touch
-    /// the buffers.
+    /// strip sum, the master EQ runs, then the master chain. The standard
+    /// chain is the master compressor and then the master limiter. The caller
+    /// applies the master fader after that. A flat EQ, a bypassed compressor,
+    /// and a bypassed limiter do not touch the buffers.
     #[allow(clippy::too_many_arguments)]
     pub fn process(
         &mut self,
@@ -610,8 +627,17 @@ impl StripMixer {
         self.comp.publish_strips(comp, slots);
 
         self.eq.apply_master(out_left, out_right);
-        self.comp.apply_master(comp, out_left, out_right);
-        self.limit.apply_master(limit, out_left, out_right);
+        effect::apply_snap(
+            self.chain,
+            out_left,
+            out_right,
+            &mut effect::BlockCx {
+                comp: &mut self.comp,
+                comp_reader: comp,
+                limit: &mut self.limit,
+                limit_reader: limit,
+            },
+        );
 
         for slot in 0..slots {
             scopes.commit(slot);

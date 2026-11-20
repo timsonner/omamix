@@ -6,6 +6,7 @@
 pub mod comp;
 pub mod db;
 pub mod dsp;
+pub mod effect;
 pub mod eq;
 pub mod fader;
 pub mod graph;
