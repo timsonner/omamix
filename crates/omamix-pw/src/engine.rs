@@ -28,7 +28,9 @@
 //! only after `default.audio.source` has been read. If that read never
 //! arrives, Mix Mic is not published. If the default source is Mix Mic, the
 //! loop quits, which destroys the Mix Mic node and leaves the session default
-//! where the session manager put it.
+//! where the session manager put it. A `DefaultSource` strip keeps that
+//! kind, so a later default-source name moves the tap instead of staying on
+//! the name read at startup.
 //!
 //! Unit tests do not call [`run_headless`].
 
@@ -36,8 +38,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use omamix_core::comp::CompUpdate;
@@ -1174,6 +1176,7 @@ fn tick(
     }
     link_engine(shared);
     reconcile(shared, filter);
+    log_strip_meters(shared, filter);
     log_callback_stats(shared, filter, false);
     publish_ready(shared);
     publish_view(shared, filter);
@@ -1381,6 +1384,61 @@ fn join_us(tries: &[Duration]) -> String {
         out.push_str(&sample.as_micros().to_string());
     }
     out
+}
+
+fn strip_meters_requested() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("OMAMIX_LOG_METERS").is_some())
+}
+
+fn format_meter(db: f32) -> String {
+    if db.is_finite() {
+        format!("{db:.1}")
+    } else {
+        "silent".to_string()
+    }
+}
+
+fn log_strip_meters(shared: &LoopShared, filter: &RefCell<Option<MixFilter>>) {
+    if !strip_meters_requested() {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let next = NEXT.load(Ordering::Relaxed);
+    if now < next {
+        return;
+    }
+    NEXT.store(now.saturating_add(400), Ordering::Relaxed);
+    let borrowed = filter.borrow();
+    let Some(engine) = borrowed.as_ref() else {
+        return;
+    };
+    let inner = shared.inner.borrow();
+    let audio = engine.shared();
+    for (peer, tap) in &inner.taps {
+        let Some(slot) = tap.slot else {
+            continue;
+        };
+        let Some(strip) = strip_for_peer(&inner, *peer) else {
+            continue;
+        };
+        let (peak, rms) = audio.strip_meters.load(slot);
+        let node = inner
+            .nodes
+            .get(peer)
+            .map(|node| node.identity.node_name.as_str())
+            .unwrap_or("");
+        eprintln!(
+            "omamix: strip meter id {} node {node} peak {} rms {}",
+            strip.id.0,
+            format_meter(peak),
+            format_meter(rms)
+        );
+    }
 }
 
 fn log_callback_stats(shared: &LoopShared, filter: &RefCell<Option<MixFilter>>, force: bool) {
@@ -2752,6 +2810,15 @@ fn resolve_requested_devices(inner: &mut LoopInner) -> Result<(), String> {
             );
         }
     }
+    let mut wanted: Vec<String> = inner
+        .scene
+        .strips
+        .iter()
+        .filter_map(|strip| match &strip.source {
+            SourceKind::CaptureDevice { node_name } => Some(node_name.clone()),
+            _ => None,
+        })
+        .collect();
     let wants_default = inner
         .scene
         .strips
@@ -2772,28 +2839,17 @@ fn resolve_requested_devices(inner: &mut LoopInner) -> Result<(), String> {
         };
         let name = metadata::resolve_default_source(&snapshot)
             .map_err(|_| "no default audio source".to_string())?;
+        if name == MIX_MIC_NODE_NAME {
+            return Err(
+                "the default source is Mix Mic, so it is not attached to a strip".to_string(),
+            );
+        }
         if !inner.source_seen {
             inner.source_seen = true;
         }
-        for strip in &mut inner.scene.strips {
-            if matches!(strip.source, SourceKind::DefaultSource) {
-                strip.name.clone_from(&name);
-                strip.source = SourceKind::CaptureDevice {
-                    node_name: name.clone(),
-                };
-            }
-        }
+        wanted.push(name);
     }
     let catalog = catalog_nodes(inner);
-    let wanted: Vec<String> = inner
-        .scene
-        .strips
-        .iter()
-        .filter_map(|strip| match &strip.source {
-            SourceKind::CaptureDevice { node_name } => Some(node_name.clone()),
-            _ => None,
-        })
-        .collect();
     let missing = route::absent_device_names(&wanted, &catalog);
     if missing.is_empty() {
         Ok(())

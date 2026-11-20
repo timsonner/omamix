@@ -60,7 +60,9 @@ pub const ADAPTER_AUTO_PORT_CONFIG: &str =
 /// JSON for `node.param.PortConfig`, applied by the node when its
 /// implementation is set. Direction is Input because `support.null-audio-sink`
 /// has an input port. The format makes the dsp ports exist immediately.
-pub const MIX_MIC_PORT_CONFIG: &str = r#"{"direction":"Input","mode":"dsp","monitor":true,"control":false,"format":{"mediaType":"audio","mediaSubtype":"raw","format":"F32P","channels":2,"position":["FL","FR"]}}"#;
+/// `rate` is 1 so a converter that rejects a missing rate still accepts the
+/// pod. Dsp mode clears that rate and the node follows the graph.
+pub const MIX_MIC_PORT_CONFIG: &str = r#"{"direction":"Input","mode":"dsp","monitor":true,"control":false,"format":{"mediaType":"audio","mediaSubtype":"raw","format":"F32P","rate":1,"channels":2,"position":["FL","FR"]}}"#;
 
 /// JSON for `node.param.Props`. Unity gain on the public adapter, same
 /// channels the filter advertises on connect.
@@ -242,7 +244,7 @@ mod tests {
     fn mix_mic_follows_the_graph_rate_and_quantum() {
         assert!(get(&mix_mic_properties(), "node.latency").is_none());
         assert!(get(&filter_properties(), "node.latency").is_none());
-        assert!(!MIX_MIC_PORT_CONFIG.contains("\"rate\""));
+        assert!(MIX_MIC_PORT_CONFIG.contains("\"rate\":1"));
         assert!(!MIX_MIC_PORT_CONFIG.contains("48000"));
         assert!(!MIX_MIC_PORT_CONFIG.contains("44100"));
         assert!(!MIX_MIC_PORT_CONFIG.contains("96000"));

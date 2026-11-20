@@ -497,11 +497,25 @@ impl eframe::App for WindowHost {
             latency_ms,
             sample_rate,
         };
+        let expand_strips = std::env::var("OMAMIX_EXPAND_STRIPS").ok().as_deref() == Some("1");
+        let scroll_bottom = std::env::var("OMAMIX_SCROLL_LEFT").ok().as_deref() == Some("bottom");
         let master_edit = egui::Panel::right("omamix-master")
             .resizable(true)
             .default_size(ui::MASTER_SIDE_DEFAULT_WIDTH)
             .min_size(ui::MASTER_SIDE_MIN_WIDTH)
-            .show(ui, |ui| ui::master_panel(ui, master_view));
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("omamix-master-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let edit = ui::master_panel(ui, master_view);
+                        if scroll_bottom {
+                            ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+                        }
+                        edit
+                    })
+                    .inner
+            });
         if self
             .picker
             .set_master_fader(master_edit.inner.fader_db, now)
@@ -524,109 +538,120 @@ impl eframe::App for WindowHost {
         );
         self.note_chain(&master_edit.inner.chain, now, &mut commands, &mut changed);
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("omamix");
-                ui.label(format!("engine: {}", self.audio.name()));
-                ui.separator();
-                ui.label(self.audio.detail());
-            });
-            if !self.retarget_note.is_empty() {
-                ui.label(&self.retarget_note);
-            }
-            if !self.save_note.is_empty() {
-                ui.label(&self.save_note);
-            }
-            ui.separator();
-            ui.label("Click a fader, then scroll while the pointer is still on it.");
-            ui.horizontal(|ui| {
-                if ui.button("Refresh").clicked() {
-                    let nodes = self.picker.catalog().to_vec();
-                    let default_source = self.picker.default_source().map(str::to_string);
-                    self.picker.refresh(nodes, default_source);
-                }
-                let selected = self.picker.selected();
-                let labels: Vec<String> = self
-                    .picker
-                    .catalog()
-                    .iter()
-                    .map(picker::choice_label)
-                    .collect();
-                let caption = match selected {
-                    PickerChoice::Default => "Default source".to_string(),
-                    PickerChoice::Listed(index) => labels
-                        .get(index)
-                        .cloned()
-                        .unwrap_or_else(|| "Default source".to_string()),
-                };
-                egui::ComboBox::from_id_salt("source-picker")
-                    .selected_text(caption)
-                    .show_ui(ui, |ui| {
-                        if ui
-                            .selectable_label(selected == PickerChoice::Default, "Default source")
-                            .clicked()
-                        {
-                            self.picker.select(PickerChoice::Default);
+            egui::ScrollArea::both()
+                .id_salt("omamix-left")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading("omamix");
+                        ui.label(format!("engine: {}", self.audio.name()));
+                        ui.separator();
+                        ui.label(self.audio.detail());
+                    });
+                    if !self.retarget_note.is_empty() {
+                        ui.label(&self.retarget_note);
+                    }
+                    if !self.save_note.is_empty() {
+                        ui.label(&self.save_note);
+                    }
+                    ui.separator();
+                    ui.label("Click a fader, then scroll while the pointer is still on it.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Refresh").clicked() {
+                            let nodes = self.picker.catalog().to_vec();
+                            let default_source = self.picker.default_source().map(str::to_string);
+                            self.picker.refresh(nodes, default_source);
                         }
-                        for (index, label) in labels.iter().enumerate() {
-                            if ui
-                                .selectable_label(
-                                    selected == PickerChoice::Listed(index),
-                                    label.as_str(),
-                                )
-                                .clicked()
-                            {
-                                self.picker.select(PickerChoice::Listed(index));
-                            }
+                        let selected = self.picker.selected();
+                        let labels: Vec<String> = self
+                            .picker
+                            .catalog()
+                            .iter()
+                            .map(picker::choice_label)
+                            .collect();
+                        let caption = match selected {
+                            PickerChoice::Default => "Default source".to_string(),
+                            PickerChoice::Listed(index) => labels
+                                .get(index)
+                                .cloned()
+                                .unwrap_or_else(|| "Default source".to_string()),
+                        };
+                        egui::ComboBox::from_id_salt("source-picker")
+                            .selected_text(caption)
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(
+                                        selected == PickerChoice::Default,
+                                        "Default source",
+                                    )
+                                    .clicked()
+                                {
+                                    self.picker.select(PickerChoice::Default);
+                                }
+                                for (index, label) in labels.iter().enumerate() {
+                                    if ui
+                                        .selectable_label(
+                                            selected == PickerChoice::Listed(index),
+                                            label.as_str(),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.picker.select(PickerChoice::Listed(index));
+                                    }
+                                }
+                            });
+                        if ui.button("Add strip").clicked()
+                            && self.picker.add(self.picker.selected(), now)
+                        {
+                            changed = true;
                         }
                     });
-                if ui.button("Add strip").clicked() && self.picker.add(self.picker.selected(), now)
-                {
-                    changed = true;
-                }
-            });
-            ui.add_space(8.0);
-            egui::ScrollArea::horizontal().show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let mut remove_id = None;
-                    let strip_count = self.picker.scene().strips.len();
-                    for index in 0..strip_count {
-                        let Some(strip) = self.picker.scene().strips.get(index).cloned() else {
-                            continue;
-                        };
-                        let id = strip.id.0;
-                        let meters = self.meters_for(id);
-                        let edit = ui::strip_panel(
-                            ui,
-                            &strip,
-                            &meters,
-                            self.reduction_for(id),
-                            self.rate(),
-                        );
-                        if edit.remove {
-                            remove_id = Some(id);
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let mut remove_id = None;
+                        let strip_count = self.picker.scene().strips.len();
+                        for index in 0..strip_count {
+                            let Some(strip) = self.picker.scene().strips.get(index).cloned() else {
+                                continue;
+                            };
+                            let id = strip.id.0;
+                            let meters = self.meters_for(id);
+                            let edit = ui::strip_panel(
+                                ui,
+                                &strip,
+                                &meters,
+                                self.reduction_for(id),
+                                self.rate(),
+                                expand_strips,
+                            );
+                            if edit.remove {
+                                remove_id = Some(id);
+                            }
+                            if self.picker.set_fader(id, edit.fader_db, now) {
+                                changed = true;
+                            }
+                            if self.picker.set_trim(id, edit.trim_db, now) {
+                                changed = true;
+                            }
+                            if self.picker.set_mute(id, edit.mute, now) {
+                                changed = true;
+                            }
+                            if self.picker.set_solo(id, edit.solo, now) {
+                                changed = true;
+                            }
+                            self.note_eq(Some(id), &edit.eq, now, &mut commands, &mut changed);
+                            self.note_comp(Some(id), &edit.comp, now, &mut commands, &mut changed);
                         }
-                        if self.picker.set_fader(id, edit.fader_db, now) {
+                        if let Some(id) = remove_id
+                            && self.picker.remove(id, now)
+                        {
                             changed = true;
                         }
-                        if self.picker.set_trim(id, edit.trim_db, now) {
-                            changed = true;
-                        }
-                        if self.picker.set_mute(id, edit.mute, now) {
-                            changed = true;
-                        }
-                        if self.picker.set_solo(id, edit.solo, now) {
-                            changed = true;
-                        }
-                        self.note_eq(Some(id), &edit.eq, now, &mut commands, &mut changed);
-                        self.note_comp(Some(id), &edit.comp, now, &mut commands, &mut changed);
-                    }
-                    if let Some(id) = remove_id
-                        && self.picker.remove(id, now)
-                    {
-                        changed = true;
+                    });
+                    if scroll_bottom {
+                        ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
                     }
                 });
-            });
         });
         if changed {
             for command in commands {

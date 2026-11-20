@@ -141,6 +141,26 @@ impl Scene {
         }
     }
 
+    pub fn ensure_default_capture_strip(&mut self) -> bool {
+        if self
+            .strips
+            .iter()
+            .any(|strip| matches!(strip.source, SourceKind::DefaultSource))
+        {
+            return false;
+        }
+        let id = self
+            .strips
+            .iter()
+            .map(|strip| strip.id.0)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.strips
+            .push(Strip::new(id, "default", SourceKind::DefaultSource));
+        true
+    }
+
     /// One strip so the UI shell has something to draw. Not a saved preset.
     pub fn placeholder() -> Self {
         let mut scene = Self::empty("Untitled");
@@ -498,6 +518,34 @@ mod tests {
         master.set_fader_db(f32::NEG_INFINITY);
         assert_eq!(master.fader_db(), f32::NEG_INFINITY);
         assert_eq!(db::db_to_linear(master.fader_db()), 0.0);
+    }
+
+    #[test]
+    fn a_startup_scene_gains_one_default_capture_strip() {
+        let mut scene = Scene::empty("window");
+        assert!(scene.ensure_default_capture_strip());
+        assert!(!scene.ensure_default_capture_strip());
+        assert_eq!(scene.strips.len(), 1);
+        assert_eq!(scene.strips[0].id.0, 1);
+        assert!(matches!(scene.strips[0].source, SourceKind::DefaultSource));
+
+        let mut picked = Scene::empty("picked");
+        picked.strips.push(Strip::new(
+            7,
+            "mic",
+            SourceKind::CaptureDevice {
+                node_name: "node-a".into(),
+            },
+        ));
+        assert!(picked.ensure_default_capture_strip());
+        assert_eq!(picked.strips.len(), 2);
+        assert!(matches!(
+            picked.strips[0].source,
+            SourceKind::CaptureDevice { ref node_name } if node_name == "node-a"
+        ));
+        assert_eq!(picked.strips[1].id.0, 8);
+        assert!(matches!(picked.strips[1].source, SourceKind::DefaultSource));
+        assert!(!picked.ensure_default_capture_strip());
     }
 
     #[test]

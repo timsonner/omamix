@@ -70,6 +70,33 @@ if clock not in text or quantum not in text:
     sys.exit("ci-smoke: private pipewire config is not " + rate + " Hz")
 if "support.null-audio-sink" not in text:
     sys.exit("ci-smoke: private pipewire config has no null device")
+needle = "node.name        = private-source\n"
+ports = (
+    needle
+    + "            adapter.auto-port-config = {\n"
+    + "                mode = dsp\n"
+    + "                monitor = true\n"
+    + "                control = false\n"
+    + "                position = preserve\n"
+    + "            }\n"
+    + "            node.param.PortConfig = {\n"
+    + "                direction = Input\n"
+    + "                mode = dsp\n"
+    + "                monitor = true\n"
+    + "                control = false\n"
+    + "                format = {\n"
+    + "                    mediaType = audio\n"
+    + "                    mediaSubtype = raw\n"
+    + "                    format = F32P\n"
+    + "                    rate = " + rate + "\n"
+    + "                    channels = 2\n"
+    + "                    position = [ FL FR ]\n"
+    + "                }\n"
+    + "            }\n"
+)
+if needle not in text:
+    sys.exit("ci-smoke: private source block was not found")
+text = text.replace(needle, ports, 1)
 pathlib.Path(dst).write_text(text)
 PY
 pipewire -c "$RUNTIME/pipewire.conf" >"$RUNTIME/pipewire.log" 2>&1 &
@@ -90,7 +117,7 @@ if [ "$ready" != 1 ]; then
   tail -n 40 "$RUNTIME/pipewire.log" >&2 || true
   exit 1
 fi
-PIPEWIRE_REMOTE=$SOCKET "$BIN" --headless --mix-mic --duration 8 >"$RUNTIME/omamix.log" 2>&1 &
+PIPEWIRE_REMOTE=$SOCKET "$BIN" --headless --mix-mic --duration 16 >"$RUNTIME/omamix.log" 2>&1 &
 ompid=$!
 set +e
 python3 - "$SOCKET" "$RUNTIME" "$ompid" "$RATE" <<'PY'
@@ -340,6 +367,108 @@ print(
     f"ci-smoke: Mix Mic node present, capture ports present, "
     f"port latency {shown} matches chain latency {chain} samples at {rate} Hz "
     f"(engine ProcessLatency {engine}, tolerance {tol} samples)"
+)
+
+def walk_pairs(obj, found):
+    if isinstance(obj, dict):
+        key = obj.get("key")
+        value = obj.get("value")
+        if isinstance(key, str) and isinstance(value, str):
+            found[key] = value
+        for item in obj.values():
+            walk_pairs(item, found)
+    elif isinstance(obj, list):
+        for item in obj:
+            walk_pairs(item, found)
+
+def meta_name(value):
+    value = value.strip()
+    if not value:
+        return None
+    if value.startswith("{"):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        name = parsed.get("name") if isinstance(parsed, dict) else None
+        if isinstance(name, str) and name:
+            return name
+        return None
+    return value
+
+def node_name(data, node_id):
+    for obj in nodes(data):
+        if str(obj.get("id")) == str(node_id):
+            return props(obj).get("node.name")
+    return None
+
+def link_ends(obj):
+    info = obj.get("info") or {}
+    bag = props(obj)
+    out_id = bag.get("link.output.node")
+    in_id = bag.get("link.input.node")
+    if out_id is None:
+        out_id = info.get("output-node-id")
+    if in_id is None:
+        in_id = info.get("input-node-id")
+    return out_id, in_id
+
+def source_links(data, source_name):
+    found = []
+    for obj in data:
+        if obj.get("type") != "PipeWire:Interface:Link":
+            continue
+        out_id, in_id = link_ends(obj)
+        if out_id is None or in_id is None:
+            continue
+        out_name = node_name(data, out_id)
+        in_name = node_name(data, in_id)
+        if out_name == source_name and in_name == "omamix.mix-engine":
+            found.append((str(out_id), str(in_id)))
+    return found
+
+def self_links(data):
+    found = []
+    for obj in data:
+        if obj.get("type") != "PipeWire:Interface:Link":
+            continue
+        out_id, in_id = link_ends(obj)
+        if out_id is None or in_id is None:
+            continue
+        out_name = node_name(data, out_id)
+        in_name = node_name(data, in_id)
+        if out_name == "omamix.mix-mic" and in_name == "omamix.mix-engine":
+            found.append((str(out_id), str(in_id)))
+    return found
+
+source_name = None
+linked = []
+looped = []
+deadline = time.time() + 4
+while time.time() < deadline and alive(ompid):
+    data = dump()
+    pairs = {}
+    walk_pairs(data, pairs)
+    raw = pairs.get("default.audio.source") or pairs.get("default.configured.audio.source")
+    source_name = meta_name(raw) if isinstance(raw, str) else None
+    if source_name:
+        linked = source_links(data, source_name)
+        looped = self_links(data)
+        if linked and not looped:
+            break
+    time.sleep(0.1)
+
+if not source_name:
+    fail("default audio source was not read")
+if source_name in ("omamix.mix-mic", "omamix.mix-engine"):
+    fail(f"default source {source_name} must not be linked into the engine")
+if looped:
+    fail("Mix Mic is linked into the mix engine")
+if len(linked) < 1:
+    fail(f"default source {source_name} was not linked into the mix engine")
+print(
+    f"ci-smoke: default source {source_name} linked into omamix.mix-engine "
+    f"({len(linked)} link(s))"
 )
 PY
 status=$?

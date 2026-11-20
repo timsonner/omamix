@@ -29,9 +29,10 @@ pub struct PortEndpoint {
 
 /// Output ports of `node_id` to link into a stereo tap, as `(fl, fr)`.
 ///
-/// Labeled FL/FR win. A single output is used for both sides, including a
-/// port labeled MONO, FC, or AUX. Two unlabeled outputs are used in id order.
-/// Several labeled ports with no FL/FR pair stay unpaired.
+/// One port is copied to both sides. When FL and FR are both present, those
+/// two are used and any further ports stay unlinked. Without that pair, the
+/// first two ports in id order are used, labels included. Extra channels are
+/// not summed.
 pub fn stereo_output_ports(ports: &[PortEndpoint], node_id: u32) -> Option<(u32, u32)> {
     stereo_ports(ports, node_id, "out")
 }
@@ -52,14 +53,13 @@ fn stereo_ports(ports: &[PortEndpoint], node_id: u32, direction: &str) -> Option
     }
     let fl = matched.iter().find(|port| port.channel == "FL");
     let fr = matched.iter().find(|port| port.channel == "FR");
-    if let (Some(fl), Some(fr)) = (fl, fr) {
+    if let (Some(fl), Some(fr)) = (fl, fr)
+        && fl.id != fr.id
+    {
         return Some((fl.id, fr.id));
     }
     if matched.len() == 1 {
         return Some((matched[0].id, matched[0].id));
-    }
-    if matched.iter().any(|port| !port.channel.is_empty()) {
-        return None;
     }
     Some((matched[0].id, matched[1].id))
 }
@@ -918,7 +918,7 @@ mod tests {
                 channel: "AUX".into(),
             },
         ];
-        assert_eq!(stereo_output_ports(&mixed, 1), None);
+        assert_eq!(stereo_output_ports(&mixed, 1), Some((1, 2)));
         let input = [PortEndpoint {
             id: 9,
             node_id: 4,
@@ -926,6 +926,85 @@ mod tests {
             channel: "FL".into(),
         }];
         assert_eq!(stereo_input_ports(&input, 4), Some((9, 9)));
+    }
+
+    #[test]
+    fn more_than_two_channels_keep_fl_fr_or_the_first_two() {
+        let labeled = [
+            PortEndpoint {
+                id: 4,
+                node_id: 1,
+                direction: "out".into(),
+                channel: "LFE".into(),
+            },
+            PortEndpoint {
+                id: 3,
+                node_id: 1,
+                direction: "out".into(),
+                channel: "FC".into(),
+            },
+            PortEndpoint {
+                id: 1,
+                node_id: 1,
+                direction: "out".into(),
+                channel: "FL".into(),
+            },
+            PortEndpoint {
+                id: 2,
+                node_id: 1,
+                direction: "out".into(),
+                channel: "FR".into(),
+            },
+        ];
+        assert_eq!(stereo_output_ports(&labeled, 1), Some((1, 2)));
+        let aux = [
+            PortEndpoint {
+                id: 30,
+                node_id: 2,
+                direction: "out".into(),
+                channel: "AUX2".into(),
+            },
+            PortEndpoint {
+                id: 10,
+                node_id: 2,
+                direction: "out".into(),
+                channel: "AUX0".into(),
+            },
+            PortEndpoint {
+                id: 20,
+                node_id: 2,
+                direction: "out".into(),
+                channel: "AUX1".into(),
+            },
+        ];
+        assert_eq!(stereo_output_ports(&aux, 2), Some((10, 20)));
+        let four = [
+            PortEndpoint {
+                id: 8,
+                node_id: 3,
+                direction: "out".into(),
+                channel: String::new(),
+            },
+            PortEndpoint {
+                id: 2,
+                node_id: 3,
+                direction: "out".into(),
+                channel: String::new(),
+            },
+            PortEndpoint {
+                id: 5,
+                node_id: 3,
+                direction: "out".into(),
+                channel: String::new(),
+            },
+            PortEndpoint {
+                id: 9,
+                node_id: 3,
+                direction: "out".into(),
+                channel: String::new(),
+            },
+        ];
+        assert_eq!(stereo_output_ports(&four, 3), Some((2, 5)));
     }
 
     #[test]
