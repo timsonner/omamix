@@ -6,7 +6,7 @@ use omamix_core::comp::{
     COMP_THRESHOLD_MIN_DB, CompSettings,
 };
 use omamix_core::db::format_db;
-use omamix_core::effect::{EffectKind, MasterChain};
+use omamix_core::effect::{MasterChain, reorder_move_enabled};
 use omamix_core::eq::{
     EQ_BAND_HZ, EQ_BANDS, EQ_GAIN_MAX_DB, EQ_GAIN_MIN_DB, EqSettings, HPF_MAX_HZ, HPF_MIN_HZ,
 };
@@ -14,6 +14,19 @@ use omamix_core::fader::{self, FADER_MAX_DB, FADER_MIN_DB};
 use omamix_core::graph::{INPUT_GAIN_MAX_DB, INPUT_GAIN_MIN_DB};
 use omamix_core::meter::{METER_BAR_FLOOR_DB, MeterDisplay};
 use omamix_core::route::SourceKind;
+
+/// Minimum width of one strip column in the mixer row.
+pub const STRIP_PANEL_MIN_WIDTH: f32 = 168.0;
+/// Column width for the ten-band EQ in the master side panel.
+pub const MASTER_EQ_BAND_WIDTH: f32 = 33.0;
+/// Fader width inside each master EQ band column.
+pub const MASTER_EQ_FADER_WIDTH: f32 = 24.0;
+/// Minimum outer width of the master side panel (includes frame margins).
+pub const MASTER_SIDE_MIN_WIDTH: f32 = 432.0;
+/// Default outer width of the master side panel at the default window size.
+pub const MASTER_SIDE_DEFAULT_WIDTH: f32 = 448.0;
+/// Default window width: master panel plus one strip and layout margin.
+pub const WINDOW_MIN_WIDTH: f32 = MASTER_SIDE_MIN_WIDTH + STRIP_PANEL_MIN_WIDTH + 32.0;
 
 #[derive(Clone)]
 pub struct StripMeters {
@@ -114,7 +127,7 @@ pub fn strip_panel(
         comp: comp_edit(strip.comp),
     };
     ui.group(|ui| {
-        ui.set_min_width(168.0);
+        ui.set_min_width(STRIP_PANEL_MIN_WIDTH);
         ui.vertical(|ui| {
             ui.strong(&strip.name);
             ui.label(source_label(&strip.source));
@@ -148,7 +161,7 @@ pub fn strip_panel(
                 .id_salt(("strip-effects", strip.id.0))
                 .show(ui, |ui| {
                     ui.set_min_width(420.0);
-                    eq_controls(ui, strip.id.0, &mut edit.eq, sample_rate);
+                    eq_controls(ui, strip.id.0, &mut edit.eq, sample_rate, EqLayout::Strip);
                     comp_controls(ui, strip.id.0, &mut edit.comp);
                     ui.label(format!("gain reduction {}", format_db(reduction_db)));
                 });
@@ -174,8 +187,10 @@ pub fn master_panel(ui: &mut egui::Ui, view: MasterView<'_>) -> MasterEdit {
         },
     };
     ui.group(|ui| {
-        ui.set_min_width(168.0);
+        let width = ui.available_width();
+        ui.set_width(width);
         ui.vertical(|ui| {
+            ui.set_width(width);
             ui.strong("Master");
             ui.label("mix");
             ui.add_space(4.0);
@@ -194,9 +209,15 @@ pub fn master_panel(ui: &mut egui::Ui, view: MasterView<'_>) -> MasterEdit {
             ));
             egui::CollapsingHeader::new("EQ")
                 .id_salt("master-eq")
+                .default_open(true)
                 .show(ui, |ui| {
-                    ui.set_min_width(420.0);
-                    eq_controls(ui, u64::MAX, &mut edit.eq, view.sample_rate);
+                    eq_controls(
+                        ui,
+                        u64::MAX,
+                        &mut edit.eq,
+                        view.sample_rate,
+                        EqLayout::Master,
+                    );
                 });
             ui.label("Chain");
             chain_rows(ui, view.chain, &mut edit.chain);
@@ -229,10 +250,26 @@ fn comp_edit(settings: CompSettings) -> CompEdit {
     }
 }
 
-fn eq_controls(ui: &mut egui::Ui, salt: u64, edit: &mut EqEdit, sample_rate: u32) {
+#[derive(Clone, Copy)]
+enum EqLayout {
+    Strip,
+    Master,
+}
+
+fn eq_controls(
+    ui: &mut egui::Ui,
+    salt: u64,
+    edit: &mut EqEdit,
+    sample_rate: u32,
+    layout: EqLayout,
+) {
     let started_bands = edit.bands;
     let started_hpf = edit.hpf_enabled;
     let started_hz = edit.hpf_hz;
+    let (band_w, fader_w) = match layout {
+        EqLayout::Strip => (40.0, 28.0),
+        EqLayout::Master => (MASTER_EQ_BAND_WIDTH, MASTER_EQ_FADER_WIDTH),
+    };
     ui.horizontal(|ui| {
         ui.checkbox(&mut edit.enabled, "EQ");
         if ui.button("Flat").clicked() {
@@ -241,7 +278,9 @@ fn eq_controls(ui: &mut egui::Ui, salt: u64, edit: &mut EqEdit, sample_rate: u32
     });
     ui.horizontal(|ui| {
         ui.checkbox(&mut edit.hpf_enabled, "High-pass");
-        ui.add(
+        let slider_w = ui.available_width().max(80.0);
+        ui.add_sized(
+            [slider_w, ui.spacing().interact_size.y],
             egui::Slider::new(&mut edit.hpf_hz, HPF_MIN_HZ..=HPF_MAX_HZ)
                 .suffix(" Hz")
                 .text("cutoff"),
@@ -251,10 +290,10 @@ fn eq_controls(ui: &mut egui::Ui, salt: u64, edit: &mut EqEdit, sample_rate: u32
         for (index, hz) in EQ_BAND_HZ.iter().enumerate() {
             ui.push_id((salt, index), |ui| {
                 ui.vertical(|ui| {
-                    ui.set_min_width(40.0);
+                    ui.set_width(band_w);
                     ui.label(band_caption(*hz));
                     let inactive = EqSettings::flat(sample_rate).band_disabled(index);
-                    band_fader(ui, &mut edit.bands[index], !inactive);
+                    band_fader(ui, &mut edit.bands[index], !inactive, fader_w);
                     ui.label(format!("{:.1}", edit.bands[index]));
                 });
             });
@@ -277,10 +316,10 @@ fn band_caption(hz: f32) -> String {
     }
 }
 
-fn band_fader(ui: &mut egui::Ui, db: &mut f32, active: bool) {
+fn band_fader(ui: &mut egui::Ui, db: &mut f32, active: bool, width: f32) {
     let height = 120.0;
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(28.0, height), egui::Sense::click_and_drag());
+        ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click_and_drag());
     if !db.is_finite() {
         *db = 0.0;
     }
@@ -366,20 +405,17 @@ fn range_slider(
 fn chain_rows(ui: &mut egui::Ui, chain: &MasterChain, edit: &mut ChainEdit) {
     let blocks = chain.blocks();
     for index in 0..blocks.len() {
-        let limiter = blocks[index].kind() == EffectKind::Limiter;
-        let up_ok = !limiter && index > 0 && blocks[index - 1].kind() != EffectKind::Limiter;
-        let down_ok =
-            !limiter && index + 1 < blocks.len() && blocks[index + 1].kind() != EffectKind::Limiter;
+        let (up_ok, down_ok) = reorder_move_enabled(blocks, index);
         ui.push_id(("chain", index), |ui| {
             ui.horizontal(|ui| {
                 if index < edit.bypass.len() {
                     ui.checkbox(&mut edit.bypass[index], "bypass");
                 }
                 ui.label(blocks[index].kind_id());
-                if ui.add_enabled(up_ok, egui::Button::new("Up")).clicked() {
+                if up_ok && ui.button("Up").clicked() {
                     edit.move_up = Some(index);
                 }
-                if ui.add_enabled(down_ok, egui::Button::new("Down")).clicked() {
+                if down_ok && ui.button("Down").clicked() {
                     edit.move_down = Some(index);
                 }
             });

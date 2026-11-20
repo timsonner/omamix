@@ -484,7 +484,45 @@ impl eframe::App for WindowHost {
         self.save_if_due(now);
         let mut changed = false;
         let mut commands = Vec::new();
-        let ctx = ui.ctx().clone();
+        let sample_rate = self.rate();
+        let latency_ms = self.picker.latency_ms(self.sample_rate, self.quantum);
+        let master_view = ui::MasterView {
+            fader_db: self.picker.scene().master.fader_db(),
+            meters: &self.master,
+            eq_enabled: self.picker.scene().master.eq_enabled,
+            eq: self.picker.scene().master.eq,
+            comp: self.picker.scene().master.comp,
+            chain: &self.picker.scene().master.chain,
+            reduction_db: self.master_gr,
+            latency_ms,
+            sample_rate,
+        };
+        let master_edit = egui::Panel::right("omamix-master")
+            .resizable(true)
+            .default_size(ui::MASTER_SIDE_DEFAULT_WIDTH)
+            .min_size(ui::MASTER_SIDE_MIN_WIDTH)
+            .show(ui, |ui| ui::master_panel(ui, master_view));
+        if self
+            .picker
+            .set_master_fader(master_edit.inner.fader_db, now)
+        {
+            changed = true;
+        }
+        self.note_eq(
+            None,
+            &master_edit.inner.eq,
+            now,
+            &mut commands,
+            &mut changed,
+        );
+        self.note_comp(
+            None,
+            &master_edit.inner.comp,
+            now,
+            &mut commands,
+            &mut changed,
+        );
+        self.note_chain(&master_edit.inner.chain, now, &mut commands, &mut changed);
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("omamix");
@@ -547,68 +585,46 @@ impl eframe::App for WindowHost {
                 }
             });
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                egui::ScrollArea::horizontal().show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let mut remove_id = None;
-                        let strip_count = self.picker.scene().strips.len();
-                        for index in 0..strip_count {
-                            let Some(strip) = self.picker.scene().strips.get(index).cloned() else {
-                                continue;
-                            };
-                            let id = strip.id.0;
-                            let meters = self.meters_for(id);
-                            let edit = ui::strip_panel(
-                                ui,
-                                &strip,
-                                &meters,
-                                self.reduction_for(id),
-                                self.rate(),
-                            );
-                            if edit.remove {
-                                remove_id = Some(id);
-                            }
-                            if self.picker.set_fader(id, edit.fader_db, now) {
-                                changed = true;
-                            }
-                            if self.picker.set_trim(id, edit.trim_db, now) {
-                                changed = true;
-                            }
-                            if self.picker.set_mute(id, edit.mute, now) {
-                                changed = true;
-                            }
-                            if self.picker.set_solo(id, edit.solo, now) {
-                                changed = true;
-                            }
-                            self.note_eq(Some(id), &edit.eq, now, &mut commands, &mut changed);
-                            self.note_comp(Some(id), &edit.comp, now, &mut commands, &mut changed);
-                        }
-                        if let Some(id) = remove_id
-                            && self.picker.remove(id, now)
-                        {
-                            changed = true;
-                        }
-                        let sample_rate = self.rate();
-                        let latency_ms = self.picker.latency_ms(self.sample_rate, self.quantum);
-                        let master_view = ui::MasterView {
-                            fader_db: self.picker.scene().master.fader_db(),
-                            meters: &self.master,
-                            eq_enabled: self.picker.scene().master.eq_enabled,
-                            eq: self.picker.scene().master.eq,
-                            comp: self.picker.scene().master.comp,
-                            chain: &self.picker.scene().master.chain,
-                            reduction_db: self.master_gr,
-                            latency_ms,
-                            sample_rate,
+            egui::ScrollArea::horizontal().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let mut remove_id = None;
+                    let strip_count = self.picker.scene().strips.len();
+                    for index in 0..strip_count {
+                        let Some(strip) = self.picker.scene().strips.get(index).cloned() else {
+                            continue;
                         };
-                        let master = ui::master_panel(ui, master_view);
-                        if self.picker.set_master_fader(master.fader_db, now) {
+                        let id = strip.id.0;
+                        let meters = self.meters_for(id);
+                        let edit = ui::strip_panel(
+                            ui,
+                            &strip,
+                            &meters,
+                            self.reduction_for(id),
+                            self.rate(),
+                        );
+                        if edit.remove {
+                            remove_id = Some(id);
+                        }
+                        if self.picker.set_fader(id, edit.fader_db, now) {
                             changed = true;
                         }
-                        self.note_eq(None, &master.eq, now, &mut commands, &mut changed);
-                        self.note_comp(None, &master.comp, now, &mut commands, &mut changed);
-                        self.note_chain(&master.chain, now, &mut commands, &mut changed);
-                    });
+                        if self.picker.set_trim(id, edit.trim_db, now) {
+                            changed = true;
+                        }
+                        if self.picker.set_mute(id, edit.mute, now) {
+                            changed = true;
+                        }
+                        if self.picker.set_solo(id, edit.solo, now) {
+                            changed = true;
+                        }
+                        self.note_eq(Some(id), &edit.eq, now, &mut commands, &mut changed);
+                        self.note_comp(Some(id), &edit.comp, now, &mut commands, &mut changed);
+                    }
+                    if let Some(id) = remove_id
+                        && self.picker.remove(id, now)
+                    {
+                        changed = true;
+                    }
                 });
             });
         });
@@ -618,7 +634,7 @@ impl eframe::App for WindowHost {
             }
             self.push_scene();
         }
-        ctx.request_repaint_after(Duration::from_millis(33));
+        ui.ctx().request_repaint_after(Duration::from_millis(33));
     }
 
     fn on_exit(&mut self) {
