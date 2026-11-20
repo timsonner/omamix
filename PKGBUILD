@@ -23,7 +23,7 @@ pkgname=omamix-git
 pkgver=0.1.0
 pkgrel=1
 pkgdesc='PipeWire live mixer that publishes one virtual microphone'
-arch=('x86_64')
+arch=('x86_64' 'aarch64')
 url='https://github.com/timsonner/omamix'
 license=('MIT')
 depends=(
@@ -70,5 +70,7 @@ check() {
 package() {
   cd "$srcdir/omamix"
   install -Dm755 "$srcdir/target/release/omamix" "$pkgdir/usr/bin/omamix"
+  install -Dm644 packaging/omamix.desktop "$pkgdir/usr/share/applications/omamix.desktop"
+  install -Dm644 packaging/omamix.service "$pkgdir/usr/lib/systemd/user/omamix.service"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
