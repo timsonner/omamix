@@ -36,6 +36,8 @@ pub struct Strip {
     pub enabled: bool,
     /// Hear this strip in the headphones without requiring it on the virtual mic.
     pub monitor_headphones: bool,
+    /// Off publishes a flat EQ and leaves `eq` stored for the next time it is on.
+    pub eq_enabled: bool,
     pub eq: EqSettings,
     pub comp: CompSettings,
 }
@@ -53,6 +55,7 @@ impl Strip {
             input_gain_db: 0.0,
             enabled: true,
             monitor_headphones: false,
+            eq_enabled: false,
             eq: EqSettings::flat(48_000),
             comp: CompSettings::bypass(48_000),
         }

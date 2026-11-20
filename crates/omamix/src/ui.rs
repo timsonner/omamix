@@ -1,6 +1,15 @@
 use eframe::egui;
 use omamix_core::Strip;
+use omamix_core::comp::{
+    COMP_ATTACK_MAX_MS, COMP_ATTACK_MIN_MS, COMP_MAKEUP_MAX_DB, COMP_MAKEUP_MIN_DB, COMP_RATIO_MAX,
+    COMP_RATIO_MIN, COMP_RELEASE_MAX_MS, COMP_RELEASE_MIN_MS, COMP_THRESHOLD_MAX_DB,
+    COMP_THRESHOLD_MIN_DB, CompSettings,
+};
 use omamix_core::db::format_db;
+use omamix_core::effect::{EffectKind, MasterChain};
+use omamix_core::eq::{
+    EQ_BAND_HZ, EQ_BANDS, EQ_GAIN_MAX_DB, EQ_GAIN_MIN_DB, EqSettings, HPF_MAX_HZ, HPF_MIN_HZ,
+};
 use omamix_core::fader::{self, FADER_MAX_DB, FADER_MIN_DB};
 use omamix_core::graph::{INPUT_GAIN_MAX_DB, INPUT_GAIN_MIN_DB};
 use omamix_core::meter::{METER_BAR_FLOOR_DB, MeterDisplay};
@@ -36,21 +45,73 @@ pub fn source_label(source: &SourceKind) -> String {
     }
 }
 
+pub struct EqEdit {
+    pub enabled: bool,
+    pub reset: bool,
+    pub hpf_enabled: bool,
+    pub hpf_hz: f32,
+    pub bands: [f32; EQ_BANDS],
+}
+
+pub struct CompEdit {
+    pub enabled: bool,
+    pub threshold_db: f32,
+    pub ratio: f32,
+    pub attack_ms: f32,
+    pub release_ms: f32,
+    pub makeup_db: f32,
+}
+
+pub struct ChainEdit {
+    pub bypass: Vec<bool>,
+    pub move_up: Option<usize>,
+    pub move_down: Option<usize>,
+}
+
 pub struct StripEdit {
     pub fader_db: f32,
     pub trim_db: f32,
     pub mute: bool,
     pub solo: bool,
     pub remove: bool,
+    pub eq: EqEdit,
+    pub comp: CompEdit,
 }
 
-pub fn strip_panel(ui: &mut egui::Ui, strip: &Strip, meters: &StripMeters) -> StripEdit {
+pub struct MasterEdit {
+    pub fader_db: f32,
+    pub eq: EqEdit,
+    pub comp: CompEdit,
+    pub chain: ChainEdit,
+}
+
+pub struct MasterView<'a> {
+    pub fader_db: f32,
+    pub meters: &'a StripMeters,
+    pub eq_enabled: bool,
+    pub eq: EqSettings,
+    pub comp: CompSettings,
+    pub chain: &'a MasterChain,
+    pub reduction_db: f32,
+    pub latency_ms: f32,
+    pub sample_rate: u32,
+}
+
+pub fn strip_panel(
+    ui: &mut egui::Ui,
+    strip: &Strip,
+    meters: &StripMeters,
+    reduction_db: f32,
+    sample_rate: u32,
+) -> StripEdit {
     let mut edit = StripEdit {
         fader_db: strip.fader_db,
         trim_db: strip.input_gain_db,
         mute: strip.mute,
         solo: strip.solo,
         remove: false,
+        eq: eq_edit(strip.eq_enabled, strip.eq),
+        comp: comp_edit(strip.comp),
     };
     ui.group(|ui| {
         ui.set_min_width(168.0);
@@ -83,35 +144,247 @@ pub fn strip_panel(ui: &mut egui::Ui, strip: &Strip, meters: &StripMeters) -> St
                     edit.remove = true;
                 }
             });
+            egui::CollapsingHeader::new("Effects")
+                .id_salt(("strip-effects", strip.id.0))
+                .show(ui, |ui| {
+                    ui.set_min_width(420.0);
+                    eq_controls(ui, strip.id.0, &mut edit.eq, sample_rate);
+                    comp_controls(ui, strip.id.0, &mut edit.comp);
+                    ui.label(format!("gain reduction {}", format_db(reduction_db)));
+                });
         });
     });
     edit
 }
 
-pub fn master_panel(ui: &mut egui::Ui, fader_db: f32, meters: &StripMeters) -> f32 {
-    let mut fader_db = fader_db;
+pub fn master_panel(ui: &mut egui::Ui, view: MasterView<'_>) -> MasterEdit {
+    let mut edit = MasterEdit {
+        fader_db: view.fader_db,
+        eq: eq_edit(view.eq_enabled, view.eq),
+        comp: comp_edit(view.comp),
+        chain: ChainEdit {
+            bypass: view
+                .chain
+                .blocks()
+                .iter()
+                .map(|block| block.bypassed())
+                .collect(),
+            move_up: None,
+            move_down: None,
+        },
+    };
     ui.group(|ui| {
-        ui.set_min_width(150.0);
+        ui.set_min_width(168.0);
         ui.vertical(|ui| {
             ui.strong("Master");
             ui.label("mix");
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                meter_column(ui, meters);
+                meter_column(ui, view.meters);
                 ui.vertical(|ui| {
                     ui.label("level");
-                    db_fader(ui, &mut fader_db);
-                    ui.label(format_db(fader_db));
+                    db_fader(ui, &mut edit.fader_db);
+                    ui.label(format_db(edit.fader_db));
                 });
             });
             ui.label(format!(
                 "peak {}  rms {}",
-                format_db(meters.peak.peak_db()),
-                format_db(meters.rms_db)
+                format_db(view.meters.peak.peak_db()),
+                format_db(view.meters.rms_db)
             ));
+            egui::CollapsingHeader::new("EQ")
+                .id_salt("master-eq")
+                .show(ui, |ui| {
+                    ui.set_min_width(420.0);
+                    eq_controls(ui, u64::MAX, &mut edit.eq, view.sample_rate);
+                });
+            ui.label("Chain");
+            chain_rows(ui, view.chain, &mut edit.chain);
+            ui.label(format!("latency {:.1} ms", view.latency_ms));
+            comp_controls(ui, u64::MAX - 1, &mut edit.comp);
+            ui.label(format!("gain reduction {}", format_db(view.reduction_db)));
         });
     });
-    fader_db
+    edit
+}
+
+fn eq_edit(enabled: bool, settings: EqSettings) -> EqEdit {
+    EqEdit {
+        enabled,
+        reset: false,
+        hpf_enabled: settings.hpf_enabled(),
+        hpf_hz: settings.hpf_hz(),
+        bands: settings.band_db(),
+    }
+}
+
+fn comp_edit(settings: CompSettings) -> CompEdit {
+    CompEdit {
+        enabled: settings.enabled(),
+        threshold_db: settings.threshold_db(),
+        ratio: settings.ratio(),
+        attack_ms: settings.attack_ms(),
+        release_ms: settings.release_ms(),
+        makeup_db: settings.makeup_db(),
+    }
+}
+
+fn eq_controls(ui: &mut egui::Ui, salt: u64, edit: &mut EqEdit, sample_rate: u32) {
+    let started_bands = edit.bands;
+    let started_hpf = edit.hpf_enabled;
+    let started_hz = edit.hpf_hz;
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut edit.enabled, "EQ");
+        if ui.button("Flat").clicked() {
+            edit.reset = true;
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut edit.hpf_enabled, "High-pass");
+        ui.add(
+            egui::Slider::new(&mut edit.hpf_hz, HPF_MIN_HZ..=HPF_MAX_HZ)
+                .suffix(" Hz")
+                .text("cutoff"),
+        );
+    });
+    ui.horizontal(|ui| {
+        for (index, hz) in EQ_BAND_HZ.iter().enumerate() {
+            ui.push_id((salt, index), |ui| {
+                ui.vertical(|ui| {
+                    ui.set_min_width(40.0);
+                    ui.label(band_caption(*hz));
+                    let inactive = EqSettings::flat(sample_rate).band_disabled(index);
+                    band_fader(ui, &mut edit.bands[index], !inactive);
+                    ui.label(format!("{:.1}", edit.bands[index]));
+                });
+            });
+        }
+    });
+    let curve_moved =
+        edit.bands != started_bands || edit.hpf_enabled != started_hpf || edit.hpf_hz != started_hz;
+    if curve_moved {
+        edit.enabled = true;
+    }
+}
+
+fn band_caption(hz: f32) -> String {
+    if hz >= 1000.0 {
+        format!("{:.0}k", hz / 1000.0)
+    } else if hz < 100.0 {
+        format!("{hz:.1}")
+    } else {
+        format!("{hz:.0}")
+    }
+}
+
+fn band_fader(ui: &mut egui::Ui, db: &mut f32, active: bool) {
+    let height = 120.0;
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(28.0, height), egui::Sense::click_and_drag());
+    if !db.is_finite() {
+        *db = 0.0;
+    }
+    *db = db.clamp(EQ_GAIN_MIN_DB, EQ_GAIN_MAX_DB);
+    if active {
+        if response.clicked() || response.drag_started() {
+            response.request_focus();
+        }
+        let notches = wheel_notches(ui, &response);
+        if response.hovered() && response.has_focus() && notches != 0 {
+            *db =
+                (*db + notches as f32 * fader::WHEEL_STEP_DB).clamp(EQ_GAIN_MIN_DB, EQ_GAIN_MAX_DB);
+        }
+        if response.dragged() {
+            let span = EQ_GAIN_MAX_DB - EQ_GAIN_MIN_DB;
+            let delta = response.drag_delta().y;
+            if delta.is_finite() && delta != 0.0 {
+                *db = (*db - delta / height * span).clamp(EQ_GAIN_MIN_DB, EQ_GAIN_MAX_DB);
+            }
+        }
+    }
+    paint_fader(
+        ui,
+        rect,
+        *db,
+        EQ_GAIN_MIN_DB,
+        EQ_GAIN_MAX_DB,
+        active && response.has_focus(),
+    );
+}
+
+fn comp_controls(ui: &mut egui::Ui, salt: u64, edit: &mut CompEdit) {
+    ui.push_id(("comp", salt), |ui| {
+        ui.checkbox(&mut edit.enabled, "Compressor");
+        range_slider(
+            ui,
+            "threshold",
+            &mut edit.threshold_db,
+            COMP_THRESHOLD_MIN_DB..=COMP_THRESHOLD_MAX_DB,
+            " dB",
+        );
+        range_slider(
+            ui,
+            "ratio",
+            &mut edit.ratio,
+            COMP_RATIO_MIN..=COMP_RATIO_MAX,
+            ":1",
+        );
+        range_slider(
+            ui,
+            "attack",
+            &mut edit.attack_ms,
+            COMP_ATTACK_MIN_MS..=COMP_ATTACK_MAX_MS,
+            " ms",
+        );
+        range_slider(
+            ui,
+            "release",
+            &mut edit.release_ms,
+            COMP_RELEASE_MIN_MS..=COMP_RELEASE_MAX_MS,
+            " ms",
+        );
+        range_slider(
+            ui,
+            "makeup",
+            &mut edit.makeup_db,
+            COMP_MAKEUP_MIN_DB..=COMP_MAKEUP_MAX_DB,
+            " dB",
+        );
+    });
+}
+
+fn range_slider(
+    ui: &mut egui::Ui,
+    name: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    suffix: &str,
+) {
+    ui.add(egui::Slider::new(value, range).text(name).suffix(suffix));
+}
+
+fn chain_rows(ui: &mut egui::Ui, chain: &MasterChain, edit: &mut ChainEdit) {
+    let blocks = chain.blocks();
+    for index in 0..blocks.len() {
+        let limiter = blocks[index].kind() == EffectKind::Limiter;
+        let up_ok = !limiter && index > 0 && blocks[index - 1].kind() != EffectKind::Limiter;
+        let down_ok =
+            !limiter && index + 1 < blocks.len() && blocks[index + 1].kind() != EffectKind::Limiter;
+        ui.push_id(("chain", index), |ui| {
+            ui.horizontal(|ui| {
+                if index < edit.bypass.len() {
+                    ui.checkbox(&mut edit.bypass[index], "bypass");
+                }
+                ui.label(blocks[index].kind_id());
+                if ui.add_enabled(up_ok, egui::Button::new("Up")).clicked() {
+                    edit.move_up = Some(index);
+                }
+                if ui.add_enabled(down_ok, egui::Button::new("Down")).clicked() {
+                    edit.move_down = Some(index);
+                }
+            });
+        });
+    }
 }
 
 fn meter_column(ui: &mut egui::Ui, meters: &StripMeters) {

@@ -249,6 +249,8 @@ struct StripDocument {
     #[serde(default)]
     monitor_headphones: bool,
     #[serde(default)]
+    eq_enabled: bool,
+    #[serde(default)]
     eq: EqDocument,
     #[serde(default)]
     compressor: CompDocument,
@@ -561,6 +563,7 @@ impl StripDocument {
             pan: finite_pan(strip.pan),
             enabled: strip.enabled,
             monitor_headphones: strip.monitor_headphones,
+            eq_enabled: strip.eq_enabled,
             eq: EqDocument::from_settings(strip.eq),
             compressor: CompDocument::from_settings(strip.comp),
         }
@@ -581,6 +584,7 @@ impl StripDocument {
         strip.pan = finite_pan(self.pan);
         strip.enabled = self.enabled;
         strip.monitor_headphones = self.monitor_headphones;
+        strip.eq_enabled = self.eq_enabled;
         strip.eq = self.eq.into_settings();
         strip.comp = self.compressor.into_settings();
         Ok(strip)
@@ -665,6 +669,7 @@ mod tests {
         device.pan = -0.5;
         device.enabled = false;
         device.monitor_headphones = true;
+        device.eq_enabled = true;
         device.eq.set_hpf_enabled(true);
         assert!(device.eq.set_band(1, -6.0));
         device.comp.set_enabled(true);
@@ -692,6 +697,9 @@ mod tests {
         assert!(text.contains("role = \"default\""));
         assert!(text.contains("role = \"app:player:player-bin\""));
         assert!(text.contains("role = \"other\""));
+        assert!(text.contains("eq_enabled = true"));
+        assert!(text.contains("hpf_hz"));
+        assert!(text.contains("threshold_db"));
         assert!(!text.contains("node_id"));
         let loaded = scene_from_toml(&text).unwrap();
         assert_eq!(loaded, scene);
@@ -783,6 +791,17 @@ role = "other"
         ));
         assert_eq!(scene.strips[1].eq, EqSettings::flat(48_000));
         assert_eq!(scene.strips[1].comp, CompSettings::bypass(48_000));
+        assert!(!scene.strips[0].eq_enabled);
+        assert!(!scene.strips[0].eq.hpf_enabled());
+        assert_eq!(scene.strips[0].eq.hpf_hz(), HPF_DEFAULT_HZ);
+        assert_eq!(scene.strips[0].eq.band_db(), [0.0; EQ_BANDS]);
+        assert_eq!(scene.strips[0].comp, CompSettings::bypass(48_000));
+        assert!(!scene.master.eq_enabled);
+        assert_eq!(scene.master.eq, EqSettings::flat(48_000));
+        assert!(!scene.master.eq.hpf_enabled());
+        assert_eq!(scene.master.eq.hpf_hz(), HPF_DEFAULT_HZ);
+        assert_eq!(scene.master.comp, CompSettings::bypass(48_000));
+        assert_eq!(scene.master.chain, MasterChain::standard());
         assert_eq!(scene.master.limit, LimitSettings::master(48_000));
     }
 

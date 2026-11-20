@@ -5,15 +5,20 @@ use eframe::egui;
 use omamix_core::graph::Scene;
 use omamix_pw::{AudioEngine, EngineCommand, NullEngine};
 
-use crate::picker::{self, Picker, PickerChoice, SCENE_SAVE_DEBOUNCE};
-use crate::ui::{self, StripMeters};
+use crate::picker::{self, EditResult, EffectCommand, Picker, PickerChoice, SCENE_SAVE_DEBOUNCE};
+use crate::ui::{self, CompEdit, EqEdit, StripMeters};
 
 pub struct WindowHost {
     picker: Picker,
     scene_path: Option<PathBuf>,
     audio: Audio,
     strips: Vec<(u64, StripMeters)>,
+    strip_gr: Vec<(u64, f32)>,
+    strip_slots: Vec<(u64, u16)>,
     master: StripMeters,
+    master_gr: f32,
+    sample_rate: u32,
+    quantum: u32,
     last_frame: Option<Instant>,
     save_note: String,
     retarget_note: String,
@@ -32,6 +37,11 @@ struct LevelSnap {
     master_peak: f32,
     master_rms: f32,
     strips: Vec<(u64, f32, f32)>,
+    strip_gr: Vec<(u64, f32)>,
+    strip_slots: Vec<(u64, u16)>,
+    master_gr: f32,
+    sample_rate: u32,
+    quantum: u32,
     catalog: Vec<omamix_core::route::ListedNode>,
     default_source: Option<String>,
     catalog_ready: bool,
@@ -45,7 +55,12 @@ impl WindowHost {
             scene_path,
             audio,
             strips: Vec::new(),
+            strip_gr: Vec::new(),
+            strip_slots: Vec::new(),
             master: StripMeters::silent(),
+            master_gr: 0.0,
+            sample_rate: 0,
+            quantum: 0,
             last_frame: None,
             save_note: String::new(),
             retarget_note: String::new(),
@@ -109,6 +124,11 @@ impl WindowHost {
             .peak
             .update(levels.master_peak, levels.master_rms, dt);
         self.master.rms_db = levels.master_rms;
+        self.master_gr = levels.master_gr;
+        self.sample_rate = levels.sample_rate;
+        self.quantum = levels.quantum;
+        self.strip_gr = levels.strip_gr;
+        self.strip_slots = levels.strip_slots;
         for (id, display) in &mut self.strips {
             let (peak, rms) = levels
                 .strips
@@ -119,6 +139,207 @@ impl WindowHost {
             display.peak.update(peak, rms, dt);
             display.rms_db = rms;
         }
+    }
+
+    fn reduction_for(&self, id: u64) -> f32 {
+        self.strip_gr
+            .iter()
+            .find(|(have, _)| *have == id)
+            .map(|(_, gr)| *gr)
+            .unwrap_or(0.0)
+    }
+
+    fn slot_for(&self, id: u64) -> Option<u16> {
+        self.strip_slots
+            .iter()
+            .find(|(have, _)| *have == id)
+            .map(|(_, slot)| *slot)
+    }
+
+    fn rate(&self) -> u32 {
+        if self.sample_rate == 0 {
+            48_000
+        } else {
+            self.sample_rate
+        }
+    }
+
+    fn keep(result: EditResult, commands: &mut Vec<EffectCommand>, changed: &mut bool) {
+        match result {
+            EditResult::Unchanged => {}
+            EditResult::Scene => *changed = true,
+            EditResult::Command(command) => {
+                *changed = true;
+                commands.push(command);
+            }
+        }
+    }
+
+    fn note_eq(
+        &mut self,
+        id: Option<u64>,
+        edit: &EqEdit,
+        now: Instant,
+        commands: &mut Vec<EffectCommand>,
+        changed: &mut bool,
+    ) {
+        if edit.reset {
+            let result = match id {
+                Some(id) => self.picker.reset_strip_eq(id, now),
+                None => self.picker.reset_master_eq(now),
+            };
+            Self::keep(result, commands, changed);
+            return;
+        }
+        Self::keep(
+            match id {
+                Some(id) => self.picker.set_strip_eq_enabled(id, edit.enabled, now),
+                None => self.picker.set_master_eq_enabled(edit.enabled, now),
+            },
+            commands,
+            changed,
+        );
+        Self::keep(
+            match id {
+                Some(id) => self.picker.set_strip_hpf_enabled(id, edit.hpf_enabled, now),
+                None => self.picker.set_master_hpf_enabled(edit.hpf_enabled, now),
+            },
+            commands,
+            changed,
+        );
+        Self::keep(
+            match id {
+                Some(id) => self.picker.set_strip_hpf_hz(id, edit.hpf_hz, now),
+                None => self.picker.set_master_hpf_hz(edit.hpf_hz, now),
+            },
+            commands,
+            changed,
+        );
+        for index in 0..edit.bands.len() {
+            Self::keep(
+                match id {
+                    Some(id) => self
+                        .picker
+                        .set_strip_band(id, index, edit.bands[index], now),
+                    None => self.picker.set_master_band(index, edit.bands[index], now),
+                },
+                commands,
+                changed,
+            );
+        }
+    }
+
+    fn note_comp(
+        &mut self,
+        id: Option<u64>,
+        edit: &CompEdit,
+        now: Instant,
+        commands: &mut Vec<EffectCommand>,
+        changed: &mut bool,
+    ) {
+        Self::keep(
+            match id {
+                Some(id) => self.picker.set_strip_comp_enabled(id, edit.enabled, now),
+                None => self.picker.set_master_comp_enabled(edit.enabled, now),
+            },
+            commands,
+            changed,
+        );
+        Self::keep(
+            match id {
+                Some(id) => self
+                    .picker
+                    .set_strip_comp_threshold(id, edit.threshold_db, now),
+                None => self
+                    .picker
+                    .set_master_comp_threshold(edit.threshold_db, now),
+            },
+            commands,
+            changed,
+        );
+        Self::keep(
+            match id {
+                Some(id) => self.picker.set_strip_comp_ratio(id, edit.ratio, now),
+                None => self.picker.set_master_comp_ratio(edit.ratio, now),
+            },
+            commands,
+            changed,
+        );
+        Self::keep(
+            match id {
+                Some(id) => self.picker.set_strip_comp_attack(id, edit.attack_ms, now),
+                None => self.picker.set_master_comp_attack(edit.attack_ms, now),
+            },
+            commands,
+            changed,
+        );
+        Self::keep(
+            match id {
+                Some(id) => self.picker.set_strip_comp_release(id, edit.release_ms, now),
+                None => self.picker.set_master_comp_release(edit.release_ms, now),
+            },
+            commands,
+            changed,
+        );
+        Self::keep(
+            match id {
+                Some(id) => self.picker.set_strip_comp_makeup(id, edit.makeup_db, now),
+                None => self.picker.set_master_comp_makeup(edit.makeup_db, now),
+            },
+            commands,
+            changed,
+        );
+    }
+
+    fn note_chain(
+        &mut self,
+        edit: &ui::ChainEdit,
+        now: Instant,
+        commands: &mut Vec<EffectCommand>,
+        changed: &mut bool,
+    ) {
+        for (index, bypass) in edit.bypass.iter().enumerate() {
+            Self::keep(
+                self.picker.set_chain_bypass(index, *bypass, now),
+                commands,
+                changed,
+            );
+        }
+        if let Some(index) = edit.move_up {
+            Self::keep(
+                self.picker.move_chain_block(index, -1, now),
+                commands,
+                changed,
+            );
+        }
+        if let Some(index) = edit.move_down {
+            Self::keep(
+                self.picker.move_chain_block(index, 1, now),
+                commands,
+                changed,
+            );
+        }
+    }
+
+    fn submit_effect(&self, command: EffectCommand) {
+        let engine_command = match command {
+            EffectCommand::StripEq { id, update } => {
+                let Some(slot) = self.slot_for(id) else {
+                    return;
+                };
+                EngineCommand::SetStripEq { slot, update }
+            }
+            EffectCommand::MasterEq(update) => EngineCommand::SetMasterEq(update),
+            EffectCommand::StripComp { id, update } => {
+                let Some(slot) = self.slot_for(id) else {
+                    return;
+                };
+                EngineCommand::SetStripComp { slot, update }
+            }
+            EffectCommand::MasterComp(update) => EngineCommand::SetMasterComp(update),
+            EffectCommand::Chain(chain) => EngineCommand::SetMasterChain(chain),
+        };
+        self.audio.submit(engine_command);
     }
 
     fn meters_for(&self, id: u64) -> StripMeters {
@@ -194,6 +415,11 @@ impl Audio {
                     master_peak: snap.master_peak,
                     master_rms: snap.master_rms,
                     strips: snap.strips,
+                    strip_gr: snap.strip_gr,
+                    strip_slots: snap.strip_slots,
+                    master_gr: snap.master_gr,
+                    sample_rate: snap.sample_rate,
+                    quantum: snap.quantum,
                     catalog: snap.catalog,
                     default_source: snap.default_source,
                     catalog_ready: snap.catalog_ready,
@@ -203,6 +429,11 @@ impl Audio {
                 master_peak: f32::NEG_INFINITY,
                 master_rms: f32::NEG_INFINITY,
                 strips: Vec::new(),
+                strip_gr: Vec::new(),
+                strip_slots: Vec::new(),
+                master_gr: 0.0,
+                sample_rate: 0,
+                quantum: 0,
                 catalog: Vec::new(),
                 default_source: None,
                 catalog_ready: false,
@@ -219,6 +450,14 @@ impl Audio {
                     .command_sender()
                     .submit(EngineCommand::ReplaceScene(Box::new(scene.clone())));
             }
+        }
+    }
+
+    fn submit(&self, command: EngineCommand) {
+        match self {
+            #[cfg(feature = "pipewire")]
+            Audio::Live(engine) => engine.command_sender().submit(command),
+            Audio::Idle { engine, .. } => engine.command_sender().submit(command),
         }
     }
 
@@ -244,6 +483,7 @@ impl eframe::App for WindowHost {
         self.sync_levels(dt);
         self.save_if_due(now);
         let mut changed = false;
+        let mut commands = Vec::new();
         let ctx = ui.ctx().clone();
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -318,7 +558,13 @@ impl eframe::App for WindowHost {
                             };
                             let id = strip.id.0;
                             let meters = self.meters_for(id);
-                            let edit = ui::strip_panel(ui, &strip, &meters);
+                            let edit = ui::strip_panel(
+                                ui,
+                                &strip,
+                                &meters,
+                                self.reduction_for(id),
+                                self.rate(),
+                            );
                             if edit.remove {
                                 remove_id = Some(id);
                             }
@@ -334,25 +580,42 @@ impl eframe::App for WindowHost {
                             if self.picker.set_solo(id, edit.solo, now) {
                                 changed = true;
                             }
+                            self.note_eq(Some(id), &edit.eq, now, &mut commands, &mut changed);
+                            self.note_comp(Some(id), &edit.comp, now, &mut commands, &mut changed);
                         }
                         if let Some(id) = remove_id
                             && self.picker.remove(id, now)
                         {
                             changed = true;
                         }
-                        let master = ui::master_panel(
-                            ui,
-                            self.picker.scene().master.fader_db(),
-                            &self.master,
-                        );
-                        if self.picker.set_master_fader(master, now) {
+                        let sample_rate = self.rate();
+                        let latency_ms = self.picker.latency_ms(self.sample_rate, self.quantum);
+                        let master_view = ui::MasterView {
+                            fader_db: self.picker.scene().master.fader_db(),
+                            meters: &self.master,
+                            eq_enabled: self.picker.scene().master.eq_enabled,
+                            eq: self.picker.scene().master.eq,
+                            comp: self.picker.scene().master.comp,
+                            chain: &self.picker.scene().master.chain,
+                            reduction_db: self.master_gr,
+                            latency_ms,
+                            sample_rate,
+                        };
+                        let master = ui::master_panel(ui, master_view);
+                        if self.picker.set_master_fader(master.fader_db, now) {
                             changed = true;
                         }
+                        self.note_eq(None, &master.eq, now, &mut commands, &mut changed);
+                        self.note_comp(None, &master.comp, now, &mut commands, &mut changed);
+                        self.note_chain(&master.chain, now, &mut commands, &mut changed);
                     });
                 });
             });
         });
         if changed {
+            for command in commands {
+                self.submit_effect(command);
+            }
             self.push_scene();
         }
         ctx.request_repaint_after(Duration::from_millis(33));

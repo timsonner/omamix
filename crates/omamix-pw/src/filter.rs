@@ -11,9 +11,9 @@ use std::ptr::{self, NonNull};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
-use omamix_core::comp::{CompReader, CompUpdate, CompWriter, open as open_comp};
+use omamix_core::comp::{CompReader, CompSettings, CompUpdate, CompWriter, open as open_comp};
 use omamix_core::effect::{ChainReader, ChainWriter, MasterChain, open as open_chain};
-use omamix_core::eq::{EqReader, EqUpdate, EqWriter, open};
+use omamix_core::eq::{EqReader, EqSettings, EqUpdate, EqWriter, open};
 use omamix_core::limit::{
     LIMIT_LOOKAHEAD_DEFAULT_MS, LimitReader, LimitSettings, LimitUpdate, LimitWriter,
     open as open_limit,
@@ -714,34 +714,58 @@ impl MixFilter {
         applied.accepted()
     }
 
-    pub(crate) fn apply_saved_eq(
-        &mut self,
-        slot: u16,
-        settings: omamix_core::eq::EqSettings,
-    ) -> bool {
-        self.eq.apply_settings(slot, settings)
-    }
-
-    pub(crate) fn apply_saved_comp(
-        &mut self,
-        slot: u16,
-        settings: omamix_core::comp::CompSettings,
-    ) -> bool {
-        self.comp.apply_settings(slot, settings)
-    }
-
-    pub(crate) fn apply_saved_master_eq(&mut self, settings: omamix_core::eq::EqSettings) {
-        self.eq.apply_master_settings(settings);
-    }
-
-    pub(crate) fn apply_saved_master_comp(&mut self, settings: omamix_core::comp::CompSettings) {
-        self.comp.apply_master_settings(settings);
-    }
-
     pub(crate) fn apply_saved_master_limit(&mut self, settings: omamix_core::limit::LimitSettings) {
         self.limit.apply_master_settings(settings);
         self.log_recorded_demotions();
         self.note_process_latency();
+    }
+
+    pub(crate) fn sync_strip_eq(&mut self, slot: u16, enabled: bool, settings: EqSettings) {
+        let Some(current) = self.eq.settings(slot as usize) else {
+            return;
+        };
+        let Some(next) = omamix_core::eq::audible_if_changed(current, enabled, settings) else {
+            return;
+        };
+        let _ = self.eq.apply_settings(slot, next);
+    }
+
+    pub(crate) fn sync_master_eq(&mut self, enabled: bool, settings: EqSettings) {
+        let Some(next) =
+            omamix_core::eq::audible_if_changed(self.eq.master_settings(), enabled, settings)
+        else {
+            return;
+        };
+        self.eq.apply_master_settings(next);
+    }
+
+    pub(crate) fn sync_strip_comp(&mut self, slot: u16, settings: CompSettings) {
+        let Some(current) = self.comp.settings(slot as usize) else {
+            return;
+        };
+        if omamix_core::comp::same_controls(current, settings) {
+            return;
+        }
+        let _ = self.comp.apply_settings(slot, settings);
+    }
+
+    pub(crate) fn sync_master_comp(&mut self, settings: CompSettings) {
+        if omamix_core::comp::same_controls(self.comp.master_settings(), settings) {
+            return;
+        }
+        self.comp.apply_master_settings(settings);
+    }
+
+    pub(crate) fn strip_reduction(&self, slot: usize) -> f32 {
+        self.comp.gain_reduction_db(slot)
+    }
+
+    pub(crate) fn master_reduction(&self) -> f32 {
+        self.comp.master_gain_reduction_db()
+    }
+
+    pub(crate) fn graph_quantum(&self) -> u32 {
+        self.limit.callback_quantum()
     }
 
     /// Publish chain order, bypass, and gain. Does not rewrite compressor

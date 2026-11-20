@@ -19,9 +19,10 @@ pub use engine::{HeadlessOptions, WindowEngine, run_headless, run_list};
 
 use std::fmt;
 
-use omamix_core::comp::{CompWriter, open as open_comp};
-use omamix_core::effect::{ChainWriter, open as open_chain};
-use omamix_core::eq::{EqWriter, open};
+use omamix_core::comp::{self, CompWriter, open as open_comp};
+use omamix_core::effect::{ChainWriter, MasterChain, open as open_chain};
+use omamix_core::eq::{self, EqWriter, open};
+use omamix_core::graph::Scene;
 use omamix_core::limit::{LimitWriter, open as open_limit};
 use omamix_core::params::StripParamBank;
 
@@ -86,26 +87,59 @@ impl NullEngine {
                     self.limit.apply_master(update);
                 }
                 EngineCommand::SetMasterChain(chain) => {
-                    if let Some(mut settings) = chain.compressor_settings() {
-                        settings.set_sample_rate(self.comp.sample_rate());
-                        if settings != self.comp.master_settings() {
-                            self.comp.apply_master_settings(settings);
-                        }
-                    }
-                    if let Some(mut settings) = chain.limiter_settings() {
-                        settings.set_sample_rate(self.limit.sample_rate());
-                        if settings != self.limit.master_settings() {
-                            self.limit.apply_master_settings(settings);
-                        }
-                    }
-                    self.chain.publish(&chain);
+                    self.apply_chain(&chain);
                 }
                 EngineCommand::ReplaceScene(scene) => {
-                    self.chain.publish(&scene.master.chain);
+                    self.apply_scene(&scene);
                 }
             }
         }
         Ok(())
+    }
+
+    fn apply_chain(&mut self, chain: &MasterChain) {
+        if let Some(mut settings) = chain.compressor_settings() {
+            settings.set_sample_rate(self.comp.sample_rate());
+            if !comp::same_controls(settings, self.comp.master_settings()) {
+                self.comp.apply_master_settings(settings);
+            }
+        }
+        if let Some(mut settings) = chain.limiter_settings() {
+            settings.set_sample_rate(self.limit.sample_rate());
+            if settings != self.limit.master_settings() {
+                self.limit.apply_master_settings(settings);
+            }
+        }
+        self.chain.publish(chain);
+    }
+
+    fn apply_scene(&mut self, scene: &Scene) {
+        for (index, strip) in scene.strips.iter().enumerate() {
+            let Ok(slot) = u16::try_from(index) else {
+                continue;
+            };
+            if let Some(current) = self.eq.settings(index)
+                && let Some(next) = eq::audible_if_changed(current, strip.eq_enabled, strip.eq)
+            {
+                let _ = self.eq.apply_settings(slot, next);
+            }
+            if let Some(current) = self.comp.settings(index)
+                && !comp::same_controls(current, strip.comp)
+            {
+                let _ = self.comp.apply_settings(slot, strip.comp);
+            }
+        }
+        if let Some(next) = eq::audible_if_changed(
+            self.eq.master_settings(),
+            scene.master.eq_enabled,
+            scene.master.eq,
+        ) {
+            self.eq.apply_master_settings(next);
+        }
+        if !comp::same_controls(self.comp.master_settings(), scene.master.comp) {
+            self.comp.apply_master_settings(scene.master.comp);
+        }
+        self.apply_chain(&scene.master.chain);
     }
 
     pub fn is_shut_down(&self) -> bool {
@@ -274,5 +308,54 @@ mod tests {
         assert!((engine.limit().master_settings().lookahead_ms() - 5.0).abs() < 1.0e-5);
         engine.drive().unwrap();
         assert!((engine.limit().master_settings().lookahead_ms() - 20.0).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn replace_scene_publishes_an_enabled_eq_and_a_disabled_eq_stays_flat() {
+        use omamix_core::graph::{Scene, Strip};
+        use omamix_core::route::SourceKind;
+
+        let mut engine = NullEngine::new();
+        let flat = Scene::empty("window");
+        engine
+            .command_sender()
+            .submit(EngineCommand::ReplaceScene(Box::new(flat)));
+        engine.drive().unwrap();
+        assert_eq!(engine.eq().master_settings().band_db(), [0.0; 10]);
+        assert!(!engine.comp().master_settings().enabled());
+
+        let mut scene = Scene::empty("window");
+        let mut strip = Strip::new(1, "mic", SourceKind::DefaultSource);
+        strip.eq_enabled = true;
+        assert!(strip.eq.set_band(3, 4.5));
+        strip.comp.set_enabled(true);
+        strip.comp.set_threshold_db(-30.0);
+        scene.strips.push(strip);
+        scene.master.eq_enabled = true;
+        assert!(scene.master.eq.set_band(0, -3.0));
+        scene.master.comp.set_enabled(true);
+        scene.master.sync_chain_params();
+        engine
+            .command_sender()
+            .submit(EngineCommand::ReplaceScene(Box::new(scene)));
+        engine.drive().unwrap();
+        assert!((engine.eq().settings(0).unwrap().band_db()[3] - 4.5).abs() < 1.0e-5);
+        assert!(engine.comp().settings(0).unwrap().enabled());
+        assert!((engine.comp().settings(0).unwrap().threshold_db() - (-30.0)).abs() < 1.0e-4);
+        assert!((engine.eq().master_settings().band_db()[0] - (-3.0)).abs() < 1.0e-5);
+        assert!(engine.comp().master_settings().enabled());
+
+        let mut off = Scene::empty("window");
+        let mut strip = Strip::new(1, "mic", SourceKind::DefaultSource);
+        assert!(strip.eq.set_band(3, 4.5));
+        off.strips.push(strip);
+        assert!(off.master.eq.set_band(0, -3.0));
+        engine
+            .command_sender()
+            .submit(EngineCommand::ReplaceScene(Box::new(off)));
+        engine.drive().unwrap();
+        assert_eq!(engine.eq().settings(0).unwrap().band_db(), [0.0; 10]);
+        assert_eq!(engine.eq().master_settings().band_db(), [0.0; 10]);
+        assert!(!engine.comp().settings(0).unwrap().enabled());
     }
 }

@@ -339,7 +339,7 @@ fn run_gui() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("omamix")
-            .with_inner_size([1100.0, 640.0]),
+            .with_inner_size([1440.0, 980.0]),
         ..Default::default()
     };
     let host = window::WindowHost::new(scene, scene_path);

@@ -36,16 +36,13 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use omamix_core::comp::{
-    COMP_ATTACK_DEFAULT_MS, COMP_KNEE_DEFAULT_DB, COMP_MAKEUP_DEFAULT_DB, COMP_RATIO_DEFAULT,
-    COMP_RELEASE_DEFAULT_MS, COMP_THRESHOLD_DEFAULT_DB, CompSettings, CompUpdate,
-};
+use omamix_core::comp::CompUpdate;
 use omamix_core::effect::MasterChain;
-use omamix_core::eq::{EqSettings, EqUpdate, HPF_DEFAULT_HZ};
+use omamix_core::eq::EqUpdate;
 use omamix_core::graph::{MasterBus, Scene, Strip};
 use omamix_core::limit::{
     LIMIT_CEILING_DEFAULT_DB, LIMIT_LOOKAHEAD_DEFAULT_MS, LIMIT_LOOKAHEAD_MAX_MS,
@@ -138,6 +135,16 @@ pub struct WindowSnapshot {
     pub master_peak: f32,
     pub master_rms: f32,
     pub strips: Vec<(u64, f32, f32)>,
+    /// Block-minimum gain reduction per strip id, in dB. 0 is no reduction.
+    pub strip_gr: Vec<(u64, f32)>,
+    /// Master compressor gain reduction, in dB.
+    pub master_gr: f32,
+    /// Callback rate. 0 until the first process.
+    pub sample_rate: u32,
+    /// Callback quantum. 0 until the first process.
+    pub quantum: u32,
+    /// Tap slot for a strip id, when the filter has claimed one.
+    pub strip_slots: Vec<(u64, u16)>,
 }
 
 struct WindowView {
@@ -149,6 +156,11 @@ struct WindowView {
     master_peak: Mutex<f32>,
     master_rms: Mutex<f32>,
     strips: Mutex<Vec<(u64, f32, f32)>>,
+    strip_gr: Mutex<Vec<(u64, f32)>>,
+    master_gr: Mutex<f32>,
+    sample_rate: AtomicU32,
+    quantum: AtomicU32,
+    strip_slots: Mutex<Vec<(u64, u16)>>,
 }
 
 impl WindowView {
@@ -162,6 +174,11 @@ impl WindowView {
             master_peak: Mutex::new(f32::NEG_INFINITY),
             master_rms: Mutex::new(f32::NEG_INFINITY),
             strips: Mutex::new(Vec::new()),
+            strip_gr: Mutex::new(Vec::new()),
+            master_gr: Mutex::new(0.0),
+            sample_rate: AtomicU32::new(0),
+            quantum: AtomicU32::new(0),
+            strip_slots: Mutex::new(Vec::new()),
         }
     }
 
@@ -181,6 +198,11 @@ impl WindowView {
         *lock_mutex(&self.master_peak) = snap.master_peak;
         *lock_mutex(&self.master_rms) = snap.master_rms;
         *lock_mutex(&self.strips) = snap.strips;
+        *lock_mutex(&self.strip_gr) = snap.strip_gr;
+        *lock_mutex(&self.master_gr) = snap.master_gr;
+        self.sample_rate.store(snap.sample_rate, Ordering::Relaxed);
+        self.quantum.store(snap.quantum, Ordering::Relaxed);
+        *lock_mutex(&self.strip_slots) = snap.strip_slots;
     }
 }
 
@@ -206,6 +228,11 @@ impl WindowEngine {
             master_peak: *lock_mutex(&self.view.master_peak),
             master_rms: *lock_mutex(&self.view.master_rms),
             strips: lock_mutex(&self.view.strips).clone(),
+            strip_gr: lock_mutex(&self.view.strip_gr).clone(),
+            master_gr: *lock_mutex(&self.view.master_gr),
+            sample_rate: self.view.sample_rate.load(Ordering::Relaxed),
+            quantum: self.view.quantum.load(Ordering::Relaxed),
+            strip_slots: lock_mutex(&self.view.strip_slots).clone(),
         }
     }
 
@@ -1099,36 +1126,73 @@ fn publish_view(shared: &LoopShared, filter: &RefCell<Option<MixFilter>>) {
     let default_source = resolved_default_name(&inner);
     let ready = inner.settle_round >= 3;
     let published = inner.published;
-    let (master_peak, master_rms, strips) = if let Some(engine) = filter.borrow().as_ref() {
-        let audio = engine.shared();
-        let mut best: HashMap<u64, (f32, f32)> = HashMap::new();
-        for (peer, tap) in &inner.taps {
-            let Some(slot) = tap.slot else {
-                continue;
-            };
-            let Some(strip) = strip_for_peer(&inner, *peer) else {
-                continue;
-            };
-            let (peak, rms) = audio.strip_meters.load(slot);
-            let entry = best
-                .entry(strip.id.0)
-                .or_insert((f32::NEG_INFINITY, f32::NEG_INFINITY));
-            if peak > entry.0 {
-                entry.0 = peak;
+    let (master_peak, master_rms, strips, strip_gr, master_gr, sample_rate, quantum, strip_slots) =
+        if let Some(engine) = filter.borrow().as_ref() {
+            let audio = engine.shared();
+            let mut best: HashMap<u64, (f32, f32)> = HashMap::new();
+            let mut reductions: HashMap<u64, f32> = HashMap::new();
+            let mut slots: HashMap<u64, u16> = HashMap::new();
+            for (peer, tap) in &inner.taps {
+                let Some(slot) = tap.slot else {
+                    continue;
+                };
+                let Some(strip) = strip_for_peer(&inner, *peer) else {
+                    continue;
+                };
+                let (peak, rms) = audio.strip_meters.load(slot);
+                let entry = best
+                    .entry(strip.id.0)
+                    .or_insert((f32::NEG_INFINITY, f32::NEG_INFINITY));
+                if peak > entry.0 {
+                    entry.0 = peak;
+                }
+                if rms > entry.1 {
+                    entry.1 = rms;
+                }
+                let reduction = engine.strip_reduction(slot);
+                let gr = reductions.entry(strip.id.0).or_insert(0.0);
+                if reduction < *gr {
+                    *gr = reduction;
+                }
+                if let Ok(slot) = u16::try_from(slot) {
+                    slots.entry(strip.id.0).or_insert(slot);
+                }
             }
-            if rms > entry.1 {
-                entry.1 = rms;
+            let mut strips = Vec::new();
+            for (id, (peak, rms)) in best {
+                strips.push((id, peak, rms));
             }
-        }
-        let mut strips = Vec::new();
-        for (id, (peak, rms)) in best {
-            strips.push((id, peak, rms));
-        }
-        let (master_peak, master_rms) = audio.meter.load();
-        (master_peak, master_rms, strips)
-    } else {
-        (f32::NEG_INFINITY, f32::NEG_INFINITY, Vec::new())
-    };
+            let mut strip_gr = Vec::new();
+            for (id, gr) in reductions {
+                strip_gr.push((id, gr));
+            }
+            let mut strip_slots = Vec::new();
+            for (id, slot) in slots {
+                strip_slots.push((id, slot));
+            }
+            let (master_peak, master_rms) = audio.meter.load();
+            (
+                master_peak,
+                master_rms,
+                strips,
+                strip_gr,
+                engine.master_reduction(),
+                audio.observed_rate.load(Ordering::Relaxed),
+                engine.graph_quantum(),
+                strip_slots,
+            )
+        } else {
+            (
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                Vec::new(),
+                Vec::new(),
+                0.0,
+                0,
+                0,
+                Vec::new(),
+            )
+        };
     drop(inner);
     view.publish(WindowSnapshot {
         catalog,
@@ -1139,6 +1203,11 @@ fn publish_view(shared: &LoopShared, filter: &RefCell<Option<MixFilter>>) {
         master_peak,
         master_rms,
         strips,
+        strip_gr,
+        master_gr,
+        sample_rate,
+        quantum,
+        strip_slots,
     });
 }
 
@@ -1215,11 +1284,11 @@ fn drain_commands(
     for command in commands {
         match command {
             EngineCommand::ReplaceScene(scene) => {
-                let chain = scene.master.chain;
+                let master = scene.master.clone();
                 shared.inner.borrow_mut().scene = *scene;
                 reapply_strip_controls(shared, filter);
                 if let Some(filter) = filter.borrow_mut().as_mut() {
-                    filter.publish_chain(&chain);
+                    apply_saved_master(filter, &master);
                 }
             }
             other => {
@@ -1249,8 +1318,8 @@ fn reapply_strip_controls(shared: &LoopShared, filter: &RefCell<Option<MixFilter
         }
         (inner.scene.master.fader_db(), pairs)
     };
-    let borrowed = filter.borrow();
-    let Some(engine) = borrowed.as_ref() else {
+    let mut borrowed = filter.borrow_mut();
+    let Some(engine) = borrowed.as_mut() else {
         return;
     };
     engine.shared().params.set_master_db(master_db);
@@ -1259,7 +1328,7 @@ fn reapply_strip_controls(shared: &LoopShared, filter: &RefCell<Option<MixFilter
     }
 }
 
-fn apply_live_strip(engine: &MixFilter, strip: &Strip, slot: usize) {
+fn apply_live_strip(engine: &mut MixFilter, strip: &Strip, slot: usize) {
     let Ok(slot) = u16::try_from(slot) else {
         return;
     };
@@ -1276,6 +1345,8 @@ fn apply_live_strip(engine: &MixFilter, strip: &Strip, slot: usize) {
     let _ = bank
         .strips
         .apply(slot, StripParamUpdate::Enabled(strip.enabled));
+    engine.sync_strip_eq(slot, strip.eq_enabled, strip.eq);
+    engine.sync_strip_comp(slot, strip.comp);
 }
 
 fn apply_event(shared: &Rc<LoopShared>, event: Pending) {
@@ -2661,24 +2732,16 @@ fn apply_saved_strip(engine: &mut MixFilter, strip: &Strip, slot: usize) {
     if !strip.enabled {
         let _ = bank.strips.apply(slot, StripParamUpdate::Enabled(false));
     }
-    if !eq_is_flat(strip.eq) {
-        let _ = engine.apply_saved_eq(slot, strip.eq);
-    }
-    if !comp_is_bypass(strip.comp) {
-        let _ = engine.apply_saved_comp(slot, strip.comp);
-    }
+    engine.sync_strip_eq(slot, strip.eq_enabled, strip.eq);
+    engine.sync_strip_comp(slot, strip.comp);
 }
 
 fn apply_saved_master(engine: &mut MixFilter, master: &MasterBus) {
     if master.fader_db() != 0.0 {
         engine.shared().params.set_master_db(master.fader_db());
     }
-    if !eq_is_flat(master.eq) {
-        engine.apply_saved_master_eq(master.eq);
-    }
-    if !comp_is_bypass(master.comp) {
-        engine.apply_saved_master_comp(master.comp);
-    }
+    engine.sync_master_eq(master.eq_enabled, master.eq);
+    engine.sync_master_comp(master.comp);
     let mut limit = master.limit;
     if limit.enabled() != master.limiter_enabled {
         limit.set_enabled(master.limiter_enabled);
@@ -2690,22 +2753,6 @@ fn apply_saved_master(engine: &mut MixFilter, master: &MasterBus) {
         engine.apply_saved_master_limit(limit);
     }
     engine.publish_chain(&master.chain);
-}
-
-fn eq_is_flat(settings: EqSettings) -> bool {
-    !settings.hpf_enabled()
-        && settings.hpf_hz() == HPF_DEFAULT_HZ
-        && settings.band_db().iter().all(|band| *band == 0.0)
-}
-
-fn comp_is_bypass(settings: CompSettings) -> bool {
-    !settings.enabled()
-        && settings.threshold_db() == COMP_THRESHOLD_DEFAULT_DB
-        && settings.ratio() == COMP_RATIO_DEFAULT
-        && settings.attack_ms() == COMP_ATTACK_DEFAULT_MS
-        && settings.release_ms() == COMP_RELEASE_DEFAULT_MS
-        && settings.knee_db() == COMP_KNEE_DEFAULT_DB
-        && settings.makeup_db() == COMP_MAKEUP_DEFAULT_DB
 }
 
 fn limit_is_factory(settings: LimitSettings) -> bool {
