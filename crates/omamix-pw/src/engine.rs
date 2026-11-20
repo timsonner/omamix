@@ -1179,9 +1179,9 @@ fn sync_limit_rate(filter: &RefCell<Option<MixFilter>>) {
 
 /// Apply the callback quantum to the master 0 ms cap.
 ///
-/// The audio callback only stores the frame count. This runs on the loop
-/// thread from the 50 ms engine timer, then publishes port latency if a
-/// shorter quantum demoted the master.
+/// The audio callback stores the frame count and the rate. This runs on the
+/// loop thread from the 50 ms engine timer and publishes ProcessLatency and
+/// port Latency for the delay that callback is applying.
 fn sync_limit_quantum(filter: &RefCell<Option<MixFilter>>) {
     let mut borrowed = filter.borrow_mut();
     let Some(filter) = borrowed.as_mut() else {

@@ -709,8 +709,8 @@ impl MixFilter {
         applied
     }
 
-    /// Copy the callback quantum into the 0 ms cap and publish latency if
-    /// that quantum demoted the master.
+    /// Copy the callback quantum into the 0 ms cap and publish the delay
+    /// the callback is applying.
     pub(crate) fn sync_limit_quantum(&mut self) {
         let frames = self.limit.callback_quantum();
         if frames == 0 {
@@ -718,8 +718,8 @@ impl MixFilter {
         }
         if self.limit.set_processing_quantum(frames) {
             self.log_recorded_demotions();
-            self.note_process_latency();
         }
+        self.note_process_latency();
     }
 
     fn log_recorded_demotions(&mut self) {
@@ -828,7 +828,8 @@ impl MixFilter {
         }
     }
 
-    /// Samples of lookahead in the mix. A bypassed master counts as 0.
+    /// Samples of delay in the mix at the callback rate and quantum.
+    /// A bypassed master counts as 0.
     pub fn reported_latency_samples(&self) -> u32 {
         self.limit.reported_latency_samples()
     }
@@ -2391,5 +2392,100 @@ mod tests {
         }));
         assert_eq!(filter.limit.master_settings().lookahead_ms(), 5.0);
         assert!(filter.limit.master_cap_demoted());
+    }
+
+    fn five_ms_samples(rate: u32) -> u32 {
+        match rate {
+            44_100 => 221,
+            48_000 => 240,
+            96_000 => 480,
+            _ => panic!("unexpected rate {rate}"),
+        }
+    }
+
+    fn expected_applied_delay(rate: u32, quantum: u32, ms: f32) -> u32 {
+        let five_ms = five_ms_samples(rate);
+        assert_eq!(
+            omamix_core::limit::lookahead_samples(
+                rate,
+                omamix_core::limit::LIMIT_LOOKAHEAD_DEFAULT_MS
+            ),
+            five_ms
+        );
+        if ms == 0.0 && omamix_core::limit::zero_ms_limiter_cap(rate, quantum) == 0 {
+            five_ms
+        } else if ms == 0.0 {
+            0
+        } else {
+            five_ms
+        }
+    }
+
+    fn impulse_delay(shared: &ProcessShared, rate: u32, quantum: u32) -> u32 {
+        let quantum = quantum.max(1) as usize;
+        let room = omamix_core::limit::lookahead_samples(
+            rate,
+            omamix_core::limit::LIMIT_LOOKAHEAD_DEFAULT_MS,
+        ) as usize
+            + 1;
+        let frames = room.div_ceil(quantum) * quantum;
+        let mut src_l = vec![0.0f32; frames];
+        let mut src_r = vec![0.0f32; frames];
+        src_l[0] = 0.05;
+        src_r[0] = 0.05;
+        let mut out_l = vec![0.0f32; frames];
+        let mut out_r = vec![0.0f32; frames];
+        let mut offset = 0;
+        while offset < frames {
+            let end = offset + quantum;
+            let inputs = [Some(StripBlockInput {
+                left: &src_l[offset..end],
+                right: &src_r[offset..end],
+            })];
+            mix_resolved_strips(
+                shared,
+                &inputs,
+                &mut out_l[offset..end],
+                &mut out_r[offset..end],
+                (end - offset) as u32,
+                rate,
+                1,
+            );
+            offset = end;
+        }
+        out_l
+            .iter()
+            .position(|sample| sample.abs() > 0.02)
+            .unwrap_or(frames) as u32
+    }
+
+    #[test]
+    fn published_process_and_port_latency_match_the_applied_delay() {
+        for rate in [44_100u32, 48_000, 96_000] {
+            for quantum in [1u32, 64, 256, 1024] {
+                for ms in [0.0f32, omamix_core::limit::LIMIT_LOOKAHEAD_DEFAULT_MS] {
+                    let mut filter = MixFilter::without_filter();
+                    assert!(
+                        filter.apply_master_limit(omamix_core::limit::LimitUpdate::LookaheadMs(ms))
+                    );
+                    let applied = impulse_delay(&filter.shared(), rate, quantum);
+                    let expect = expected_applied_delay(rate, quantum, ms);
+                    assert_eq!(
+                        applied, expect,
+                        "applied delay at {rate} Hz, quantum {quantum}, lookahead {ms} ms"
+                    );
+                    assert_eq!(filter.reported_latency_samples(), applied);
+                    assert!(filter.set_limit_rate(rate));
+                    filter.sync_limit_quantum();
+                    assert_eq!(filter.reported_latency_samples(), applied);
+                    assert_eq!(filter.input_latency_written, Some(applied));
+                    assert_eq!(filter.output_latency_written, Some(applied));
+                    assert_eq!(
+                        filter.latency_queued.map(|(samples, _)| samples),
+                        Some(applied)
+                    );
+                }
+            }
+        }
     }
 }

@@ -187,19 +187,63 @@ def first_rate(node):
                 return item.get("rate")
     return None
 
+def param_items(obj, key):
+    blob = params(obj)
+    if isinstance(blob, dict):
+        return blob.get(key) or []
+    if isinstance(blob, list):
+        return [item for item in blob if isinstance(item, dict) and item.get("id") == key]
+    return []
+
 def process_latency(data):
     for obj in nodes(data):
         name = props(obj).get("node.name") or ""
-        blob = params(obj)
-        items = []
-        if isinstance(blob, dict):
-            items = blob.get("ProcessLatency") or []
-        elif isinstance(blob, list):
-            items = [item for item in blob if isinstance(item, dict) and item.get("id") == "ProcessLatency"]
-        for item in items:
+        for item in param_items(obj, "ProcessLatency"):
             if isinstance(item, dict) and "rate" in item:
                 return name, item.get("rate")
     return None, None
+
+def process_latency_of(data, name):
+    node = find_name(data, name)
+    if node is None:
+        return None
+    for item in param_items(node, "ProcessLatency"):
+        if isinstance(item, dict) and "rate" in item:
+            return item.get("rate")
+    return None
+
+def latency_rate(item):
+    if not isinstance(item, dict):
+        return None
+    for key in ("maxRate", "minRate", "rate"):
+        if item.get(key) not in (None,):
+            return item.get(key)
+    return None
+
+def port_latency_rows(data, node_id):
+    rows = []
+    if node_id is None:
+        return rows
+    for obj in ports(data):
+        p = props(obj)
+        if str(p.get("node.id")) != str(node_id):
+            continue
+        port_direction = p.get("port.direction")
+        for item in param_items(obj, "Latency"):
+            rate = latency_rate(item)
+            if rate is None or not isinstance(item, dict):
+                continue
+            rows.append((port_direction, item.get("direction"), rate))
+    return rows
+
+def same_direction_rates(rows):
+    found = []
+    for port_direction, lat_direction, rate in rows:
+        if port_direction == "out" and lat_direction == "Output":
+            found.append(rate)
+        elif port_direction == "in" and lat_direction == "Input":
+            found.append(rate)
+    return found
 
 rec = subprocess.Popen(
     [
@@ -302,8 +346,16 @@ if in_fr is not None:
 time.sleep(0.6)
 data = dump()
 mix = find_name(data, "omamix.mix-mic")
+engine_node = find_name(data, "omamix.mix-engine")
 node_rate = first_rate(mix)
 lat_name, lat_rate = process_latency(data)
+engine_lat = process_latency_of(data, "omamix.mix-engine")
+mic_lat = process_latency_of(data, "omamix.mix-mic")
+engine_rows = port_latency_rows(data, None if engine_node is None else engine_node.get("id"))
+mic_rows = port_latency_rows(data, None if mix is None else mix.get("id"))
+engine_ports = [rate for _port_direction, _lat_direction, rate in engine_rows]
+mic_ports = [rate for _port_direction, _lat_direction, rate in mic_rows]
+engine_same = same_direction_rates(engine_rows)
 meta = sh("pw-metadata", "-r", socket, "-n", "settings", check=False).stdout
 open(os.path.join(work, "during.json"), "w").write(json.dumps(data))
 while alive(ompid):
@@ -324,6 +376,7 @@ teardown = "absent" if left is None and engine is None else "present"
 tone = "none"
 frames = 0
 file_rate = 0
+onset = None
 if os.path.isfile(wav) and os.path.getsize(wav) > 44:
     w = wave.open(wav, "rb")
     frames = w.getnframes()
@@ -343,34 +396,45 @@ if os.path.isfile(wav) and os.path.getsize(wav) > 44:
         scale = 1.0
     mono = [values[i] / scale for i in range(0, len(values), channels or 1)]
     loud = [i for i, sample in enumerate(mono) if abs(sample) >= 0.02]
+    onset = loud[0] if loud else None
     if len(loud) >= max(8, file_rate // 10):
         mono = mono[loud[0]:loud[-1] + 1]
         crosses = 0
+        sounding = 0
         for i in range(1, len(mono)):
+            if mono[i] == 0.0 or mono[i - 1] == 0.0:
+                continue
+            sounding += 1
             if mono[i - 1] < 0.0 <= mono[i]:
                 crosses += 1
-        if file_rate and mono:
-            tone = f"{crosses * file_rate / len(mono):.2f}"
+        if file_rate and sounding:
+            tone = f"{crosses * file_rate / sounding:.2f}"
 
 def meta_has(key, value):
     return f"{key}" in meta and str(value) in meta
 
 force_ok = meta_has("clock.force-rate", rate) and meta_has("clock.force-quantum", quantum)
-expect = int(round(rate * 0.005))
-lat_ok = lat_rate is not None and abs(int(lat_rate) - expect) <= 2
+expect = int(rate * 0.005 + 0.5)
+def exact(value):
+    return value is not None and int(value) == expect
+lat_ok = exact(engine_lat)
+port_ok = bool(engine_same) and all(exact(value) for value in engine_same)
 try:
     tone_ok = abs(float(tone) - 440.0) <= 5.0
 except ValueError:
     tone_ok = False
 rate_ok = node_rate is not None and int(node_rate) == rate
 tear_ok = teardown == "absent"
-passed = tone_ok and rate_ok and lat_ok and tear_ok and force_ok
+passed = tone_ok and rate_ok and lat_ok and port_ok and tear_ok and force_ok
 tag = "MEASURED" if tone != "none" or node_rate is not None else "UNVERIFIED"
 print(
     f"{tag} rate={rate} quantum={quantum} tone_hz={tone} node_rate={node_rate} "
     f"process_latency={lat_rate} process_latency_node={lat_name} "
+    f"engine_process_latency={engine_lat} mic_process_latency={mic_lat} "
+    f"engine_port_latency={engine_ports} engine_port_same={engine_same} mic_port_latency={mic_ports} "
+    f"expect_samples={expect} onset_samples={onset} applied_delay=UNVERIFIED "
     f"file_rate={file_rate} frames={frames} teardown={teardown} "
-    f"force_seen={int(force_ok)} pass={int(passed)}"
+    f"force_seen={int(force_ok)} port_ok={int(port_ok)} pass={int(passed)}"
 )
 sys.exit(0 if passed else 1)
 PY
@@ -391,7 +455,7 @@ PY
 }
 
 for rate in 44100 48000 96000; do
-  for quantum in 64 256 1024; do
+  for quantum in 32 64 256 1024; do
     if run_cell "$rate" "$quantum"; then
       :
     else
