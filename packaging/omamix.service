@@ -1,0 +1,12 @@
+[Unit]
+Description=omamix headless Mix Mic engine
+After=pipewire.service wireplumber.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/omamix --headless --mix-mic
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

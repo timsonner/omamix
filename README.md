@@ -87,7 +87,23 @@ Those feature tests build a local `pw_properties` object. They do not connect to
 bash scripts/prove.sh
 ```
 
-The Arch package is `omamix-git` ([`PKGBUILD`](PKGBUILD)). `build` runs `cargo build --frozen --release -p omamix --features pipewire` and `package` installs `/usr/bin/omamix`. Its `source` is the unpinned public GitHub repo.
+The Arch package is `omamix-git` ([`PKGBUILD`](PKGBUILD)). `build` runs `cargo build --frozen --release -p omamix --features pipewire` and `package` installs `/usr/bin/omamix`, a desktop entry, and a user systemd unit. Its `source` is the unpinned public GitHub repo.
+
+## Install and autostart
+
+On a machine where the package (or an equivalent install) placed `omamix` on `PATH` and installed `omamix.service` under `/usr/lib/systemd/user`, enable the headless Mix Mic engine at login:
+
+```sh
+systemctl --user enable --now omamix.service
+```
+
+The service runs `/usr/bin/omamix --headless --mix-mic`, which loads the saved scene from the XDG config path when no `--strips` are given. Disable and stop it with:
+
+```sh
+systemctl --user disable --now omamix.service
+```
+
+Do not run the GUI (`omamix` with no `--headless`) and this service together. Each PipeWire build publishes its own client and a virtual source named `omamix.mix-mic`. Two processes give two such sources, which makes recorders and default-source handling ambiguous. Use the service for always-on Mix Mic, or run the window alone when you want to edit the scene.
 
 ## Usage
 

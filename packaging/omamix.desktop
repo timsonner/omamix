@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=omamix
+GenericName=Live mixer
+Comment=PipeWire live mixer with a virtual Mix Mic source
+Exec=omamix
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;
