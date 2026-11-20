@@ -15,6 +15,7 @@ pub struct WindowHost {
     strips: Vec<(u64, StripMeters)>,
     strip_gr: Vec<(u64, f32)>,
     strip_slots: Vec<(u64, u16)>,
+    strip_muted: Vec<(u64, bool)>,
     master: StripMeters,
     master_gr: f32,
     sample_rate: u32,
@@ -39,6 +40,7 @@ struct LevelSnap {
     strips: Vec<(u64, f32, f32)>,
     strip_gr: Vec<(u64, f32)>,
     strip_slots: Vec<(u64, u16)>,
+    strip_muted: Vec<(u64, bool)>,
     master_gr: f32,
     sample_rate: u32,
     quantum: u32,
@@ -57,6 +59,7 @@ impl WindowHost {
             strips: Vec::new(),
             strip_gr: Vec::new(),
             strip_slots: Vec::new(),
+            strip_muted: Vec::new(),
             master: StripMeters::silent(),
             master_gr: 0.0,
             sample_rate: 0,
@@ -129,6 +132,7 @@ impl WindowHost {
         self.quantum = levels.quantum;
         self.strip_gr = levels.strip_gr;
         self.strip_slots = levels.strip_slots;
+        self.strip_muted = levels.strip_muted;
         for (id, display) in &mut self.strips {
             let (peak, rms) = levels
                 .strips
@@ -154,6 +158,12 @@ impl WindowHost {
             .iter()
             .find(|(have, _)| *have == id)
             .map(|(_, slot)| *slot)
+    }
+
+    fn source_muted(&self, id: u64) -> bool {
+        self.strip_muted
+            .iter()
+            .any(|(have, muted)| *have == id && *muted)
     }
 
     fn rate(&self) -> u32 {
@@ -417,6 +427,7 @@ impl Audio {
                     strips: snap.strips,
                     strip_gr: snap.strip_gr,
                     strip_slots: snap.strip_slots,
+                    strip_muted: snap.strip_muted,
                     master_gr: snap.master_gr,
                     sample_rate: snap.sample_rate,
                     quantum: snap.quantum,
@@ -431,6 +442,7 @@ impl Audio {
                 strips: Vec::new(),
                 strip_gr: Vec::new(),
                 strip_slots: Vec::new(),
+                strip_muted: Vec::new(),
                 master_gr: 0.0,
                 sample_rate: 0,
                 quantum: 0,
@@ -623,6 +635,7 @@ impl eframe::App for WindowHost {
                                 self.reduction_for(id),
                                 self.rate(),
                                 expand_strips,
+                                self.source_muted(id),
                             );
                             if edit.remove {
                                 remove_id = Some(id);

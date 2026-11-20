@@ -117,6 +117,7 @@ pub fn strip_panel(
     reduction_db: f32,
     sample_rate: u32,
     expand_effects: bool,
+    source_muted: bool,
 ) -> StripEdit {
     let mut edit = StripEdit {
         fader_db: strip.fader_db,
@@ -130,7 +131,7 @@ pub fn strip_panel(
     ui.group(|ui| {
         ui.set_min_width(STRIP_PANEL_MIN_WIDTH);
         ui.vertical(|ui| {
-            ui.strong(&strip.name);
+            strip_header(ui, &strip.name, source_muted);
             ui.label(source_label(&strip.source));
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -174,6 +175,34 @@ pub fn strip_panel(
         });
     });
     edit
+}
+
+fn strip_header(ui: &mut egui::Ui, name: &str, source_muted: bool) {
+    ui.horizontal(|ui| {
+        ui.set_min_height(22.0);
+        ui.strong(name);
+        ui.add_space(8.0);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(58.0, 16.0), egui::Sense::hover());
+        if source_muted {
+            paint_muted_badge(ui, rect);
+        }
+    });
+}
+
+fn paint_muted_badge(ui: &egui::Ui, rect: egui::Rect) {
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        egui::CornerRadius::same(3),
+        egui::Color32::from_rgb(148, 36, 40),
+    );
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "MUTED",
+        egui::FontId::proportional(12.0),
+        egui::Color32::from_rgb(255, 244, 236),
+    );
 }
 
 pub fn master_panel(ui: &mut egui::Ui, view: MasterView<'_>) -> MasterEdit {
