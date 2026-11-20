@@ -200,6 +200,38 @@ impl EqSettings {
     }
 }
 
+/// Block the mixer should publish for this switch.
+///
+/// Off is a flat block at the stored sample rate. The stored bands stay put.
+pub fn audible(enabled: bool, stored: EqSettings) -> EqSettings {
+    if enabled {
+        stored
+    } else {
+        EqSettings::flat(stored.sample_rate())
+    }
+}
+
+/// High-pass and band gains. Sample rate is not compared.
+pub fn same_controls(left: EqSettings, right: EqSettings) -> bool {
+    left.hpf_enabled() == right.hpf_enabled()
+        && left.hpf_hz() == right.hpf_hz()
+        && left.band_db() == right.band_db()
+}
+
+/// `Some` when [`audible`] differs from `current` in the controls above.
+pub fn audible_if_changed(
+    current: EqSettings,
+    enabled: bool,
+    stored: EqSettings,
+) -> Option<EqSettings> {
+    let next = audible(enabled, stored);
+    if same_controls(current, next) {
+        None
+    } else {
+        Some(next)
+    }
+}
+
 /// Pure magnitude, in dB, of `settings` at `freq_hz`.
 ///
 /// This is the curve the EQ widget draws. It does not read atomics and it
@@ -2006,5 +2038,22 @@ mod tests {
         let num = num_re * num_re + num_im * num_im;
         let den = den_re * den_re + den_im * den_im;
         10.0 * (num / den).log10()
+    }
+
+    #[test]
+    fn a_disabled_eq_publishes_flat_without_clearing_the_stored_bands() {
+        let mut hot = EqSettings::flat(48_000);
+        assert!(hot.set_band(1, 6.0));
+        hot.set_hpf_enabled(true);
+        let flat = audible(false, hot);
+        assert_eq!(flat.band_db(), [0.0; EQ_BANDS]);
+        assert!(!flat.hpf_enabled());
+        assert_eq!(hot.band_db()[1], 6.0);
+        assert!(same_controls(EqSettings::flat(44_100), flat));
+        assert!(audible_if_changed(EqSettings::flat(48_000), false, hot).is_none());
+        let next = audible_if_changed(EqSettings::flat(48_000), true, hot).unwrap();
+        assert_eq!(next.band_db()[1], 6.0);
+        assert!(next.hpf_enabled());
+        assert!(audible_if_changed(next, true, hot).is_none());
     }
 }

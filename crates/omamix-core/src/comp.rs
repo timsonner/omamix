@@ -246,6 +246,17 @@ impl CompSettings {
     }
 }
 
+/// Enable, threshold, ratio, times, knee, and makeup. Sample rate is ignored.
+pub fn same_controls(left: CompSettings, right: CompSettings) -> bool {
+    left.enabled() == right.enabled()
+        && left.threshold_db() == right.threshold_db()
+        && left.ratio() == right.ratio()
+        && left.attack_ms() == right.attack_ms()
+        && left.release_ms() == right.release_ms()
+        && left.knee_db() == right.knee_db()
+        && left.makeup_db() == right.makeup_db()
+}
+
 /// Gain reduction of one static level, in dB.
 ///
 /// `level_db` is the detector level, not a sample. The result is 0 when
@@ -1986,6 +1997,18 @@ mod tests {
         );
         std::hint::black_box((&left, &right));
         std::hint::black_box(per);
+    }
+
+    #[test]
+    fn same_controls_ignores_sample_rate() {
+        let mut left = CompSettings::bypass(48_000);
+        left.set_enabled(true);
+        left.set_threshold_db(-24.0);
+        let mut right = left;
+        assert!(right.set_sample_rate(44_100));
+        assert!(same_controls(left, right));
+        right.set_ratio(2.0);
+        assert!(!same_controls(left, right));
     }
 
     fn marker(stamp: u32) -> CompBlock {

@@ -131,6 +131,8 @@ cargo run -p omamix --features pipewire -- --headless --mix-mic --tone --duratio
 
 In the window, click a fader, then scroll while the pointer is still on it. One notch is 0.5 dB. Strip trim and fader start at 0 dB, pan at center (both channels stay at gain 1), with mute and solo off. The master fader starts at 0 dB.
 
+Each strip has an Effects section. It holds the 10-band graphic EQ (31.5 Hz through 16 kHz, +/-12 dB), a high-pass switch and cutoff, and the compressor (enable, threshold, ratio, attack, release, makeup). The section also shows that strip's gain reduction. The master section has the same EQ, with a switch for the whole EQ and a Flat button that puts every band back at 0 dB and turns the high-pass off. Below it, the master chain is an ordered list. Each block has a bypass switch and Up and Down buttons. The limiter stays last. The line under the list is the chain's reported latency in milliseconds. The master compressor uses the same controls, and the master gain reduction is shown under them. Moving a control turns the whole EQ on. Turning the EQ off keeps the stored bands and publishes a flat curve. Every edit goes through the same command path as the faders, marks the scene dirty, and is written by the existing autosave. A scene file that has no EQ, compressor, or chain keys loads flat and bypassed, with the default chain (compressor, then limiter).
+
 ## Layout
 
 ```text
