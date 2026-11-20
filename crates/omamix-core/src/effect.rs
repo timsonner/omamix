@@ -88,6 +88,19 @@ fn sanitize_gain(gain_db: f32) -> f32 {
     )
 }
 
+/// Whether `index` may move up or down without crossing the limiter.
+pub fn reorder_move_enabled(blocks: &[EffectBlock], index: usize) -> (bool, bool) {
+    if index >= blocks.len() {
+        return (false, false);
+    }
+    if blocks[index].kind() == EffectKind::Limiter {
+        return (false, false);
+    }
+    let up = index > 0 && blocks[index - 1].kind() != EffectKind::Limiter;
+    let down = index + 1 < blocks.len() && blocks[index + 1].kind() != EffectKind::Limiter;
+    (up, down)
+}
+
 /// Kind of one chain block. The tag is what the callback matches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EffectKind {
@@ -549,6 +562,11 @@ impl MasterChain {
         &self.slots[..self.len as usize]
     }
 
+    /// Whether the chain row at `index` may move up or down in the UI.
+    pub fn reorder_move_enabled(&self, index: usize) -> (bool, bool) {
+        reorder_move_enabled(self.blocks(), index)
+    }
+
     /// Kind ids in order.
     pub fn kind_ids(&self) -> Vec<&'static str> {
         self.blocks().iter().map(EffectBlock::kind_id).collect()
@@ -904,6 +922,23 @@ mod tests {
             rate,
         );
         (left, right)
+    }
+
+    #[test]
+    fn reorder_buttons_follow_the_limiter_and_movable_ends() {
+        let chain = MasterChain::standard();
+        assert_eq!(chain.reorder_move_enabled(0), (false, false));
+        assert_eq!(chain.reorder_move_enabled(1), (false, false));
+        let (chain, _) = MasterChain::from_blocks(&[
+            EffectBlock::gain(3.0),
+            EffectBlock::compressor(CompSettings::bypass(48_000)),
+            EffectBlock::gain(-1.0),
+            EffectBlock::limiter(LimitSettings::master(48_000)),
+        ]);
+        assert_eq!(chain.reorder_move_enabled(0), (false, true));
+        assert_eq!(chain.reorder_move_enabled(1), (true, true));
+        assert_eq!(chain.reorder_move_enabled(2), (true, false));
+        assert_eq!(chain.reorder_move_enabled(3), (false, false));
     }
 
     #[test]

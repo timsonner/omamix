@@ -6,7 +6,7 @@ use omamix_core::comp::{
     COMP_THRESHOLD_MIN_DB, CompSettings,
 };
 use omamix_core::db::format_db;
-use omamix_core::effect::{EffectKind, MasterChain};
+use omamix_core::effect::{MasterChain, reorder_move_enabled};
 use omamix_core::eq::{
     EQ_BAND_HZ, EQ_BANDS, EQ_GAIN_MAX_DB, EQ_GAIN_MIN_DB, EqSettings, HPF_MAX_HZ, HPF_MIN_HZ,
 };
@@ -14,6 +14,13 @@ use omamix_core::fader::{self, FADER_MAX_DB, FADER_MIN_DB};
 use omamix_core::graph::{INPUT_GAIN_MAX_DB, INPUT_GAIN_MIN_DB};
 use omamix_core::meter::{METER_BAR_FLOOR_DB, MeterDisplay};
 use omamix_core::route::SourceKind;
+
+/// Minimum width of one strip column in the mixer row.
+pub const STRIP_PANEL_MIN_WIDTH: f32 = 168.0;
+/// Fixed width of the master side panel, wide enough for every EQ band.
+pub const MASTER_SIDE_WIDTH: f32 = 480.0;
+/// Default window width: master panel plus one strip and layout margin.
+pub const WINDOW_MIN_WIDTH: f32 = MASTER_SIDE_WIDTH + STRIP_PANEL_MIN_WIDTH + 32.0;
 
 #[derive(Clone)]
 pub struct StripMeters {
@@ -114,7 +121,7 @@ pub fn strip_panel(
         comp: comp_edit(strip.comp),
     };
     ui.group(|ui| {
-        ui.set_min_width(168.0);
+        ui.set_min_width(STRIP_PANEL_MIN_WIDTH);
         ui.vertical(|ui| {
             ui.strong(&strip.name);
             ui.label(source_label(&strip.source));
@@ -174,7 +181,7 @@ pub fn master_panel(ui: &mut egui::Ui, view: MasterView<'_>) -> MasterEdit {
         },
     };
     ui.group(|ui| {
-        ui.set_min_width(168.0);
+        ui.set_min_width(MASTER_SIDE_WIDTH - 16.0);
         ui.vertical(|ui| {
             ui.strong("Master");
             ui.label("mix");
@@ -195,7 +202,7 @@ pub fn master_panel(ui: &mut egui::Ui, view: MasterView<'_>) -> MasterEdit {
             egui::CollapsingHeader::new("EQ")
                 .id_salt("master-eq")
                 .show(ui, |ui| {
-                    ui.set_min_width(420.0);
+                    ui.set_min_width(MASTER_SIDE_WIDTH - 24.0);
                     eq_controls(ui, u64::MAX, &mut edit.eq, view.sample_rate);
                 });
             ui.label("Chain");
@@ -366,20 +373,17 @@ fn range_slider(
 fn chain_rows(ui: &mut egui::Ui, chain: &MasterChain, edit: &mut ChainEdit) {
     let blocks = chain.blocks();
     for index in 0..blocks.len() {
-        let limiter = blocks[index].kind() == EffectKind::Limiter;
-        let up_ok = !limiter && index > 0 && blocks[index - 1].kind() != EffectKind::Limiter;
-        let down_ok =
-            !limiter && index + 1 < blocks.len() && blocks[index + 1].kind() != EffectKind::Limiter;
+        let (up_ok, down_ok) = reorder_move_enabled(blocks, index);
         ui.push_id(("chain", index), |ui| {
             ui.horizontal(|ui| {
                 if index < edit.bypass.len() {
                     ui.checkbox(&mut edit.bypass[index], "bypass");
                 }
                 ui.label(blocks[index].kind_id());
-                if ui.add_enabled(up_ok, egui::Button::new("Up")).clicked() {
+                if up_ok && ui.button("Up").clicked() {
                     edit.move_up = Some(index);
                 }
-                if ui.add_enabled(down_ok, egui::Button::new("Down")).clicked() {
+                if down_ok && ui.button("Down").clicked() {
                     edit.move_down = Some(index);
                 }
             });
