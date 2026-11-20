@@ -23,8 +23,47 @@ jobs:
       - name: test
         run: cargo test --workspace
 
-  # No pipewire-feature job. ubuntu-24.04's apt libpipewire is 1.0.5, and
-  # pipewire-rs 0.10 / v1_2_0 needs >= 1.2 (E0425 on spa_meta_sync_timeline).
-  # An Arch container would also need a rolling pacman upgrade to get a new
-  # enough libpipewire, which is not a reliable pin. The feature build runs
-  # on the Arch dev machine (libpipewire 1.6.8). See the README.
+  pipewire:
+    runs-on: ubuntu-latest
+    container: ubuntu:26.04
+    steps:
+      - name: Install PipeWire and build packages
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            clang \
+            curl \
+            git \
+            libclang-dev \
+            libegl1-mesa-dev \
+            libgl1-mesa-dev \
+            libpipewire-0.3-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libxrandr-dev \
+            pkg-config \
+            pipewire \
+            python3
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: "1.95"
+          components: rustfmt, clippy
+      - name: libpipewire
+        run: pkg-config --modversion libpipewire-0.3 && pkg-config --atleast-version=1.2 libpipewire-0.3
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --features pipewire -- -D warnings
+      - name: test
+        run: cargo test --workspace --features pipewire
+      - name: smoke
+        run: bash scripts/ci-smoke.sh
