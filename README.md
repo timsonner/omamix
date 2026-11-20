@@ -10,7 +10,7 @@ omamix targets any Linux workstation with PipeWire and working sound drivers. It
 - Each strip and the master publish block peak and RMS in dBFS. A sine at -20 dBFS reads -20 peak and about -23 RMS. Silence stays at -inf.
 - The high-pass and the 10-band graphic EQ default to flat (every band at 0 dB, high-pass off). The bands are peaking sections, not shelves.
 - The compressor on each strip and on the master defaults to bypass. Its generic settings are threshold -18 dB, ratio 4:1, attack 10 ms, release 100 ms, hard knee, makeup 0 dB. Gain reduction is published per strip and for the master.
-- The master limiter defaults to on: ceiling -1 dBTP, lookahead 5 ms (range 0 to 20 ms, where 0 ms is a clipper). Reported latency is that lookahead, published as ProcessLatency and port Latency. A line `lookahead <ms>` on stdin sets it. [`scripts/true-peak-proof.sh`](scripts/true-peak-proof.sh) checks the ceiling with ffmpeg.
+- The master limiter defaults to on: ceiling -1 dBTP, lookahead 5 ms (range 0 to 20 ms, where 0 ms is a clipper). Reported latency is the delay actually applied, in samples at the graph rate: 221 at 44.1 kHz, 240 at 48 kHz, and 480 at 96 kHz for that 5 ms default. A 0 ms request stays a clipper (0 samples) when the scaled cap is at least 1, and is stored as 5 ms when the cap is 0 (the cap is 27 at 48 kHz and 256 frames, and 0 at 48 kHz and 1 frame). ProcessLatency and port Latency publish that sample count and follow rate, quantum, and lookahead changes. A line `lookahead <ms>` on stdin sets it. [`scripts/true-peak-proof.sh`](scripts/true-peak-proof.sh) checks the ceiling with ffmpeg.
 
 These rules have unit tests that do not connect to PipeWire.
 
@@ -138,7 +138,7 @@ crates/omamix-pw/     audio engine; PipeWire filter and headless loop behind the
 crates/omamix/        binary; eframe window behind the gui feature (default on)
 docs/                 spec, architecture, testing, audio baseline
 scripts/prove.sh      private PipeWire procedure
-scripts/rate-matrix.sh  Mix Mic at 44100, 48000, and 96000 and quanta 64, 256, and 1024
+scripts/rate-matrix.sh  Mix Mic at 44100, 48000, and 96000 and quanta 32, 64, 256, and 1024
 scripts/true-peak-proof.sh  limiter ceiling check
 scripts/check-agnostic.sh   CI guard against machine-specific names in code
 PKGBUILD              Arch package omamix-git

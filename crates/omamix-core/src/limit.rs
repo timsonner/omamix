@@ -20,9 +20,11 @@
 //!
 //! The master starts on: ceiling -1 dBTP, lookahead 5 ms.
 //!
-//! Reported latency is the delay that is actually in the signal. A bypassed
-//! master reports 0. Lookahead 0 reports 0. Otherwise it is
-//! [`lookahead_samples`] at the rate the callback is running. The loop
+//! Reported latency is the delay that is actually in the signal, in samples
+//! at the rate the callback is running. A bypassed master reports 0.
+//! Lookahead 0 reports 0 when [`zero_ms_limiter_cap`] is at least 1. When
+//! that cap is 0 the callback delays by the default lookahead and the report
+//! follows it. Otherwise the report is [`lookahead_samples`]. The loop
 //! thread copies that number into the filter `ProcessLatency` param as
 //! samples only (`ns` is 0, because PipeWire adds the two fields). Output
 //! port `Latency` adds the upstream rate to that delay. Only the rate is
@@ -50,8 +52,9 @@
 //! published at another rate is still applied: the callback recomputes the
 //! delay and the release coefficient at the rate it is running.
 //!
-//! `callback_quantum` has one production writer: the audio callback, through
-//! [`LimitReader::note_callback_quantum`]. [`LimitWriter::note_callback_quantum`]
+//! `callback_quantum` and the callback rate have one production writer: the
+//! audio callback, through [`LimitReader::note_callback_quantum`] and
+//! [`LimitReader::note_callback_rate`]. [`LimitWriter::note_callback_quantum`]
 //! exists only in tests.
 //!
 //! Gain reduction is one atomic, in dB, negative when the signal is reduced
@@ -234,6 +237,7 @@ struct LimitShared {
     /// The audio callback is the only production writer. The loop thread
     /// copies this into [`Self::applied_quantum`].
     callback_quantum: AtomicU32,
+    callback_rate: AtomicU32,
 }
 
 /// Master on.
@@ -247,6 +251,7 @@ fn open_inner(master_on: bool) -> (LimitWriter, LimitReader) {
         sample_rate: AtomicU32::new(48_000),
         applied_quantum: AtomicU32::new(ZERO_MS_REFERENCE_FRAMES),
         callback_quantum: AtomicU32::new(ZERO_MS_REFERENCE_FRAMES),
+        callback_rate: AtomicU32::new(0),
     });
     let mut writer = LimitWriter {
         inner: Arc::clone(&inner),
@@ -266,6 +271,12 @@ impl LimitShared {
     fn store_callback_quantum(&self, frames: usize) {
         let frames = u32::try_from(frames).unwrap_or(u32::MAX).max(1);
         self.callback_quantum.store(frames, Ordering::Release);
+    }
+
+    fn store_callback_rate(&self, sample_rate: u32) {
+        if usable_rate(sample_rate).is_some() {
+            self.callback_rate.store(sample_rate, Ordering::Release);
+        }
     }
 }
 
@@ -378,9 +389,23 @@ impl LimitWriter {
         self.master_settings().latency_samples()
     }
 
-    /// Samples from an input tap to the master output.
     pub fn reported_latency_samples(&self) -> u32 {
-        self.master_latency_samples()
+        let settings = self.master_settings();
+        signal_delay_samples(
+            settings.enabled(),
+            settings.lookahead_ms(),
+            self.reporting_rate(),
+            self.callback_quantum().max(1),
+        )
+    }
+
+    fn reporting_rate(&self) -> u32 {
+        let callback = self.inner.callback_rate.load(Ordering::Acquire);
+        if usable_rate(callback).is_some() {
+            callback
+        } else {
+            self.sample_rate()
+        }
     }
 
     fn republish(&mut self) {
@@ -482,6 +507,10 @@ impl LimitReader {
     pub(crate) fn note_callback_quantum(&self, frames: usize) {
         self.inner.store_callback_quantum(frames);
     }
+
+    pub(crate) fn note_callback_rate(&self, sample_rate: u32) {
+        self.inner.store_callback_rate(sample_rate);
+    }
 }
 
 fn channel_settings(sample_rate: u32, channel: &LimitChannel) -> LimitSettings {
@@ -575,6 +604,7 @@ impl LimitRuntime {
     /// restarted.
     pub(crate) fn begin(&mut self, reader: &mut LimitReader, frames: usize, sample_rate: u32) {
         reader.note_callback_quantum(frames);
+        reader.note_callback_rate(sample_rate);
         let mut polled = reader.poll_master(sample_rate);
         let cap = zero_ms_limiter_cap(sample_rate, frames.max(1) as u32);
         let published_rate = polled
@@ -811,6 +841,26 @@ impl LimitSettings {
 fn default_lookahead_samples(callback_rate: u32, published_rate: u32) -> u32 {
     let rate = usable_rate(callback_rate).unwrap_or(published_rate);
     lookahead_samples(rate, LIMIT_LOOKAHEAD_DEFAULT_MS)
+}
+
+fn signal_delay_samples(
+    enabled: bool,
+    lookahead_ms: f32,
+    sample_rate: u32,
+    quantum_frames: u32,
+) -> u32 {
+    if !enabled {
+        return 0;
+    }
+    let Some(rate) = usable_rate(sample_rate) else {
+        return 0;
+    };
+    let delay = lookahead_samples(rate, sanitize_lookahead(lookahead_ms));
+    if delay == 0 && zero_ms_limiter_cap(rate, quantum_frames) == 0 {
+        lookahead_samples(rate, LIMIT_LOOKAHEAD_DEFAULT_MS)
+    } else {
+        delay
+    }
 }
 
 /// Samples of delay for `lookahead_ms` at `sample_rate`.
@@ -4117,6 +4167,82 @@ mod tests {
                     .wrapping_add(sample.to_bits() as u64);
             }
             assert_eq!(hash, expect);
+        }
+    }
+
+    fn five_ms_samples(rate: u32) -> u32 {
+        match rate {
+            44_100 => 221,
+            48_000 => 240,
+            96_000 => 480,
+            _ => panic!("unexpected rate {rate}"),
+        }
+    }
+
+    fn expected_applied_delay(rate: u32, quantum: u32, ms: f32) -> u32 {
+        let five_ms = five_ms_samples(rate);
+        assert_eq!(lookahead_samples(rate, LIMIT_LOOKAHEAD_DEFAULT_MS), five_ms);
+        if ms == 0.0 && zero_ms_limiter_cap(rate, quantum) == 0 {
+            five_ms
+        } else if ms == 0.0 {
+            0
+        } else {
+            five_ms
+        }
+    }
+
+    fn impulse_delay(reader: &mut LimitReader, rate: u32, quantum: u32) -> u32 {
+        let quantum = quantum.max(1) as usize;
+        let room = lookahead_samples(rate, LIMIT_LOOKAHEAD_DEFAULT_MS) as usize + 1;
+        let frames = room.div_ceil(quantum) * quantum;
+        let mut left = vec![0.0f32; frames];
+        let mut right = vec![0.0f32; frames];
+        left[0] = 0.05;
+        right[0] = 0.05;
+        let mut runtime = LimitRuntime::new();
+        let mut offset = 0;
+        while offset < frames {
+            let end = offset + quantum;
+            runtime.process_master(
+                reader,
+                &mut left[offset..end],
+                &mut right[offset..end],
+                rate,
+            );
+            offset = end;
+        }
+        left.iter()
+            .position(|sample| sample.abs() > 0.02)
+            .unwrap_or(frames) as u32
+    }
+
+    #[test]
+    fn published_latency_matches_the_applied_delay_at_each_quantum_and_rate() {
+        for rate in [44_100u32, 48_000, 96_000] {
+            for quantum in [1u32, 64, 256, 1024] {
+                for ms in [0.0f32, LIMIT_LOOKAHEAD_DEFAULT_MS] {
+                    let (mut writer, mut reader) = open();
+                    assert!(writer.apply_master(LimitUpdate::LookaheadMs(ms)).accepted());
+                    let applied = impulse_delay(&mut reader, rate, quantum);
+                    let expect = expected_applied_delay(rate, quantum, ms);
+                    assert_eq!(
+                        applied, expect,
+                        "applied delay at {rate} Hz, quantum {quantum}, lookahead {ms} ms"
+                    );
+                    assert_eq!(
+                        writer.reported_latency_samples(),
+                        applied,
+                        "published delay at {rate} Hz, quantum {quantum}, lookahead {ms} ms"
+                    );
+                    assert!(writer.set_sample_rate(rate));
+                    let _ = writer.set_processing_quantum(quantum);
+                    assert_eq!(
+                        writer.reported_latency_samples(),
+                        applied,
+                        "published delay after sync at {rate} Hz, quantum {quantum}, lookahead {ms} ms"
+                    );
+                }
+            }
         }
     }
 }
