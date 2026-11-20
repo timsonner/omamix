@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use omamix_core::comp::CompUpdate;
-use omamix_core::effect::MasterChain;
+use omamix_core::effect::{EffectKind, MasterChain};
 use omamix_core::eq::EqUpdate;
 use omamix_core::graph::{MasterBus, Scene, Strip};
 use omamix_core::limit::{
@@ -97,6 +97,7 @@ enum LoopMsg {
     SetMasterComp(CompUpdate),
     SetMasterLimit(LimitUpdate),
     SetMasterChain(Box<MasterChain>),
+    BypassLimiter(bool),
 }
 
 fn engine_command_msg(command: EngineCommand) -> Option<LoopMsg> {
@@ -349,7 +350,7 @@ pub fn run_headless(options: HeadlessOptions) -> Result<HeadlessReport, EngineEr
     }
 
     let deadline = duration.map(|span| Instant::now() + span);
-    let (look_tx, look_rx) = std::sync::mpsc::channel::<f32>();
+    let (look_tx, look_rx) = std::sync::mpsc::channel::<StdinCmd>();
     let _reader = std::thread::Builder::new()
         .name("omamix-lookahead".into())
         .spawn(move || read_lookahead_lines(look_tx));
@@ -364,8 +365,11 @@ pub fn run_headless(options: HeadlessOptions) -> Result<HeadlessReport, EngineEr
             break;
         }
         match look_rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(ms) => {
+            Ok(StdinCmd::Lookahead(ms)) => {
                 let _ = pw_tx.send(LoopMsg::SetMasterLimit(LimitUpdate::LookaheadMs(ms)));
+            }
+            Ok(StdinCmd::BypassLimiter(on)) => {
+                let _ = pw_tx.send(LoopMsg::BypassLimiter(on));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -395,12 +399,63 @@ fn clamp_lookahead_token(text: &str) -> Option<f32> {
     Some(ms.clamp(LIMIT_LOOKAHEAD_MIN_MS, LIMIT_LOOKAHEAD_MAX_MS))
 }
 
-/// Read `lookahead <ms>` lines and forward the milliseconds.
+/// One control line from stdin.
+enum StdinCmd {
+    Lookahead(f32),
+    BypassLimiter(bool),
+}
+
+/// Parse `lookahead <ms>` or `bypass limiter` / `bypass limiter off`.
+///
+/// Other lines are ignored. Lookahead tokens that are not finite numbers
+/// are ignored. A finite lookahead is clamped to [`LIMIT_LOOKAHEAD_MIN_MS`]
+/// and [`LIMIT_LOOKAHEAD_MAX_MS`].
+fn parse_stdin_line(line: &str) -> Option<StdinCmd> {
+    let mut parts = line.split_whitespace();
+    match parts.next() {
+        Some("lookahead") => {
+            let text = parts.next()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(StdinCmd::Lookahead(clamp_lookahead_token(text)?))
+        }
+        Some("bypass") => {
+            if parts.next() != Some("limiter") {
+                return None;
+            }
+            let on = match parts.next() {
+                None | Some("on") => true,
+                Some("off") => false,
+                Some(_) => return None,
+            };
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(StdinCmd::BypassLimiter(on))
+        }
+        _ => None,
+    }
+}
+
+/// Chain-bypass the limiter block. Other blocks stay as they are.
+fn bypass_limiter_block(chain: &mut MasterChain, bypass: bool) -> bool {
+    let Some(index) = chain
+        .blocks()
+        .iter()
+        .position(|block| block.kind() == EffectKind::Limiter)
+    else {
+        return false;
+    };
+    chain.set_bypass(index, bypass)
+}
+
+/// Read lookahead and limiter-bypass lines and forward them.
 ///
 /// Other lines are ignored. This does not touch the audio callback. The
 /// caller waits on the channel. A closed stdin ends this task, and the
 /// caller sleeps 50 ms when the sender is gone so it does not spin.
-fn read_lookahead_lines(tx: std::sync::mpsc::Sender<f32>) {
+fn read_lookahead_lines(tx: std::sync::mpsc::Sender<StdinCmd>) {
     let stdin = std::io::stdin();
     let mut line = String::new();
     loop {
@@ -409,17 +464,10 @@ fn read_lookahead_lines(tx: std::sync::mpsc::Sender<f32>) {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
-        let mut parts = line.split_whitespace();
-        if parts.next() != Some("lookahead") {
-            continue;
-        }
-        let Some(text) = parts.next() else {
+        let Some(cmd) = parse_stdin_line(&line) else {
             continue;
         };
-        let Some(ms) = clamp_lookahead_token(text) else {
-            continue;
-        };
-        if tx.send(ms).is_err() {
+        if tx.send(cmd).is_err() {
             break;
         }
     }
@@ -707,8 +755,9 @@ fn pw_thread(
         let mainloop = mainloop.clone();
         let filter = Rc::clone(&filter);
         let monitor_on = Arc::clone(&monitor_on);
+        let shared_loop = Rc::clone(&shared_loop);
         move |msg| {
-            if apply_loop_msg(&msg, &filter, &monitor_on) {
+            if apply_loop_msg(&msg, &shared_loop, &filter, &monitor_on) {
                 mainloop.quit();
             }
         }
@@ -752,6 +801,7 @@ fn pw_thread(
 
 fn apply_loop_msg(
     msg: &LoopMsg,
+    shared: &LoopShared,
     filter: &RefCell<Option<MixFilter>>,
     monitor_on: &AtomicBool,
 ) -> bool {
@@ -806,6 +856,19 @@ fn apply_loop_msg(
         LoopMsg::SetMasterChain(chain) => {
             if let Some(filter) = filter.borrow_mut().as_mut() {
                 filter.apply_chain(chain);
+            }
+            false
+        }
+        LoopMsg::BypassLimiter(on) => {
+            let chain = {
+                let mut inner = shared.inner.borrow_mut();
+                if !bypass_limiter_block(&mut inner.scene.master.chain, *on) {
+                    return false;
+                }
+                inner.scene.master.chain
+            };
+            if let Some(filter) = filter.borrow_mut().as_mut() {
+                filter.apply_chain(&chain);
             }
             false
         }
@@ -1293,7 +1356,7 @@ fn drain_commands(
             }
             other => {
                 if let Some(msg) = engine_command_msg(other)
-                    && apply_loop_msg(&msg, filter, monitor_on)
+                    && apply_loop_msg(&msg, shared, filter, monitor_on)
                 {
                     quit = true;
                 }
@@ -3068,7 +3131,8 @@ mod owned_id_tests {
 
 #[cfg(test)]
 mod lookahead_token_tests {
-    use super::clamp_lookahead_token;
+    use super::{StdinCmd, bypass_limiter_block, clamp_lookahead_token, parse_stdin_line};
+    use omamix_core::effect::{EffectKind, MasterChain};
 
     #[test]
     fn stdin_lookahead_rejects_non_finite_and_clamps_the_range() {
@@ -3087,5 +3151,46 @@ mod lookahead_token_tests {
         assert_eq!(clamp_lookahead_token("infinity"), None);
         assert_eq!(clamp_lookahead_token(""), None);
         assert_eq!(clamp_lookahead_token("nope"), None);
+    }
+
+    #[test]
+    fn stdin_bypass_targets_the_limiter_block() {
+        assert!(matches!(
+            parse_stdin_line("bypass limiter"),
+            Some(StdinCmd::BypassLimiter(true))
+        ));
+        assert!(matches!(
+            parse_stdin_line("bypass limiter on"),
+            Some(StdinCmd::BypassLimiter(true))
+        ));
+        assert!(matches!(
+            parse_stdin_line("bypass limiter off"),
+            Some(StdinCmd::BypassLimiter(false))
+        ));
+        assert!(parse_stdin_line("bypass").is_none());
+        assert!(parse_stdin_line("bypass sink").is_none());
+        assert!(parse_stdin_line("bypass limiter later").is_none());
+        assert!(matches!(
+            parse_stdin_line("lookahead 5"),
+            Some(StdinCmd::Lookahead(ms)) if (ms - 5.0).abs() < 1.0e-6
+        ));
+        let mut chain = MasterChain::standard();
+        assert!(bypass_limiter_block(&mut chain, true));
+        assert!(
+            chain
+                .blocks()
+                .iter()
+                .any(|block| { block.kind() == EffectKind::Limiter && block.bypassed() })
+        );
+        assert!(
+            chain
+                .blocks()
+                .iter()
+                .any(|block| { block.kind() == EffectKind::Compressor && !block.bypassed() })
+        );
+        assert_eq!(chain.latency_samples(48_000, 256), 0);
+        assert!(bypass_limiter_block(&mut chain, false));
+        assert!(chain.blocks().iter().all(|block| !block.bypassed()));
+        assert_eq!(chain.latency_samples(48_000, 256), 240);
     }
 }

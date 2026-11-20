@@ -109,12 +109,15 @@ PY
   pw-metadata -r "$SOCKET" -n settings 0 clock.force-rate "$rate" >"$work/force-rate.txt" 2>&1 || true
   pw-metadata -r "$SOCKET" -n settings 0 clock.force-quantum "$quantum" >"$work/force-quantum.txt" 2>&1 || true
   sleep 0.2
-  PIPEWIRE_REMOTE=$SOCKET "$BIN" --headless --mix-mic --tone --duration 3 >"$work/omamix.log" 2>&1 &
+  local stdin_fifo=$work/stdin
+  mkfifo "$stdin_fifo"
+  exec {omamix_stdin}<>"$stdin_fifo"
+  PIPEWIRE_REMOTE=$SOCKET "$BIN" --headless --mix-mic --tone --duration 8 <"$stdin_fifo" >"$work/omamix.log" 2>&1 &
   ompid=$!
-  python3 - "$SOCKET" "$work" "$rate" "$quantum" "$ompid" <<'PY'
-import json, math, os, signal, struct, subprocess, sys, time, wave
+  python3 - "$SOCKET" "$work" "$rate" "$quantum" "$ompid" "$stdin_fifo" <<'PY'
+import json, math, os, re, signal, struct, subprocess, sys, time, wave
 
-socket, work, rate_s, quantum_s, ompid_s = sys.argv[1:]
+socket, work, rate_s, quantum_s, ompid_s, fifo = sys.argv[1:]
 rate = int(rate_s)
 quantum = int(quantum_s)
 ompid = int(ompid_s)
@@ -245,6 +248,52 @@ def same_direction_rates(rows):
             found.append(rate)
     return found
 
+def capture_output_rates(rows):
+    return [
+        rate
+        for port_direction, lat_direction, rate in rows
+        if port_direction == "out" and lat_direction == "Output"
+    ]
+
+def latency_snapshot():
+    data = dump()
+    mix = find_name(data, "omamix.mix-mic")
+    engine_node = find_name(data, "omamix.mix-engine")
+    engine_lat = process_latency_of(data, "omamix.mix-engine")
+    mic_lat = process_latency_of(data, "omamix.mix-mic")
+    lat_name, lat_rate = process_latency(data)
+    engine_rows = port_latency_rows(data, None if engine_node is None else engine_node.get("id"))
+    mic_rows = port_latency_rows(data, None if mix is None else mix.get("id"))
+    return data, mix, lat_name, lat_rate, engine_lat, mic_lat, engine_rows, mic_rows
+
+def recorder_link_rates():
+    result = sh("pw-link", "-r", socket, "-l", "-t", check=False)
+    text = (result.stdout or "") + "\n" + (result.stderr or "")
+    open(os.path.join(work, "pw-link.txt"), "w").write(text)
+    if result.returncode != 0 and not (result.stdout or "").strip():
+        return None
+    node_name = ""
+    if recorder is not None:
+        node_name = props(recorder).get("node.name") or ""
+    rates = []
+    watch = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        named = bool(node_name) and node_name in stripped and "input_" in stripped
+        generic = "pw-record" in stripped and "input_" in stripped
+        if named or generic:
+            watch = True
+            continue
+        if watch and "output latency:" in stripped:
+            match = re.search(r"rate=\[\s*(-?\d+)\s+(-?\d+)\s*\]", stripped)
+            if match:
+                rates.append(int(match.group(2)))
+            watch = False
+            continue
+        if watch and stripped and "latency:" not in stripped:
+            watch = False
+    return rates
+
 rec = subprocess.Popen(
     [
         "pw-record",
@@ -344,20 +393,40 @@ if in_fr is not None:
     link(out_fr, in_fr)
 
 time.sleep(0.6)
-data = dump()
-mix = find_name(data, "omamix.mix-mic")
-engine_node = find_name(data, "omamix.mix-engine")
+data, mix, lat_name, lat_rate, engine_lat, mic_lat, engine_rows, mic_rows = latency_snapshot()
 node_rate = first_rate(mix)
-lat_name, lat_rate = process_latency(data)
-engine_lat = process_latency_of(data, "omamix.mix-engine")
-mic_lat = process_latency_of(data, "omamix.mix-mic")
-engine_rows = port_latency_rows(data, None if engine_node is None else engine_node.get("id"))
-mic_rows = port_latency_rows(data, None if mix is None else mix.get("id"))
 engine_ports = [rate for _port_direction, _lat_direction, rate in engine_rows]
 mic_ports = [rate for _port_direction, _lat_direction, rate in mic_rows]
 engine_same = same_direction_rates(engine_rows)
+mic_capture = capture_output_rates(mic_rows)
+link_values = recorder_link_rates()
 meta = sh("pw-metadata", "-r", socket, "-n", "settings", check=False).stdout
 open(os.path.join(work, "during.json"), "w").write(json.dumps(data))
+with open(fifo, "w") as handle:
+    handle.write("bypass limiter\n")
+    handle.flush()
+bypass_capture = None
+bypass_engine = None
+bypass_same = None
+bypass_deadline = time.time() + 2.0
+while time.time() < bypass_deadline and alive(ompid):
+    time.sleep(0.1)
+    _data_b, _mix_b, _name_b, _rate_b, engine_lat_b, _mic_lat_b, engine_rows_b, mic_rows_b = latency_snapshot()
+    rates = capture_output_rates(mic_rows_b)
+    same = same_direction_rates(engine_rows_b)
+    bypass_capture = rates
+    bypass_engine = engine_lat_b
+    bypass_same = same
+    if (
+        rates
+        and all(int(value) == 0 for value in rates)
+        and engine_lat_b is not None
+        and int(engine_lat_b) == 0
+        and same
+        and all(int(value) == 0 for value in same)
+    ):
+        open(os.path.join(work, "bypass.json"), "w").write(json.dumps(_data_b))
+        break
 while alive(ompid):
     time.sleep(0.05)
 rec.send_signal(signal.SIGTERM)
@@ -419,22 +488,43 @@ def exact(value):
     return value is not None and int(value) == expect
 lat_ok = exact(engine_lat)
 port_ok = bool(engine_same) and all(exact(value) for value in engine_same)
+mic_ok = bool(mic_capture) and all(exact(value) for value in mic_capture)
+bypass_ok = (
+    bool(bypass_capture)
+    and all(int(value) == 0 for value in bypass_capture)
+    and bypass_engine is not None
+    and int(bypass_engine) == 0
+    and bool(bypass_same)
+    and all(int(value) == 0 for value in bypass_same)
+)
+if not link_values:
+    link_tag = "UNVERIFIED"
+    link_ok = True
+elif all(exact(value) for value in link_values):
+    link_tag = "MEASURED"
+    link_ok = True
+else:
+    link_tag = "MEASURED"
+    link_ok = False
 try:
     tone_ok = abs(float(tone) - 440.0) <= 5.0
 except ValueError:
     tone_ok = False
 rate_ok = node_rate is not None and int(node_rate) == rate
 tear_ok = teardown == "absent"
-passed = tone_ok and rate_ok and lat_ok and port_ok and tear_ok and force_ok
+passed = tone_ok and rate_ok and lat_ok and port_ok and mic_ok and bypass_ok and link_ok and tear_ok and force_ok
 tag = "MEASURED" if tone != "none" or node_rate is not None else "UNVERIFIED"
 print(
     f"{tag} rate={rate} quantum={quantum} tone_hz={tone} node_rate={node_rate} "
     f"process_latency={lat_rate} process_latency_node={lat_name} "
     f"engine_process_latency={engine_lat} mic_process_latency={mic_lat} "
     f"engine_port_latency={engine_ports} engine_port_same={engine_same} mic_port_latency={mic_ports} "
+    f"mic_capture={mic_capture} mic_capture_bypass={bypass_capture} engine_bypass={bypass_engine} "
     f"expect_samples={expect} onset_samples={onset} applied_delay=UNVERIFIED "
+    f"link_latency={link_values} link={link_tag} pactl=UNVERIFIED "
     f"file_rate={file_rate} frames={frames} teardown={teardown} "
-    f"force_seen={int(force_ok)} port_ok={int(port_ok)} pass={int(passed)}"
+    f"force_seen={int(force_ok)} port_ok={int(port_ok)} mic_ok={int(mic_ok)} "
+    f"bypass_ok={int(bypass_ok)} pass={int(passed)}"
 )
 sys.exit(0 if passed else 1)
 PY
@@ -451,6 +541,10 @@ PY
   kill "$pwpid" 2>/dev/null || true
   wait "$pwpid" 2>/dev/null || true
   rm -f "$SOCKET"
+  if [ -n "${omamix_stdin:-}" ]; then
+    exec {omamix_stdin}>&-
+    unset omamix_stdin
+  fi
   return "$status"
 }
 

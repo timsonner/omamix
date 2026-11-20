@@ -40,6 +40,16 @@ pub const MIX_MIC_DESCRIPTION: &str = "Mix Mic";
 /// without a session manager configuring its ports.
 pub const MIX_MIC_MEDIA_CLASS: &str = "Audio/Source/Virtual";
 
+/// Samples a Mix Mic capture port reports.
+///
+/// `chain` is the master delay. `upstream` is the rate already on the filter
+/// output. `adapter` is delay the null-audio-sink adapter adds on top.
+/// `monitor.passthrough` copies `chain + upstream` from the filter output
+/// onto the capture port. Add `adapter` when the adapter inserts more.
+pub fn mix_mic_capture_latency(chain: u32, upstream: u32, adapter: u32) -> u32 {
+    chain.saturating_add(upstream).saturating_add(adapter)
+}
+
 /// JSON for `adapter.auto-port-config`. The null-audio-sink follower exposes
 /// an enum format; the adapter applies this at init and creates dsp ports
 /// from `audio.position`. `monitor` is true so a recorder can capture the
@@ -85,6 +95,7 @@ pub fn mix_mic_properties() -> Vec<(&'static str, &'static str)> {
         ("node.dont-reconnect", "true"),
         ("node.autoconnect", "false"),
         ("object.linger", "false"),
+        ("monitor.passthrough", "true"),
         (OMAMIX_OWNED_KEY, "true"),
         ("adapter.auto-port-config", ADAPTER_AUTO_PORT_CONFIG),
         ("node.param.PortConfig", MIX_MIC_PORT_CONFIG),
@@ -183,6 +194,7 @@ mod tests {
             MIX_MIC_SESSION_PRIORITY
         );
         assert!(get(&props, "node.latency").is_none());
+        assert_eq!(get(&props, "monitor.passthrough"), Some("true"));
         assert_eq!(get(&props, "node.dont-reconnect"), Some("true"));
         assert_eq!(get(&props, "node.autoconnect"), Some("false"));
         assert_eq!(get(&props, "object.linger"), Some("false"));
@@ -211,6 +223,20 @@ mod tests {
                 *key != "node.driver" && *key != "node.want-driver" && *key != "node.latency"
             }));
         }
+    }
+
+    #[test]
+    fn mix_mic_capture_latency_adds_chain_upstream_and_adapter() {
+        assert_eq!(mix_mic_capture_latency(221, 0, 0), 221);
+        assert_eq!(mix_mic_capture_latency(240, 0, 0), 240);
+        assert_eq!(mix_mic_capture_latency(480, 0, 0), 480);
+        assert_eq!(mix_mic_capture_latency(0, 0, 0), 0);
+        assert_eq!(mix_mic_capture_latency(240, 32, 0), 272);
+        assert_eq!(mix_mic_capture_latency(240, 0, 16), 256);
+        assert_eq!(mix_mic_capture_latency(240, 32, 16), 288);
+        assert_eq!(mix_mic_capture_latency(u32::MAX, 1, 0), u32::MAX);
+        assert_eq!(mix_mic_capture_latency(u32::MAX, 0, 1), u32::MAX);
+        assert_eq!(mix_mic_capture_latency(1, u32::MAX, 1), u32::MAX);
     }
 
     #[test]
