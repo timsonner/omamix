@@ -497,11 +497,25 @@ impl eframe::App for WindowHost {
             latency_ms,
             sample_rate,
         };
+        let expand_strips = std::env::var("OMAMIX_EXPAND_STRIPS").ok().as_deref() == Some("1");
+        let scroll_bottom = std::env::var("OMAMIX_SCROLL_LEFT").ok().as_deref() == Some("bottom");
         let master_edit = egui::Panel::right("omamix-master")
             .resizable(true)
             .default_size(ui::MASTER_SIDE_DEFAULT_WIDTH)
             .min_size(ui::MASTER_SIDE_MIN_WIDTH)
-            .show(ui, |ui| ui::master_panel(ui, master_view));
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("omamix-master-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let edit = ui::master_panel(ui, master_view);
+                        if scroll_bottom {
+                            ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+                        }
+                        edit
+                    })
+                    .inner
+            });
         if self
             .picker
             .set_master_fader(master_edit.inner.fader_db, now)
@@ -523,8 +537,6 @@ impl eframe::App for WindowHost {
             &mut changed,
         );
         self.note_chain(&master_edit.inner.chain, now, &mut commands, &mut changed);
-        let expand_strips = std::env::var("OMAMIX_EXPAND_STRIPS").ok().as_deref() == Some("1");
-        let scroll_bottom = std::env::var("OMAMIX_SCROLL_LEFT").ok().as_deref() == Some("bottom");
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::both()
                 .id_salt("omamix-left")
