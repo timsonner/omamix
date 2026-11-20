@@ -8,6 +8,7 @@ use crate::comp::{
     COMP_ATTACK_DEFAULT_MS, COMP_KNEE_DEFAULT_DB, COMP_MAKEUP_DEFAULT_DB, COMP_RATIO_DEFAULT,
     COMP_RELEASE_DEFAULT_MS, COMP_THRESHOLD_DEFAULT_DB, CompSettings,
 };
+use crate::effect::{EffectBlock, EffectKind, EffectParams, MasterChain};
 use crate::eq::{EQ_BANDS, EqSettings, HPF_DEFAULT_HZ};
 use crate::fader;
 use crate::graph::{MasterBus, Scene, Strip};
@@ -204,6 +205,9 @@ struct MasterDocument {
     compressor: CompDocument,
     #[serde(default)]
     limiter: LimitDocument,
+    /// Absent on a scene written before the chain. Load builds the default.
+    #[serde(default)]
+    chain: Option<Vec<ChainEntryDocument>>,
 }
 
 impl Default for MasterDocument {
@@ -218,6 +222,7 @@ impl Default for MasterDocument {
             eq: EqDocument::default(),
             compressor: CompDocument::default(),
             limiter: LimitDocument::default(),
+            chain: None,
         }
     }
 }
@@ -378,6 +383,27 @@ impl LimitDocument {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct ChainEntryDocument {
+    kind: String,
+    #[serde(default)]
+    bypass: bool,
+    #[serde(default)]
+    params: Option<toml::Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct GainParamDocument {
+    #[serde(default)]
+    gain_db: f32,
+}
+
+impl Default for GainParamDocument {
+    fn default() -> Self {
+        Self { gain_db: 0.0 }
+    }
+}
+
 impl SceneDocument {
     fn from_scene(scene: &Scene) -> Self {
         Self {
@@ -390,7 +416,7 @@ impl SceneDocument {
 
     fn into_scene(self) -> Result<Scene, SceneFileError> {
         let mut scene = Scene::empty(self.name);
-        scene.master = self.master.into_master();
+        scene.master = self.master.into_master()?;
         for (index, strip) in self.strips.into_iter().enumerate() {
             scene.strips.push(strip.into_strip(index)?);
         }
@@ -410,10 +436,11 @@ impl MasterDocument {
             eq: EqDocument::from_settings(master.eq),
             compressor: CompDocument::from_settings(master.comp),
             limiter: LimitDocument::from_settings(master.limit),
+            chain: Some(chain_entries(&master.chain)),
         }
     }
 
-    fn into_master(self) -> MasterBus {
+    fn into_master(self) -> Result<MasterBus, SceneFileError> {
         let mut master = MasterBus::default();
         master.set_fader_db(self.fader_db);
         master.eq_enabled = self.eq_enabled;
@@ -424,8 +451,101 @@ impl MasterDocument {
         master.eq = self.eq.into_settings();
         master.comp = self.compressor.into_settings();
         master.limit = self.limiter.into_settings();
-        master
+        match self.chain {
+            None => master.chain = MasterChain::from_settings(master.comp, master.limit),
+            Some(entries) => {
+                let (chain, warnings) = chain_from_entries(&entries)?;
+                for warning in &warnings {
+                    eprintln!("omamix: warning: master chain {warning}");
+                }
+                if let Some(settings) = chain.compressor_settings() {
+                    master.comp = settings;
+                    master.compressor_enabled = settings.enabled();
+                }
+                if let Some(settings) = chain.limiter_settings() {
+                    master.limit = settings;
+                    master.limiter_enabled = settings.enabled();
+                    master.limiter_ceiling_dbtp = settings.ceiling_db();
+                }
+                master.chain = chain;
+            }
+        }
+        Ok(master)
     }
+}
+
+fn document_value<T: Serialize>(value: &T) -> toml::Value {
+    toml::to_string(value)
+        .ok()
+        .and_then(|text| toml::from_str(&text).ok())
+        .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()))
+}
+
+fn document_from_value<T>(value: Option<&toml::Value>) -> Result<T, SceneFileError>
+where
+    T: serde::de::DeserializeOwned + Default,
+{
+    let Some(value) = value else {
+        return Ok(T::default());
+    };
+    T::deserialize(value.clone()).map_err(|err| SceneFileError::Format(err.to_string()))
+}
+
+fn chain_entries(chain: &MasterChain) -> Vec<ChainEntryDocument> {
+    chain
+        .blocks()
+        .iter()
+        .map(|block| {
+            let params = match block.params() {
+                EffectParams::Compressor { .. } => block
+                    .comp_settings()
+                    .map(|settings| document_value(&CompDocument::from_settings(settings))),
+                EffectParams::Limiter { .. } => block
+                    .limit_settings()
+                    .map(|settings| document_value(&LimitDocument::from_settings(settings))),
+                EffectParams::Gain { gain_db } => {
+                    Some(document_value(&GainParamDocument { gain_db }))
+                }
+            };
+            ChainEntryDocument {
+                kind: block.kind_id().to_string(),
+                bypass: block.bypassed(),
+                params,
+            }
+        })
+        .collect()
+}
+
+fn chain_from_entries(
+    entries: &[ChainEntryDocument],
+) -> Result<(MasterChain, Vec<String>), SceneFileError> {
+    let mut warnings = Vec::new();
+    let mut blocks = Vec::new();
+    for entry in entries {
+        let Some(kind) = EffectKind::parse(&entry.kind) else {
+            warnings.push(format!("skipped unknown effect '{}'", entry.kind));
+            continue;
+        };
+        let mut block = match kind {
+            EffectKind::Compressor => {
+                let doc = document_from_value::<CompDocument>(entry.params.as_ref())?;
+                EffectBlock::compressor(doc.into_settings())
+            }
+            EffectKind::Limiter => {
+                let doc = document_from_value::<LimitDocument>(entry.params.as_ref())?;
+                EffectBlock::limiter(doc.into_settings())
+            }
+            EffectKind::Gain => {
+                let doc = document_from_value::<GainParamDocument>(entry.params.as_ref())?;
+                EffectBlock::gain(doc.gain_db)
+            }
+        };
+        block.set_bypass(entry.bypass);
+        blocks.push(block);
+    }
+    let (chain, more) = MasterChain::from_blocks(&blocks);
+    warnings.extend(more);
+    Ok((chain, warnings))
 }
 
 impl StripDocument {
@@ -529,6 +649,7 @@ mod tests {
         scene.master.limit.set_enabled(true);
         scene.master.limit.set_ceiling_db(-2.0);
         scene.master.limit.set_lookahead_ms(10.0);
+        scene.master.sync_chain_params();
 
         let mut device = Strip::new(
             4,
@@ -704,5 +825,76 @@ role = "other"
         let missing = dir.join("absent.toml");
         assert!(load_scene_file(&missing).unwrap_err().is_missing());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_scene_without_a_chain_loads_the_default_order() {
+        let scene = scene_from_toml("version = 1\nname = \"old\"\n").unwrap();
+        assert_eq!(scene.master.chain.kind_ids(), vec!["compressor", "limiter"]);
+        assert_eq!(scene.master.chain, MasterChain::standard());
+        let text = scene_to_toml(&scene).unwrap();
+        assert!(text.contains("kind = \"compressor\""));
+        assert!(text.contains("kind = \"limiter\""));
+        let loaded = scene_from_toml(&text).unwrap();
+        assert_eq!(loaded.master.chain, scene.master.chain);
+    }
+
+    #[test]
+    fn a_chain_round_trips_and_an_unknown_kind_is_skipped() {
+        let mut scene = Scene::empty("desk");
+        let mut comp = CompSettings::bypass(48_000);
+        comp.set_enabled(true);
+        comp.set_threshold_db(-12.0);
+        let gain = EffectBlock::gain(-6.0);
+        let (chain, warnings) = MasterChain::from_blocks(&[
+            gain,
+            EffectBlock::compressor(comp),
+            EffectBlock::limiter(LimitSettings::master(48_000)),
+        ]);
+        assert!(warnings.is_empty());
+        scene.master.comp = comp;
+        scene.master.compressor_enabled = true;
+        scene.master.chain = chain;
+        scene.master.sync_chain_params();
+        let text = scene_to_toml(&scene).unwrap();
+        assert!(text.contains("kind = \"gain\""));
+        assert!(text.contains("gain_db = -6.0") || text.contains("gain_db = -6"));
+        let loaded = scene_from_toml(&text).unwrap();
+        assert_eq!(loaded, scene);
+
+        let odd = r#"
+version = 1
+name = "odd"
+
+[[master.chain]]
+kind = "gain"
+
+[master.chain.params]
+gain_db = 3.0
+
+[[master.chain]]
+kind = "plate"
+
+[[master.chain]]
+kind = "limiter"
+bypass = true
+"#;
+        let scene = scene_from_toml(odd).unwrap();
+        assert_eq!(scene.master.chain.kind_ids(), vec!["gain", "limiter"]);
+        assert!(scene.master.chain.blocks()[1].bypassed());
+        assert!(scene.master.limiter_enabled);
+
+        #[derive(Deserialize)]
+        struct Wrap {
+            chain: Vec<ChainEntryDocument>,
+        }
+        let wrap: Wrap = toml::from_str("[[chain]]\nkind = \"plate\"\n").unwrap();
+        let (chain, warnings) = chain_from_entries(&wrap.chain).unwrap();
+        assert!(chain.is_empty());
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.contains("plate") && line.contains("unknown effect"))
+        );
     }
 }

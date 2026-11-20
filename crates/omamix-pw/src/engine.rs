@@ -44,6 +44,7 @@ use omamix_core::comp::{
     COMP_ATTACK_DEFAULT_MS, COMP_KNEE_DEFAULT_DB, COMP_MAKEUP_DEFAULT_DB, COMP_RATIO_DEFAULT,
     COMP_RELEASE_DEFAULT_MS, COMP_THRESHOLD_DEFAULT_DB, CompSettings, CompUpdate,
 };
+use omamix_core::effect::MasterChain;
 use omamix_core::eq::{EqSettings, EqUpdate, HPF_DEFAULT_HZ};
 use omamix_core::graph::{MasterBus, Scene, Strip};
 use omamix_core::limit::{
@@ -98,6 +99,7 @@ enum LoopMsg {
     SetStripComp { slot: u16, update: CompUpdate },
     SetMasterComp(CompUpdate),
     SetMasterLimit(LimitUpdate),
+    SetMasterChain(Box<MasterChain>),
 }
 
 fn engine_command_msg(command: EngineCommand) -> Option<LoopMsg> {
@@ -111,6 +113,7 @@ fn engine_command_msg(command: EngineCommand) -> Option<LoopMsg> {
         EngineCommand::SetStripComp { slot, update } => LoopMsg::SetStripComp { slot, update },
         EngineCommand::SetMasterComp(update) => LoopMsg::SetMasterComp(update),
         EngineCommand::SetMasterLimit(update) => LoopMsg::SetMasterLimit(update),
+        EngineCommand::SetMasterChain(chain) => LoopMsg::SetMasterChain(chain),
         EngineCommand::ReplaceScene(_) => return None,
     })
 }
@@ -773,6 +776,12 @@ fn apply_loop_msg(
             }
             false
         }
+        LoopMsg::SetMasterChain(chain) => {
+            if let Some(filter) = filter.borrow_mut().as_mut() {
+                filter.apply_chain(chain);
+            }
+            false
+        }
     }
 }
 
@@ -1206,8 +1215,12 @@ fn drain_commands(
     for command in commands {
         match command {
             EngineCommand::ReplaceScene(scene) => {
+                let chain = scene.master.chain;
                 shared.inner.borrow_mut().scene = *scene;
                 reapply_strip_controls(shared, filter);
+                if let Some(filter) = filter.borrow_mut().as_mut() {
+                    filter.publish_chain(&chain);
+                }
             }
             other => {
                 if let Some(msg) = engine_command_msg(other)
@@ -2676,6 +2689,7 @@ fn apply_saved_master(engine: &mut MixFilter, master: &MasterBus) {
     if !limit_is_factory(limit) {
         engine.apply_saved_master_limit(limit);
     }
+    engine.publish_chain(&master.chain);
 }
 
 fn eq_is_flat(settings: EqSettings) -> bool {

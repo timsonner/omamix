@@ -12,8 +12,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
 use omamix_core::comp::{CompReader, CompUpdate, CompWriter, open as open_comp};
+use omamix_core::effect::{ChainReader, ChainWriter, MasterChain, open as open_chain};
 use omamix_core::eq::{EqReader, EqUpdate, EqWriter, open};
-use omamix_core::limit::{LimitReader, LimitUpdate, LimitWriter, open as open_limit};
+use omamix_core::limit::{
+    LIMIT_LOOKAHEAD_DEFAULT_MS, LimitReader, LimitSettings, LimitUpdate, LimitWriter,
+    open as open_limit,
+};
 use omamix_core::params::{
     STRIP_SLOT_COUNT, StripBlockInput, StripMeterBank, StripMixer, StripParamBank,
 };
@@ -316,6 +320,21 @@ impl RtLimit {
 // SAFETY: `reader` is polled only on the data loop, through one `&mut LimitReader` per callback. `LimitReader` is not `Sync` and not `Clone`. This wrapper is what lets `ProcessShared` be shared. The producer is a separate `LimitWriter` owned by the loop thread, not a field of this struct.
 unsafe impl Sync for RtLimit {}
 
+/// Chain publications for the data loop. The producer is [`ChainWriter`],
+/// which is not stored here and is not `Sync`.
+struct RtChain {
+    reader: UnsafeCell<ChainReader>,
+}
+
+impl RtChain {
+    fn reader_ptr(&self) -> *mut ChainReader {
+        self.reader.get()
+    }
+}
+
+// SAFETY: `reader` is polled only on the data loop, through one `&mut ChainReader` per callback. `ChainReader` is not `Sync` and not `Clone`. This wrapper is what lets `ProcessShared` be shared. The producer is a separate `ChainWriter` owned by the loop thread, not a field of this struct.
+unsafe impl Sync for RtChain {}
+
 /// Shared with `process()`. The loop thread writes params and port pointers.
 /// `process()` writes the meters, the gain-reduction atomics, the scope rings,
 /// and the monitor slot. No channel receive. EQ coefficients and compressor
@@ -331,6 +350,8 @@ pub struct ProcessShared {
     comp: RtComp,
     /// Master limiter publications. `process` loads them through `&mut LimitReader`.
     limit: RtLimit,
+    /// Master chain order. `process` loads it through `&mut ChainReader`.
+    chain: RtChain,
     /// Sample rate from the last `process`, so the loop thread can rebuild.
     /// Zero until the first callback.
     pub observed_rate: AtomicU32,
@@ -372,11 +393,12 @@ impl ProcessShared {
     }
 
     /// Readers stay in the shared state. The writers are the loop thread's.
-    fn pair() -> (Self, EqWriter, CompWriter, LimitWriter) {
+    fn pair() -> (Self, EqWriter, CompWriter, LimitWriter, ChainWriter) {
         let (eq_writer, eq_reader) = open();
         let (comp_writer, comp_reader) = open_comp();
         let (limit_writer, limit_reader) = open_limit();
-        let own = limit_writer.reported_latency_samples();
+        let (chain_writer, chain_reader) = open_chain();
+        let own = chain_writer.reported_with_limiter(&limit_writer);
         (
             Self {
                 params: AtomicParams::new(),
@@ -389,6 +411,9 @@ impl ProcessShared {
                 },
                 limit: RtLimit {
                     reader: UnsafeCell::new(limit_reader),
+                },
+                chain: RtChain {
+                    reader: UnsafeCell::new(chain_reader),
                 },
                 observed_rate: AtomicU32::new(0),
                 mixer: RtMixer::new(48_000),
@@ -414,6 +439,7 @@ impl ProcessShared {
             eq_writer,
             comp_writer,
             limit_writer,
+            chain_writer,
         )
     }
 
@@ -501,6 +527,19 @@ fn output_direction_latency(upstream: u32, own: u32) -> u32 {
     upstream.saturating_add(own)
 }
 
+fn limiter_request_matches(writer: &LimitWriter, settings: LimitSettings) -> bool {
+    let current = writer.master_settings();
+    if settings.enabled() != current.enabled() || settings.ceiling_db() != current.ceiling_db() {
+        return false;
+    }
+    if settings.lookahead_ms() == current.lookahead_ms() {
+        return true;
+    }
+    settings.lookahead_ms() == 0.0
+        && current.lookahead_ms() == LIMIT_LOOKAHEAD_DEFAULT_MS
+        && writer.master_cap_demoted()
+}
+
 pub struct MixFilter {
     raw: NonNull<c_void>,
     events: Box<PwFilterEvents>,
@@ -512,6 +551,8 @@ pub struct MixFilter {
     comp: CompWriter,
     /// The only limiter producer. Not shared with `process`.
     limit: LimitWriter,
+    /// The only chain producer. Not shared with `process`.
+    chain: ChainWriter,
     destroyed: bool,
     /// True after `pw_filter_connect`. Param updates stay off the unit-test
     /// filter, which has no PipeWire object.
@@ -551,7 +592,7 @@ impl MixFilter {
         tone: bool,
     ) -> Result<Self, pw::Error> {
         let name = CString::new("omamix mix engine").expect("name");
-        let (shared, eq, comp, limit) = ProcessShared::pair();
+        let (shared, eq, comp, limit, chain) = ProcessShared::pair();
         let shared = Arc::new(shared);
         shared.tone.store(tone, Ordering::Release);
         let raw = unsafe { pw_filter_new(core.as_raw_ptr(), name.as_ptr(), props.into_raw()) };
@@ -588,6 +629,7 @@ impl MixFilter {
             eq,
             comp,
             limit,
+            chain,
             destroyed: false,
             live: false,
             latency_sent: None,
@@ -700,6 +742,35 @@ impl MixFilter {
         self.limit.apply_master_settings(settings);
         self.log_recorded_demotions();
         self.note_process_latency();
+    }
+
+    /// Publish chain order, bypass, and gain. Does not rewrite compressor
+    /// or limiter settings. The loop thread calls this.
+    pub(crate) fn publish_chain(&mut self, chain: &MasterChain) {
+        self.chain.publish(chain);
+        self.note_process_latency();
+    }
+
+    /// Publish `chain` and, when a block's settings differ, the compressor
+    /// or limiter block those settings name.
+    ///
+    /// A 0 ms lookahead the cap already rewrote to 5 ms is left as it is, so
+    /// a second copy of the same request does not publish the limiter again.
+    pub(crate) fn apply_chain(&mut self, chain: &MasterChain) {
+        if let Some(mut settings) = chain.compressor_settings() {
+            settings.set_sample_rate(self.comp.sample_rate());
+            if settings != self.comp.master_settings() {
+                self.comp.apply_master_settings(settings);
+            }
+        }
+        if let Some(mut settings) = chain.limiter_settings() {
+            settings.set_sample_rate(self.limit.sample_rate());
+            if !limiter_request_matches(&self.limit, settings) {
+                self.limit.apply_master_settings(settings);
+                self.log_recorded_demotions();
+            }
+        }
+        self.publish_chain(chain);
     }
 
     pub(crate) fn set_limit_rate(&mut self, rate: u32) -> bool {
@@ -829,9 +900,11 @@ impl MixFilter {
     }
 
     /// Samples of delay in the mix at the callback rate and quantum.
-    /// A bypassed master counts as 0.
+    ///
+    /// This is the sum of the published chain. The default chain is the
+    /// limiter delay. A chain-bypassed limiter counts as 0.
     pub fn reported_latency_samples(&self) -> u32 {
-        self.limit.reported_latency_samples()
+        self.chain.reported_with_limiter(&self.limit)
     }
 
     pub fn node_id(&self) -> Option<u32> {
@@ -1011,7 +1084,7 @@ impl MixFilter {
     /// `destroyed` is already set.
     #[cfg(test)]
     fn without_filter() -> Self {
-        let (shared, eq, comp, limit) = ProcessShared::pair();
+        let (shared, eq, comp, limit, chain) = ProcessShared::pair();
         Self {
             raw: NonNull::dangling(),
             events: Box::new(PwFilterEvents {
@@ -1034,6 +1107,7 @@ impl MixFilter {
             eq,
             comp,
             limit,
+            chain,
             destroyed: true,
             live: false,
             latency_sent: None,
@@ -1268,12 +1342,13 @@ fn render(shared: &ProcessShared, position: &SpaIoPosition) {
     shared.slot.write(&out_l[..frames], &out_r[..frames]);
 }
 
-/// Strip mix, master limiter, optional tone, then the master fader, then the master meter.
+/// Strip mix, master chain, optional tone, then the master fader, then the master meter.
 ///
-/// `render` calls this after the port pointers are resolved. The master
-/// limiter is on at 5 ms, so a short block comes out as the delay line, not
-/// the current input. Tone and the master fader run after that limiter. The
-/// mixer cell is the data loop's, or a single-threaded test's.
+/// `render` calls this after the port pointers are resolved. The default
+/// chain is the compressor and then the limiter. The limiter is on at 5 ms,
+/// so a short block comes out as the delay line, not the current input. Tone
+/// and the master fader run after that chain. The mixer cell is the data
+/// loop's, or a single-threaded test's.
 fn mix_resolved_strips(
     shared: &ProcessShared,
     inputs: &[Option<StripBlockInput<'_>>],
@@ -1290,10 +1365,12 @@ fn mix_resolved_strips(
     let mixer = unsafe { &mut *shared.mixer.get() };
     // Safety: same data-loop mutator as the mixer cell.
     let scopes = unsafe { &mut *shared.scopes.writers() };
-    // SAFETY: one `&mut EqReader`, one `&mut CompReader`, and one `&mut LimitReader` for this callback. The cells are not borrowed again until `process` returns. They do not alias `strips` or the meters.
+    // SAFETY: one `&mut EqReader`, one `&mut CompReader`, one `&mut LimitReader`, and one `&mut ChainReader` for this callback. The cells are not borrowed again until `process` returns. They do not alias `strips` or the meters.
     let eq = unsafe { &mut *shared.eq.reader_ptr() };
     let comp = unsafe { &mut *shared.comp.reader_ptr() };
     let limit = unsafe { &mut *shared.limit.reader_ptr() };
+    let chain = unsafe { &mut *shared.chain.reader_ptr() };
+    mixer.load_chain(chain);
     mixer.process(
         &shared.strips,
         eq,
@@ -1733,7 +1810,7 @@ mod tests {
 
     #[test]
     fn default_strip_mix_still_delays_when_the_publication_rate_differs() {
-        let (shared, _eq, _comp, limit) = ProcessShared::pair();
+        let (shared, _eq, _comp, limit, _chain) = ProcessShared::pair();
         assert!(!shared.tone.load(Ordering::Acquire));
         assert_eq!(shared.params.master_linear(), 1.0);
         assert!(limit.master_settings().enabled());
@@ -1752,7 +1829,7 @@ mod tests {
 
     #[test]
     fn default_strip_mix_delays_when_the_rate_matches_the_master_limiter() {
-        let (shared, _eq, _comp, limit) = ProcessShared::pair();
+        let (shared, _eq, _comp, limit, _chain) = ProcessShared::pair();
         let delay = limit.master_latency_samples() as usize;
         assert_eq!(
             delay,
@@ -1773,7 +1850,7 @@ mod tests {
 
     #[test]
     fn master_lookahead_returns_the_quiet_block_after_the_delay() {
-        let (shared, _eq, _comp, limit) = ProcessShared::pair();
+        let (shared, _eq, _comp, limit, _chain) = ProcessShared::pair();
         let delay = limit.master_latency_samples() as usize;
         let quiet_l = [0.1f32, -0.2, 0.05, 0.15, -0.15, -0.0, 0.08, -0.003];
         let quiet_r = [-0.1f32, 0.2, -0.05, 0.12, 0.05, -0.08, 0.0, 0.003];
@@ -1809,7 +1886,7 @@ mod tests {
     #[test]
     fn claiming_a_tap_slot_resets_inherited_strip_params() {
         use omamix_core::params::StripParamUpdate;
-        let (shared, mut eq, mut comp, _limit) = ProcessShared::pair();
+        let (shared, mut eq, mut comp, _limit, _chain) = ProcessShared::pair();
         assert!(shared.strips.apply(3, StripParamUpdate::Mute(true)));
         assert!(shared.strips.apply(3, StripParamUpdate::Solo(true)));
         assert!(shared.strips.apply(3, StripParamUpdate::Enabled(false)));

@@ -5,6 +5,7 @@
 
 use crate::comp::CompSettings;
 use crate::db::{self, BelowMin};
+use crate::effect::MasterChain;
 use crate::eq::EqSettings;
 use crate::fader;
 use crate::limit::LimitSettings;
@@ -82,6 +83,8 @@ pub struct MasterBus {
     pub eq: EqSettings,
     pub comp: CompSettings,
     pub limit: LimitSettings,
+    /// Master effect order. The default is the compressor, then the limiter.
+    pub chain: MasterChain,
 }
 
 impl MasterBus {
@@ -92,6 +95,13 @@ impl MasterBus {
     /// Same finite range as a channel fader. NaN mutes. +∞ clamps to the max boost.
     pub fn set_fader_db(&mut self, db: f32) {
         self.fader_db = fader::sanitize_fader_db(db);
+    }
+
+    /// Copy `comp` and `limit` onto the matching chain blocks.
+    ///
+    /// Order, bypass, and any gain blocks stay as they are.
+    pub fn sync_chain_params(&mut self) {
+        self.chain.mirror_settings(self.comp, self.limit);
     }
 }
 
@@ -107,6 +117,7 @@ impl Default for MasterBus {
             eq: EqSettings::flat(48_000),
             comp: CompSettings::bypass(48_000),
             limit: LimitSettings::master(48_000),
+            chain: MasterChain::standard(),
         }
     }
 }

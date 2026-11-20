@@ -843,7 +843,12 @@ fn default_lookahead_samples(callback_rate: u32, published_rate: u32) -> u32 {
     lookahead_samples(rate, LIMIT_LOOKAHEAD_DEFAULT_MS)
 }
 
-fn signal_delay_samples(
+/// Delay the callback applies for these limiter settings.
+///
+/// `0` when the limiter is bypassed. A stored lookahead of 0 ms is also 0,
+/// except when [`zero_ms_limiter_cap`] is 0: that quantum runs the default
+/// lookahead instead.
+pub(crate) fn signal_delay_samples(
     enabled: bool,
     lookahead_ms: f32,
     sample_rate: u32,
