@@ -183,8 +183,6 @@ impl MixSlot {
     pub fn write(&self, left: &[f32], right: &[f32]) {
         let n = left.len().min(right.len()).min(MIX_SLOT_CAP);
         let seq = self.seq.load(Ordering::Relaxed);
-        // Odd sequence: a reader must retry. The release fence publishes that
-        // odd value before the sample stores.
         self.seq.store(seq.wrapping_add(1) | 1, Ordering::Relaxed);
         fence(Ordering::Release);
         unsafe {
@@ -212,7 +210,6 @@ impl MixSlot {
                 left[..n].copy_from_slice(&src_l[..n]);
                 right[..n].copy_from_slice(&src_r[..n]);
             }
-            // Acquire the writer's release fence before trusting the second sequence.
             fence(Ordering::Acquire);
             let end = self.seq.load(Ordering::Relaxed);
             if start == end && end & 1 == 0 {
@@ -229,7 +226,6 @@ impl Default for MixSlot {
     }
 }
 
-// The slot is a seqlock. Readers and the single writer do not use a mutex.
 unsafe impl Sync for MixSlot {}
 
 #[cfg(test)]

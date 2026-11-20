@@ -823,9 +823,6 @@ mod tests {
 
     #[test]
     fn same_client_capture_refuses_only_the_capturing_node() {
-        // Node 4 reads Mix Mic. Node 5 is another stream of that client and
-        // has no edge of its own, so it stays eligible. An Application strip
-        // can still match it by media.name.
         let nodes = [
             NodeRef {
                 id: 4,

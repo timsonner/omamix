@@ -1,24 +1,3 @@
-# Maintainer: timsonner
-# The git source is unpinned: sha256sums is SKIP and pkgver() follows
-# whatever commit HEAD is when makepkg runs.
-# The omamix binary does not call pactl. libpulse is not a dependency.
-#
-# Runtime NEEDED (readelf -d on the pipewire-feature binary):
-#   libpipewire-0.3.so.0, libgcc_s.so.1, libm.so.6, libc.so.6,
-#   ld-linux-x86-64.so.2.
-# libpipewire is that runtime library. It is not also a makedepend:
-# Arch installs depends before the build.
-# glibc covers libc, libm, and the dynamic linker.
-# libgcc_s is implicit through the toolchain. gcc-libs and libgcc are omitted.
-# pipewire is the daemon. readelf NEEDED does not list it. It stays in
-# depends because Mix Mic cannot run without that daemon.
-# eframe dlopens Wayland, xkbcommon, and EGL even though readelf NEEDED
-# omits them, so those packages stay:
-#   wayland       libwayland-client.so.0 and libwayland-egl.so.1
-#   libxkbcommon  libxkbcommon.so.0
-#   mesa          libEGL.so.1
-# wgpu also dlopens libvulkan.so.1 when a loader is present. That loader
-# is not a package dependency.
 pkgname=omamix-git
 pkgver=0.1.0
 pkgrel=1
@@ -37,8 +16,6 @@ depends=(
 makedepends=('git' 'cargo' 'clang' 'pkgconf')
 provides=('omamix')
 conflicts=('omamix')
-# Arch repository packages only. Do not add AUR dependencies.
-# libpipewire must be >= 1.2. The pipewire feature's build.rs rejects older headers.
 options=('!lto' '!debug')
 
 source=("omamix::git+https://github.com/timsonner/omamix.git")

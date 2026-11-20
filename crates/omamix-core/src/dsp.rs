@@ -228,7 +228,6 @@ mod tests {
         let (left, right) = constant_power_gains(0.0);
         assert!((left - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-5);
         assert!((right - left).abs() < 1e-5);
-        // The strip law is unity here. This formula must not replace it.
         assert!((balance_gains(0.0).0 - left).abs() > 0.2);
         let (hard_left, hard_left_right) = constant_power_gains(-1.0);
         assert!((hard_left - 1.0).abs() < 1e-5);

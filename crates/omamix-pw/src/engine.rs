@@ -782,10 +782,6 @@ fn pw_thread(
 
     mainloop.run();
 
-    // Drop order after run() returns: timer, channel, monitor, listener,
-    // shared_loop (links, bindings, then the filter Rc), registry, core.
-    // object.linger=false plus the client disconnect removes anything still
-    // exported. Drop the filter explicitly before the core.
     drop(timer);
     drop(_attached);
     drop(listener);
@@ -1095,7 +1091,6 @@ struct Tap {
 }
 
 struct LiveLink {
-    // Listener drops first (struct fields drop in declaration order).
     _listener: pw::link::LinkListener,
     _link: pw::link::Link,
 }
@@ -1728,7 +1723,6 @@ fn bind_one(shared: &Rc<LoopShared>, global: &GlobalObject<PropertiesBox>) {
             return;
         }
     }
-    // The registry pointer stays valid until pw_thread drops it, after this timer.
     let registry_ptr = shared.inner.borrow().registry;
     let registry = unsafe { &*registry_ptr.cast::<pw::registry::Registry>() };
     let id = global.id;
@@ -2180,7 +2174,6 @@ fn create_link(
     output_port: u32,
     input_port: u32,
 ) -> Result<u64, ()> {
-    // The core pointer stays valid until pw_thread drops it, after this timer.
     let core_ptr = shared.inner.borrow().core;
     let core = unsafe { &*core_ptr.cast::<pw::core::Core>() };
     let mut props = PropertiesBox::new();

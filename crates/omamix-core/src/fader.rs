@@ -235,7 +235,6 @@ mod tests {
     fn small_trackpad_deltas_accumulate_to_one_notch() {
         let mut accum = WheelAccum::default();
         let mut notches = 0;
-        // Nine events of 4 points are 36, short of POINTS_PER_NOTCH (40).
         for _ in 0..9 {
             notches += accum.push(WheelUnit::Point, 4.0);
         }
@@ -245,7 +244,6 @@ mod tests {
         assert_eq!(notches, 1);
         assert!(accum.pending().abs() < 1e-4);
 
-        // A swipe of many small events is a couple of notches, not one per event.
         let mut swipe = WheelAccum::default();
         let mut total = 0;
         for _ in 0..20 {
@@ -262,7 +260,6 @@ mod tests {
         let mut accum = WheelAccum::default();
         assert_eq!(accum.push(WheelUnit::Point, 30.0), 0);
         assert!((accum.pending() - 0.75).abs() < 1e-3);
-        // +0.75 pending must not swallow the first notch the other way.
         assert_eq!(accum.push(WheelUnit::Line, -1.0), -1);
         assert_eq!(accum.pending(), 0.0);
     }
@@ -290,7 +287,6 @@ mod tests {
 
     #[test]
     fn scrolling_elsewhere_does_not_move_a_focused_fader() {
-        // Last click left focus here. The pointer is over some other widget.
         let start = -6.0;
         let mut accum = WheelAccum::default();
         let notches = accum.push(WheelUnit::Line, 1.0);

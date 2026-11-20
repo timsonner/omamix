@@ -139,7 +139,6 @@ fn rms_linear(sum_sq: f64, count: f64) -> f32 {
     if count <= 0.0 {
         return 0.0;
     }
-    // A non-finite sum is an overflowed loud block, not silence.
     if !sum_sq.is_finite() {
         return f32::INFINITY;
     }
@@ -217,8 +216,6 @@ impl MeterDisplay {
         } else {
             0.0
         };
-        // Equal peaks refresh the hold, so a steady tone does not fall.
-        // −∞ >= −∞ is true, and refreshing silence is a no-op.
         if block_peak >= self.peak_db {
             self.peak_db = block_peak;
             self.hold_secs = PEAK_HOLD_SECS;
