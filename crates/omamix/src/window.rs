@@ -498,8 +498,9 @@ impl eframe::App for WindowHost {
             sample_rate,
         };
         let master_edit = egui::Panel::right("omamix-master")
-            .resizable(false)
-            .exact_size(ui::MASTER_SIDE_WIDTH)
+            .resizable(true)
+            .default_size(ui::MASTER_SIDE_DEFAULT_WIDTH)
+            .min_size(ui::MASTER_SIDE_MIN_WIDTH)
             .show(ui, |ui| ui::master_panel(ui, master_view));
         if self
             .picker
