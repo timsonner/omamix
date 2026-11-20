@@ -80,6 +80,7 @@ mod tests {
         assert_eq!(props.get("priority.session"), Some("1"));
         assert_eq!(props.get("priority.driver"), Some("1"));
         assert!(props.get("node.latency").is_none());
+        assert_eq!(props.get("monitor.passthrough"), Some("true"));
         assert_eq!(props.get("node.dont-reconnect"), Some("true"));
         assert_eq!(props.get("object.linger"), Some("false"));
         assert_eq!(props.get(contract::OMAMIX_OWNED_KEY), Some("true"));
