@@ -9,7 +9,9 @@ use std::cell::UnsafeCell;
 use std::ffi::{CString, c_char, c_void};
 use std::ptr::{self, NonNull};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 
 use omamix_core::comp::{CompReader, CompSettings, CompUpdate, CompWriter, open as open_comp};
 use omamix_core::effect::{ChainReader, ChainWriter, MasterChain, open as open_chain};
@@ -81,6 +83,7 @@ struct ClearJob {
 }
 
 pub const MAX_TAP_PORTS: usize = omamix_core::params::STRIP_SLOT_COUNT;
+const CALLBACK_RING: usize = 8192;
 
 #[repr(C)]
 struct SpaFraction {
@@ -379,12 +382,63 @@ pub struct ProcessShared {
     /// `on_param_changed` and reads it in `write_known_port_latency`.
     /// The audio callback does not read it.
     upstream_rate: AtomicU32,
+    live_cap: AtomicU32,
+    callback_us: Box<[AtomicU32]>,
+    callback_index: AtomicUsize,
+    callback_over: AtomicU64,
+}
+
+fn callback_ring() -> Box<[AtomicU32]> {
+    let mut samples = Vec::with_capacity(CALLBACK_RING);
+    for _ in 0..CALLBACK_RING {
+        samples.push(AtomicU32::new(0));
+    }
+    samples.into_boxed_slice()
+}
+
+fn callback_rank(sorted: &[u32], pct: u32) -> u32 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = (pct as usize * sorted.len()).saturating_add(99) / 100;
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
 }
 
 impl ProcessShared {
     #[cfg(test)]
     fn new() -> Self {
         Self::pair().0
+    }
+
+    pub(crate) fn live_cap(&self) -> u32 {
+        self.live_cap.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn store_live_cap(&self, cap: u32) {
+        self.live_cap.store(cap, Ordering::Release);
+        self.callback_index.store(0, Ordering::Relaxed);
+        self.callback_over.store(0, Ordering::Relaxed);
+    }
+
+    pub(crate) fn callback_summary(&self) -> (u32, u32, u32, u64, u64) {
+        let n = self.callback_index.load(Ordering::Relaxed);
+        let len = self.callback_us.len();
+        let count = n.min(len);
+        let mut samples = Vec::with_capacity(count);
+        for index in 0..count {
+            samples.push(self.callback_us[index].load(Ordering::Relaxed));
+        }
+        samples.sort_unstable();
+        let p50 = callback_rank(&samples, 50);
+        let p99 = callback_rank(&samples, 99);
+        let max = samples.last().copied().unwrap_or(0);
+        (
+            p50,
+            p99,
+            max,
+            u64::try_from(n).unwrap_or(u64::MAX),
+            self.callback_over.load(Ordering::Relaxed),
+        )
     }
 
     /// Readers stay in the shared state. The writers are the loop thread's.
@@ -430,6 +484,10 @@ impl ProcessShared {
                 upstream_fl: std::array::from_fn(|_| AtomicU32::new(0)),
                 upstream_fr: std::array::from_fn(|_| AtomicU32::new(0)),
                 upstream_rate: AtomicU32::new(0),
+                live_cap: AtomicU32::new(0),
+                callback_us: callback_ring(),
+                callback_index: AtomicUsize::new(0),
+                callback_over: AtomicU64::new(0),
             },
             eq_writer,
             comp_writer,
@@ -578,6 +636,11 @@ pub struct MixFilter {
     /// A real connect leaves it false and adds the port.
     #[cfg(test)]
     reject_ports: bool,
+    cap_rate: u32,
+    cap_quantum: u32,
+    cap_lookahead_bits: u32,
+    cap_enabled: bool,
+    cap_stable: u8,
 }
 
 impl MixFilter {
@@ -641,6 +704,11 @@ impl MixFilter {
             demotion_lines: Vec::new(),
             #[cfg(test)]
             reject_ports: false,
+            cap_rate: 0,
+            cap_quantum: 0,
+            cap_lookahead_bits: 0,
+            cap_enabled: false,
+            cap_stable: 0,
         };
         filter.add_output_ports()?;
         let samples = filter.reported_latency_samples();
@@ -674,6 +742,55 @@ impl MixFilter {
 
     pub fn shared(&self) -> Arc<ProcessShared> {
         Arc::clone(&self.shared)
+    }
+
+    pub(crate) fn live_cap(&self) -> u32 {
+        self.shared.live_cap()
+    }
+
+    pub(crate) fn master_limit_settings(&self) -> omamix_core::limit::LimitSettings {
+        self.limit.master_settings()
+    }
+
+    pub(crate) fn cap_matches(
+        &self,
+        rate: u32,
+        quantum: u32,
+        enabled: bool,
+        lookahead_ms: f32,
+    ) -> bool {
+        self.live_cap() > 0
+            && self.cap_rate == rate
+            && self.cap_quantum == quantum
+            && self.cap_enabled == enabled
+            && self.cap_lookahead_bits == lookahead_ms.to_bits()
+    }
+
+    pub(crate) fn store_live_cap(
+        &mut self,
+        rate: u32,
+        quantum: u32,
+        enabled: bool,
+        lookahead_ms: f32,
+        cap: u32,
+    ) {
+        let cap = cap
+            .min(STRIP_SLOT_COUNT as u32)
+            .max(omamix_core::live_cap::LIVE_CAP_FALLBACK);
+        self.shared.store_live_cap(cap);
+        self.cap_rate = rate;
+        self.cap_quantum = quantum;
+        self.cap_enabled = enabled;
+        self.cap_lookahead_bits = lookahead_ms.to_bits();
+        self.cap_stable = 0;
+    }
+
+    pub(crate) fn note_cap_stable(&mut self) {
+        self.cap_stable = self.cap_stable.saturating_add(1);
+    }
+
+    pub(crate) fn cap_settled(&self) -> bool {
+        self.live_cap() > 0 && self.cap_stable >= 1
     }
 
     pub(crate) fn apply_strip_eq(&mut self, slot: u16, update: EqUpdate) -> bool {
@@ -938,6 +1055,23 @@ impl MixFilter {
 
     /// One stereo tap. Reuses the first empty slot. Returns that slot.
     pub fn add_tap_ports(&mut self, peer: u32) -> Result<usize, ()> {
+        let cap = self.shared.live_cap() as usize;
+        if cap == 0 {
+            return Err(());
+        }
+        let occupied = (0..MAX_TAP_PORTS)
+            .filter(|index| {
+                !self.shared.inputs_fl[*index]
+                    .load(Ordering::Acquire)
+                    .is_null()
+                    || !self.shared.inputs_fr[*index]
+                        .load(Ordering::Acquire)
+                        .is_null()
+            })
+            .count();
+        if occupied >= cap {
+            return Err(());
+        }
         let slot = (0..MAX_TAP_PORTS)
             .find(|index| {
                 self.shared.inputs_fl[*index]
@@ -1096,6 +1230,9 @@ impl MixFilter {
     #[cfg(test)]
     fn without_filter() -> Self {
         let (shared, eq, comp, limit, chain) = ProcessShared::pair();
+        shared
+            .live_cap
+            .store(STRIP_SLOT_COUNT as u32, Ordering::Release);
         Self {
             raw: NonNull::dangling(),
             events: Box::new(PwFilterEvents {
@@ -1129,6 +1266,11 @@ impl MixFilter {
             port_latency_writes: 0,
             demotion_lines: Vec::new(),
             reject_ports: true,
+            cap_rate: 0,
+            cap_quantum: 0,
+            cap_lookahead_bits: 0,
+            cap_enabled: false,
+            cap_stable: 0,
         }
     }
 
@@ -1297,6 +1439,7 @@ unsafe extern "C" fn on_process(data: *mut c_void, position: *mut SpaIoPosition)
 }
 
 fn render(shared: &ProcessShared, position: &SpaIoPosition) {
+    let started = std::time::Instant::now();
     let n = position.clock.duration;
     if n == 0 || n > 16_384 {
         return;
@@ -1315,7 +1458,8 @@ fn render(shared: &ProcessShared, position: &SpaIoPosition) {
     let taps = shared
         .input_count
         .load(Ordering::Acquire)
-        .min(MAX_TAP_PORTS);
+        .min(MAX_TAP_PORTS)
+        .min(shared.live_cap() as usize);
     let mut ptr_l = [std::ptr::null::<f32>(); MAX_TAP_PORTS];
     let mut ptr_r = [std::ptr::null::<f32>(); MAX_TAP_PORTS];
     for index in 0..taps {
@@ -1343,6 +1487,35 @@ fn render(shared: &ProcessShared, position: &SpaIoPosition) {
 
     let frames = (n as usize).min(MIX_SLOT_CAP);
     shared.slot.write(&out_l[..frames], &out_r[..frames]);
+    note_callback(
+        shared,
+        started,
+        n,
+        position.clock.rate.num,
+        position.clock.rate.denom,
+    );
+}
+
+fn note_callback(
+    shared: &ProcessShared,
+    started: std::time::Instant,
+    frames: u32,
+    num: u32,
+    denom: u32,
+) {
+    let elapsed = started.elapsed().as_micros();
+    let us = u32::try_from(elapsed).unwrap_or(u32::MAX);
+    let len = shared.callback_us.len();
+    if len == 0 {
+        return;
+    }
+    let index = shared.callback_index.fetch_add(1, Ordering::Relaxed);
+    shared.callback_us[index % len].store(us, Ordering::Relaxed);
+    let rate = negotiated_rate(num, denom).max(1);
+    let quantum_us = u64::from(frames).saturating_mul(1_000_000) / u64::from(rate);
+    if u64::from(us) > quantum_us {
+        shared.callback_over.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Strip mix, master chain, optional tone, then the master fader, then the master meter.
@@ -2011,6 +2184,20 @@ mod tests {
         );
         assert_eq!(scope_l, [1.0; 3]);
         assert_eq!(scope_r, [1.0; 3]);
+    }
+
+    #[test]
+    fn a_live_cap_of_one_refuses_another_tap() {
+        use omamix_core::params::StripParamUpdate;
+        let mut filter = MixFilter::without_filter();
+        filter.shared.store_live_cap(1);
+        let occupied = std::ptr::without_provenance_mut::<c_void>(0x11);
+        filter.shared.inputs_fl[0].store(occupied, Ordering::Release);
+        filter.shared.inputs_fr[0].store(occupied, Ordering::Release);
+        assert!(filter.shared.strips.apply(1, StripParamUpdate::Mute(true)));
+        assert!(filter.add_tap_ports(4).is_err());
+        assert!(filter.shared.strips.mute(1));
+        assert!(filter.shared.inputs_fl[1].load(Ordering::Acquire).is_null());
     }
 
     fn assert_minus_20_sine(peak: f32, rms: f32) {
