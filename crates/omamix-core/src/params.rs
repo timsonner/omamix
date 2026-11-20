@@ -169,7 +169,6 @@ impl OnePole {
     fn next(&mut self, target: f32) -> f32 {
         let target = finite_or(target, 0.0);
         let y = self.y + self.coeff * (target - self.y);
-        // Flush denormals. The 1% settle point is far above this floor.
         let y = if y.is_finite() {
             if y.abs() < 1.0e-15 { 0.0 } else { y }
         } else {
@@ -587,7 +586,6 @@ impl StripMixer {
         self.limit.begin(limit, frames, sample_rate);
 
         for frame in 0..frames {
-            // +0.0. Adding -0.0 yields +0.0, so a negative zero is not kept.
             let mut left = 0.0f32;
             let mut right = 0.0f32;
             for slot in 0..slots {
@@ -907,9 +905,6 @@ mod tests {
         let mut limit = LimitReader::bypassed();
         let mut eq = EqReader::flat();
         let mut comp = CompReader::bypassed();
-        // Index 5 is -0.0. The sum starts at +0.0, so that sample comes back
-        // as +0.0. `assert_eq` treats the two zeros as equal. The sign bit is
-        // the check below.
         let samples_l = [0.1f32, -0.25, 0.5, 1.0, -1.0, -0.0, 0.70710677, -0.003];
         let samples_r = [-0.1f32, 0.25, -0.5, 0.125, 0.5, -1.0, 0.0, 0.003];
         assert_eq!(samples_l[5].to_bits(), (-0.0f32).to_bits());
@@ -1020,7 +1015,6 @@ mod tests {
             );
             near(block[n5 - 1], 1.0, 0.01 + SETTLE_SLACK);
 
-            // A second solo keeps both strips. Mute still wins on the soloed one.
             bank.apply(1, StripParamUpdate::Solo(true));
             mixer.align_to_targets(&bank, 2);
             let (before_mute, _) = process_constant(&mut mixer, &bank, 2, 1.0, 1, rate);
@@ -1069,8 +1063,6 @@ mod tests {
             let (mut eq_writer, mut eq) = open();
             assert!(eq_writer.set_sample_rate(rate));
             let (mut comp_writer, mut comp) = open_comp();
-            // Settled biquads, not the identity bypass. A 1 kHz boost leaves
-            // a constant input audible, so a skipped filter cannot pass.
             assert!(eq_writer.apply(
                 0,
                 EqUpdate::Band {
@@ -1148,7 +1140,6 @@ mod tests {
                 "an active compressor should publish gain reduction"
             );
 
-            // The ramp runs on the next block after a new publication.
             assert!(eq_writer.apply(
                 0,
                 EqUpdate::Band {

@@ -325,7 +325,6 @@ fn run_list() -> ExitCode {
 
 #[cfg(not(feature = "pipewire"))]
 fn start_headless(cli: Cli, scene: Scene, fallback_missing_devices: bool) -> ExitCode {
-    // Parsed so a bad --strips value still fails above. Nothing here connects.
     let _ = (cli, scene, fallback_missing_devices);
     eprintln!(
         "omamix: --headless requires a build with --features pipewire; no audio client was opened"

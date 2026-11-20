@@ -1066,8 +1066,6 @@ mod tests {
                 }
                 collect(&path, out);
             } else if is_private_procedure(&path) {
-                // The private procedure links and writes the private default.
-                // Every other file, including another prove.sh, stays in the scan.
             } else if matches!(
                 path.extension().and_then(|ext| ext.to_str()),
                 Some("rs") | Some("sh") | Some("toml")

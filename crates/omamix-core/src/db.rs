@@ -126,7 +126,6 @@ mod tests {
 
     #[test]
     fn cubic_forty_percent_is_about_minus_24_db() {
-        // 0.40³ = 0.064; 20·log10(0.064) = −23.876 dB.
         let db = cubic_to_db(0.4);
         close(db, -23.876);
         assert!((db + 24.0).abs() < 0.2);
@@ -137,7 +136,6 @@ mod tests {
         assert!(cubic_to_db(0.0).is_infinite() && cubic_to_db(0.0).is_sign_negative());
         assert_eq!(db_to_linear(f32::NEG_INFINITY), 0.0);
         assert_eq!(linear_to_db(0.0), f32::NEG_INFINITY);
-        // +20 dB is a 10× amplitude. This is the conversion, not a measured mic offset.
         close(db_to_linear(20.0), 10.0);
         close(linear_to_db(10.0), 20.0);
     }

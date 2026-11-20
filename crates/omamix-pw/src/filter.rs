@@ -228,25 +228,20 @@ impl RtScopes {
 
     #[cfg(test)]
     fn push_strip(&self, slot: usize, left: &[f32], right: &[f32]) -> usize {
-        // Safety: `RtScopes`'s Sync bound is one data-loop writer. This call
-        // is that writer, or a test that does not share the cell.
         unsafe { (*self.writers.get()).push(slot, left, right) }
     }
 
     #[cfg(test)]
     fn pop_strip(&self, slot: usize, left: &mut [f32], right: &mut [f32]) -> usize {
-        // Safety: one reader pops a strip ring. It does not alias the writer cell.
         unsafe { (*self.readers.get()).pop(slot, left, right) }
     }
 
     fn push_master(&self, left: &[f32], right: &[f32]) -> usize {
-        // Safety: same data-loop writer as `push_strip`.
         unsafe { (*self.master_writer.get()).push(left, right) }
     }
 
     #[cfg(test)]
     fn pop_master(&self, left: &mut [f32], right: &mut [f32]) -> usize {
-        // Safety: one reader pops the master ring. It does not alias the writer cell.
         unsafe { (*self.master_reader.get()).pop(left, right) }
     }
 
@@ -953,9 +948,6 @@ impl MixFilter {
                         .is_null()
             })
             .ok_or(())?;
-        // Neutral before either new port pointer is stored. The coefficient
-        // publish is here, on the loop thread. `clear_tap_slot` only clears
-        // filter memory on the data loop.
         prepare_tap_slot(&self.shared, &mut self.eq, &mut self.comp, slot);
         let fl = self.add_port(
             pw::spa::utils::Direction::Input,
@@ -970,9 +962,6 @@ impl MixFilter {
         ) {
             Ok(fr) => fr,
             Err(()) => {
-                // FL is already on the filter. Clear it on the data loop, then
-                // free it. A failed clear leaves the pointer in the slot until
-                // destroy, and that slot stays occupied.
                 self.remove_tap_ports(slot);
                 return Err(());
             }
@@ -1002,8 +991,6 @@ impl MixFilter {
         if slot >= MAX_TAP_PORTS {
             return;
         }
-        // Flat coefficients are built here, off the data loop. The invoke
-        // below only clears filter memory and the port pointers.
         self.eq.reset_slot(slot);
         self.comp.reset_slot(slot);
         self.shared.clear_upstream_slot(slot);
@@ -1181,8 +1168,6 @@ impl MixFilter {
         }
         self.destroyed = true;
         unsafe {
-            // Disconnect before the hook is removed so an in-flight process
-            // is not still using the filter when the node goes away.
             let _ = pw_filter_disconnect(self.raw.as_ptr());
             pw::spa::utils::hook::remove(*self.hook);
             pw_filter_destroy(self.raw.as_ptr());
@@ -1227,8 +1212,6 @@ unsafe extern "C" fn clear_tap_slot(
         count -= 1;
     }
     shared.input_count.store(count, Ordering::Release);
-    // Same data loop as `process`. Put the slot back to the neutral smoother
-    // and the neutral parameters so the next tap does not inherit a mute.
     reset_slot_atomics(shared, slot);
     unsafe { (*shared.mixer.get()).reset_slot(slot) };
     0
@@ -1293,7 +1276,6 @@ unsafe extern "C" fn on_state(data: *mut c_void, _old: i32, state: i32, _error: 
     if data.is_null() {
         return;
     }
-    // `data` is the ProcessShared arc held by MixFilter for the filter's life.
     let shared = unsafe { &*(data as *const ProcessShared) };
     shared.state.store(state, Ordering::Relaxed);
     let filter = shared.filter.load(Ordering::Acquire);
@@ -1308,7 +1290,6 @@ unsafe extern "C" fn on_process(data: *mut c_void, position: *mut SpaIoPosition)
         return;
     }
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // Same ProcessShared pointer pw_filter_add_listener received.
         let shared = unsafe { &*(data as *const ProcessShared) };
         let position = unsafe { &*position };
         render(shared, position);
@@ -1335,8 +1316,6 @@ fn render(shared: &ProcessShared, position: &SpaIoPosition) {
         .input_count
         .load(Ordering::Acquire)
         .min(MAX_TAP_PORTS);
-    // Copy the port addresses first. The `&mut` from `dsp_samples` must not
-    // still be live when the mixer borrows `out_l` / `out_r`.
     let mut ptr_l = [std::ptr::null::<f32>(); MAX_TAP_PORTS];
     let mut ptr_r = [std::ptr::null::<f32>(); MAX_TAP_PORTS];
     for index in 0..taps {
@@ -1384,10 +1363,7 @@ fn mix_resolved_strips(
 ) {
     let rate = negotiated_rate(num, denom);
     shared.observed_rate.store(rate, Ordering::Relaxed);
-    // Safety: `RtMixer`'s Sync bound is the data-loop mutator. This call is
-    // that mutator, or a test that does not share the cell.
     let mixer = unsafe { &mut *shared.mixer.get() };
-    // Safety: same data-loop mutator as the mixer cell.
     let scopes = unsafe { &mut *shared.scopes.writers() };
     // SAFETY: one `&mut EqReader`, one `&mut CompReader`, one `&mut LimitReader`, and one `&mut ChainReader` for this callback. The cells are not borrowed again until `process` returns. They do not alias `strips` or the meters.
     let eq = unsafe { &mut *shared.eq.reader_ptr() };
@@ -1412,7 +1388,6 @@ fn mix_resolved_strips(
         write_tone(shared, n, num, denom, out_l, out_r);
     }
 
-    // Unity unless the loop thread published a fader. No hidden mic boost.
     let gain = shared.params.master_linear();
     if gain != 1.0 {
         for sample in out_l.iter_mut().chain(out_r.iter_mut()) {
@@ -1759,8 +1734,6 @@ mod tests {
         }
         let away_from_zero = phase.min(1.0 - phase);
         assert!(away_from_zero < 0.02, "phase {phase}");
-        // The rise at t=0 is the starting sample, and the 440th rise is the
-        // first sample of the next second, outside this loop.
         assert_eq!(rises, 439);
     }
 

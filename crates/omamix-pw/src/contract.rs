@@ -120,7 +120,6 @@ pub fn app_capture_properties(node_name: &str) -> Vec<(String, String)> {
         ("node.passive".into(), "true".into()),
         ("stream.dont-remix".into(), "true".into()),
         ("node.autoconnect".into(), "false".into()),
-        // Leave this tap where we linked it. Do not send it to the default source.
         ("node.dont-reconnect".into(), "true".into()),
         ("object.linger".into(), "false".into()),
         (OMAMIX_OWNED_KEY.into(), "true".into()),

@@ -1,28 +1,4 @@
 #!/bin/bash
-# Private PipeWire procedure for docs/TESTING.md.
-# Execute this file. Do not source it.
-#
-# No verbose daemon flags. Stdout and stderr go to files under the per-run
-# scratch directory. Daemons are children of this script, not service-manager units.
-# PIPEWIRE_LOG_SYSTEMD=false is set before those daemons start, and
-# PIPEWIRE_DEBUG and WIREPLUMBER_DEBUG are unset, so daemon log lines go to
-# the private log files. That does not cover rtkit-daemon. It is a system
-# service, and it writes the journal when a process asks it for realtime.
-# The private pipewire and pipewire-pulse copies set rtkit.enabled = false.
-# DISABLE_RTKIT is set for the private processes so wireplumber and the
-# clients, which load libpipewire-module-rt from the system config, do not
-# ask rtkit either. Pidfiles live under the private root and are never printed.
-# trap cleanup EXIT INT TERM HUP tears the daemons down on success, failure,
-# Ctrl-C, SIGTERM, and SIGHUP. Monitor mode is not global. It is on only
-# while start_bg spawns a daemon, so that daemon gets its own process group.
-# A terminal Ctrl-C stays with this script and exits 130. cleanup removes the
-# per-run scratch directory and the private root. A second signal during
-# cleanup still removes the private root when that directory is still there.
-# cleanup returns early only after the root is gone. wpctl and stat snapshots
-# stay in shell variables, so a signal does not leave a status file behind.
-# After cleanup, pgrep -f reports a count, not pids.
-# Exit 0 is a clean pass. Exit 3 is PASSED WITH GAPS. Exit 1 is a failure.
-# SIGINT exits 130. SIGTERM exits 143. SIGHUP exits 129.
 
 if [ -z "${BASH_VERSION:-}" ]; then
   echo "scripts/prove.sh needs bash" >&2
@@ -56,8 +32,6 @@ OMAMIX_GAPS=()
 OMAMIX_HAD_DISABLE_RTKIT=0
 OMAMIX_OLD_DISABLE_RTKIT=
 
-# Only a fresh mktemp directory under /tmp is removed. /tmp/omamix-fixround
-# is refused and is never a scratch path.
 drop_scratch() {
   dir=$OMAMIX_SCRATCH
   [ -n "$dir" ] || return 0
@@ -77,10 +51,8 @@ drop_scratch() {
   esac
 }
 
-# Opt-in only. The kept directory is a fresh mktemp name, not a fixed path.
 keep_logs_if_requested() {
   [ "${OMAMIX_KEEP_LOGS:-}" = 1 ] || return 0
-  # A re-entered cleanup must not mint a second keep directory.
   [ "${OMAMIX_LOGS_KEPT:-}" = 1 ] && return 0
   [ -n "$OMAMIX_SCRATCH" ] || return 0
   [ -d "$OMAMIX_SCRATCH" ] || return 0
@@ -108,9 +80,6 @@ keep_logs_if_requested() {
   echo "kept private logs: $keep"
 }
 
-# A missing config directory is the line "absent" plus its path. That is a
-# pass when the after snapshot still says absent. An appearance, a removal,
-# or any other listing change fails the comparison.
 config_snapshot() {
   dir=$1
   if [ -d "$dir" ]; then
@@ -158,9 +127,6 @@ add_gap() {
   echo "$1"
 }
 
-# The committed templates set rtkit.enabled = false. Re-apply it on the
-# private copy if that line is missing. Never edit a file outside the
-# private root.
 set_rtkit_disabled() {
   conf=$1
   case "$conf" in
@@ -186,12 +152,6 @@ die() {
   exit 1
 }
 
-# Kill every daemon this script started, remove the private root, then count
-# leftover processes. The count is the only process fact this function prints.
-# The scratch directory holds logs and recordings. wpctl and stat text stays
-# in shell variables. A second call returns only when the private root is
-# already gone. If that directory is still there, the second call finishes
-# the kill and the rm. It still drops the scratch directory.
 cleanup() {
   if [ "$OMAMIX_CLEANED" = 1 ] && [ ! -d "${OMAMIX_PRIVATE_ROOT:-}" ]; then
     drop_scratch
@@ -200,9 +160,6 @@ cleanup() {
   OMAMIX_CLEANED=1
 
   root=$OMAMIX_PRIVATE_ROOT
-  # Pidfiles record the process. A second walk catches a child whose command
-  # line or environment still contains the private root. The shell running
-  # this script is skipped. Pids are not printed.
   signal_private() {
     sig=$1
     [ -n "$root" ] || return 0
@@ -216,8 +173,6 @@ cleanup() {
       done
     fi
     for cmdf in /proc/[0-9]*/cmdline; do
-      # A process can exit between the glob and the open. Skip it. Do not
-      # let grep print ENOENT.
       [ -r "$cmdf" ] || continue
       pid=${cmdf#/proc/}
       pid=${pid%/cmdline}
@@ -269,8 +224,6 @@ cleanup() {
     return 0
   fi
 
-  # The bracket keeps pgrep's own command line from matching the path.
-  # Escape regex metacharacters without a single-quoted sed expression.
   escaped=$root
   escaped=${escaped//\\/\\\\}
   escaped=${escaped//./\\.}
@@ -342,8 +295,6 @@ if [ ! -x "$OMAMIX_REPO/target/debug/omamix" ]; then
   die "prebuilt omamix binary is missing"
 fi
 
-# wpctl status can carry a device serial. Keep it in a variable, never a file,
-# so SIGKILL does not leave a snapshot.
 wpctl_before_raw=$(env -u PIPEWIRE_REMOTE -u PIPEWIRE_RUNTIME_DIR -u PULSE_RUNTIME_PATH \
   XDG_RUNTIME_DIR="$OMAMIX_REAL_RUNTIME" \
   HOME="$OMAMIX_REAL_HOME" \
@@ -368,7 +319,6 @@ install -d \
   "$OMAMIX_SCRATCH/log" \
   "$OMAMIX_SCRATCH/out"
 
-# Exports and the runtime guard come before any config is copied.
 export XDG_RUNTIME_DIR="$OMAMIX_PRIVATE_ROOT/runtime"
 export XDG_CONFIG_HOME="$OMAMIX_PRIVATE_ROOT/config"
 export XDG_STATE_HOME="$OMAMIX_PRIVATE_ROOT/state"
@@ -416,10 +366,6 @@ esac
 start_bg() {
   name=$1
   shift
-  # Monitor mode only for this spawn. The daemon gets its own process group,
-  # so cleanup can signal the group from the pidfile. The script stays in the
-  # terminal's foreground group, and a Ctrl-C reaches this script. The pid
-  # is not printed.
   set -m
   "$@" >"$OMAMIX_SCRATCH/log/${name}.log" 2>&1 </dev/null &
   pid=$!
@@ -526,8 +472,6 @@ echo "Mix Mic ready"
 
 socket="${XDG_RUNTIME_DIR:?}/omamix-private-0"
 
-# Background the recorder first. Link only after its node exists, then wait
-# before stopping it, so the tone is in the file and not only in a header.
 record_tone() {
   kind=$1
   wav="$OMAMIX_SCRATCH/out/${kind}.wav"
@@ -624,7 +568,6 @@ for _ in range(50):
     data = dump()
     in_fl = port_id(data, node_id, "input_FL") or port_id(data, node_id, "FL")
     in_fr = port_id(data, node_id, "input_FR") or port_id(data, node_id, "FR")
-    # A mono capture port is still a live input.
     if in_fl is None:
         for obj in ports(data):
             p = props(obj)
@@ -751,8 +694,6 @@ pw-dump -N -r "${XDG_RUNTIME_DIR:?}/omamix-private-0" \
   > "$OMAMIX_SCRATCH/out/private-dump.json"
 
 meta=$(pw-metadata -r "${XDG_RUNTIME_DIR:?}/omamix-private-0" -n default)
-# A here-string, not a pipe. Under pipefail, grep -q can close the pipe early
-# and the writer dies with SIGPIPE, which looks like a missing key.
 if ! grep -F -e 'default.audio.sink' <<< "$meta" >/dev/null; then
   die "default.audio.sink missing"
 fi
@@ -763,8 +704,6 @@ if grep -F -e 'default.configured' <<< "$meta" >/dev/null; then
   die "default.configured was present before the warning check"
 fi
 
-# After the captures: point the private default at Mix Mic. omamix removes
-# that node and logs the warning. This stays on the private socket.
 pw-metadata -r "${XDG_RUNTIME_DIR:?}/omamix-private-0" \
   -n default 0 default.audio.source '{ "name": "omamix.mix-mic" }' \
   >"$OMAMIX_SCRATCH/log/metadata-set.txt" 2>&1
@@ -816,10 +755,6 @@ fi
 
 cleanup || die "private-root processes remained after cleanup"
 
-# The before text is a shell variable, so cleanup can remove every scratch
-# file first. Each wpctl status is a new client, so that one line's id and
-# pid change every run. Compare the rest. Do not print the status and do not
-# write it to a file. A missing or failing wpctl on either side is a gap.
 if [ "$OMAMIX_WPCTL_BEFORE" != 1 ]; then
   add_gap "live graph not compared (wpctl before missing or failed)"
 else
@@ -853,8 +788,6 @@ unset OMAMIX_STAT_BEFORE OMAMIX_STAT_AFTER
 echo "stat after:"
 print_config_mtimes || die "could not stat config trees"
 
-# Directories are already gone. Drop the traps so a late signal cannot change
-# the verdict, then say what actually happened.
 trap - EXIT INT TERM HUP
 if [ "${#OMAMIX_GAPS[@]}" -eq 0 ]; then
   echo "private procedure passed"
