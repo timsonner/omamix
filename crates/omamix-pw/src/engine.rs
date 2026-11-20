@@ -32,6 +32,14 @@
 //! kind, so a later default-source name moves the tap instead of staying on
 //! the name read at startup.
 //!
+//! Each node that feeds a strip is read for its Props param (`mute`,
+//! `channelVolumes`, and `softMute` / `softVolumes` when the pod has them).
+//! The loop subscribes to later Props changes. It does not write volume or
+//! mute. The strip is muted when that source's mute flag is set or every
+//! channel volume is at or below -90 dB. An empty volume list with the mute
+//! flag clear is not muted. A transition logs `omamix: source <id> muted`
+//! or `omamix: source <id> unmuted`.
+//!
 //! Unit tests do not call [`run_headless`].
 
 use std::cell::RefCell;
@@ -148,6 +156,8 @@ pub struct WindowSnapshot {
     pub quantum: u32,
     /// Tap slot for a strip id, when the filter has claimed one.
     pub strip_slots: Vec<(u64, u16)>,
+    /// Per strip id: true when every feeding source with a Props reading is muted.
+    pub strip_muted: Vec<(u64, bool)>,
 }
 
 struct WindowView {
@@ -164,6 +174,7 @@ struct WindowView {
     sample_rate: AtomicU32,
     quantum: AtomicU32,
     strip_slots: Mutex<Vec<(u64, u16)>>,
+    strip_muted: Mutex<Vec<(u64, bool)>>,
 }
 
 impl WindowView {
@@ -182,6 +193,7 @@ impl WindowView {
             sample_rate: AtomicU32::new(0),
             quantum: AtomicU32::new(0),
             strip_slots: Mutex::new(Vec::new()),
+            strip_muted: Mutex::new(Vec::new()),
         }
     }
 
@@ -206,6 +218,7 @@ impl WindowView {
         self.sample_rate.store(snap.sample_rate, Ordering::Relaxed);
         self.quantum.store(snap.quantum, Ordering::Relaxed);
         *lock_mutex(&self.strip_slots) = snap.strip_slots;
+        *lock_mutex(&self.strip_muted) = snap.strip_muted;
     }
 }
 
@@ -236,6 +249,7 @@ impl WindowEngine {
             sample_rate: self.view.sample_rate.load(Ordering::Relaxed),
             quantum: self.view.quantum.load(Ordering::Relaxed),
             strip_slots: lock_mutex(&self.view.strip_slots).clone(),
+            strip_muted: lock_mutex(&self.view.strip_muted).clone(),
         }
     }
 
@@ -1011,6 +1025,10 @@ enum Pending {
         id: u32,
         seq: pw::spa::utils::result::AsyncSeq,
     },
+    Props {
+        id: u32,
+        bytes: Vec<u8>,
+    },
 }
 
 struct LoopInner {
@@ -1071,6 +1089,62 @@ struct ClientRec {
 struct NodeRec {
     identity: NodeIdentity,
     bound: bool,
+    level: Option<SourceLevel>,
+    logged_muted: Option<bool>,
+    props_polls: u8,
+}
+
+#[derive(Default)]
+struct SourceLevel {
+    mute: bool,
+    soft_mute: bool,
+    volumes: Vec<f32>,
+    saw_volumes: bool,
+    soft_volumes: Vec<f32>,
+    saw_soft_volumes: bool,
+}
+
+struct PropsPatch {
+    mute: Option<bool>,
+    soft_mute: Option<bool>,
+    volumes: Option<Vec<f32>>,
+    soft_volumes: Option<Vec<f32>>,
+}
+
+impl SourceLevel {
+    fn apply(&mut self, patch: &PropsPatch) {
+        if let Some(mute) = patch.mute {
+            self.mute = mute;
+        }
+        if let Some(mute) = patch.soft_mute {
+            self.soft_mute = mute;
+        }
+        if let Some(volumes) = &patch.volumes {
+            self.volumes.clone_from(volumes);
+            self.saw_volumes = true;
+        }
+        if let Some(volumes) = &patch.soft_volumes {
+            self.soft_volumes.clone_from(volumes);
+            self.saw_soft_volumes = true;
+        }
+    }
+
+    fn is_muted(&self) -> bool {
+        let volumes = self.saw_volumes.then_some(self.volumes.as_slice());
+        let soft = self
+            .saw_soft_volumes
+            .then_some(self.soft_volumes.as_slice());
+        omamix_core::db::source_feed_muted(self.mute, volumes, self.soft_mute, soft)
+    }
+}
+
+impl PropsPatch {
+    fn is_empty(&self) -> bool {
+        self.mute.is_none()
+            && self.soft_mute.is_none()
+            && self.volumes.is_none()
+            && self.soft_volumes.is_none()
+    }
 }
 
 struct PortRec {
@@ -1176,6 +1250,11 @@ fn tick(
     }
     link_engine(shared);
     reconcile(shared, filter);
+    {
+        let mut inner = shared.inner.borrow_mut();
+        poll_source_props(&mut inner);
+        sync_source_mute_logs(&mut inner);
+    }
     log_strip_meters(shared, filter);
     log_callback_stats(shared, filter, false);
     publish_ready(shared);
@@ -1192,6 +1271,7 @@ fn publish_view(shared: &LoopShared, filter: &RefCell<Option<MixFilter>>) {
     let default_source = resolved_default_name(&inner);
     let ready = inner.settle_round >= 3;
     let published = inner.published;
+    let strip_muted = muted_strips(&inner);
     let (master_peak, master_rms, strips, strip_gr, master_gr, sample_rate, quantum, strip_slots) =
         if let Some(engine) = filter.borrow().as_ref() {
             let audio = engine.shared();
@@ -1274,6 +1354,7 @@ fn publish_view(shared: &LoopShared, filter: &RefCell<Option<MixFilter>>) {
         sample_rate,
         quantum,
         strip_slots,
+        strip_muted,
     });
 }
 
@@ -1555,6 +1636,7 @@ fn apply_event(shared: &Rc<LoopShared>, event: Pending) {
         Pending::LinkState { key, active, error } => note_link_state(shared, key, active, error),
         Pending::Metadata { key, value } => note_metadata(shared, &key, value.as_deref()),
         Pending::CoreDone { id, seq } => note_core_done(shared, id, seq),
+        Pending::Props { id, bytes } => note_props(shared, id, &bytes),
     }
 }
 
@@ -1577,6 +1659,9 @@ fn note_global(shared: &Rc<LoopShared>, global: GlobalObject<PropertiesBox>) {
                 NodeRec {
                     identity,
                     bound: false,
+                    level: None,
+                    logged_muted: None,
+                    props_polls: 0,
                 },
             );
             if let Some(event) = link::registry_budget_event(link::RegistryKind::Node) {
@@ -1877,6 +1962,14 @@ fn bind_one(shared: &Rc<LoopShared>, global: &GlobalObject<PropertiesBox>) {
             let Ok(node) = registry.bind::<pw::node::Node, _>(global) else {
                 return;
             };
+            let push_props = {
+                let shared_loop = Rc::clone(shared);
+                move |bytes: Vec<u8>| {
+                    if let Ok(mut pending) = shared_loop.pending.lock() {
+                        pending.push(Pending::Props { id, bytes });
+                    }
+                }
+            };
             let listener = node
                 .add_listener_local()
                 .info(move |info| {
@@ -1884,7 +1977,19 @@ fn bind_one(shared: &Rc<LoopShared>, global: &GlobalObject<PropertiesBox>) {
                         push_info(dict_pairs(props));
                     }
                 })
+                .param(move |_seq, param_id, _index, _next, param| {
+                    if param_id != pw::spa::param::ParamType::Props {
+                        return;
+                    }
+                    let Some(pod) = param else {
+                        return;
+                    };
+                    push_props(pod.as_bytes().to_vec());
+                })
                 .register();
+            let props_id = [pw::spa::param::ParamType::Props];
+            node.subscribe_params(&props_id);
+            node.enum_params(0, Some(pw::spa::param::ParamType::Props), 0, u32::MAX);
             Binding {
                 id,
                 _listener: ProxyListener::Node(listener),
@@ -2051,6 +2156,157 @@ fn reconcile(shared: &Rc<LoopShared>, filter: &Rc<RefCell<Option<MixFilter>>>) {
     for peer in peers {
         ensure_tap(shared, filter, peer);
     }
+}
+
+fn note_props(shared: &LoopShared, id: u32, bytes: &[u8]) {
+    let Some(patch) = parse_props_patch(bytes) else {
+        return;
+    };
+    if patch.is_empty() {
+        return;
+    }
+    let mut inner = shared.inner.borrow_mut();
+    {
+        let Some(node) = inner.nodes.get_mut(&id) else {
+            return;
+        };
+        node.level
+            .get_or_insert_with(SourceLevel::default)
+            .apply(&patch);
+    }
+    sync_source_mute_logs(&mut inner);
+}
+
+fn parse_props_patch(bytes: &[u8]) -> Option<PropsPatch> {
+    use pw::spa::pod::Value;
+    use pw::spa::pod::deserialize::PodDeserializer;
+
+    let (_, value) = PodDeserializer::deserialize_any_from(bytes).ok()?;
+    let Value::Object(object) = value else {
+        return None;
+    };
+    if object.id != pw::spa::sys::SPA_PARAM_Props
+        && object.type_ != pw::spa::sys::SPA_TYPE_OBJECT_Props
+    {
+        return None;
+    }
+    let mut patch = PropsPatch {
+        mute: None,
+        soft_mute: None,
+        volumes: None,
+        soft_volumes: None,
+    };
+    for prop in object.properties {
+        match prop.key {
+            pw::spa::sys::SPA_PROP_mute => {
+                if let Value::Bool(mute) = prop.value {
+                    patch.mute = Some(mute);
+                }
+            }
+            pw::spa::sys::SPA_PROP_softMute => {
+                if let Value::Bool(mute) = prop.value {
+                    patch.soft_mute = Some(mute);
+                }
+            }
+            pw::spa::sys::SPA_PROP_channelVolumes => {
+                if let Some(volumes) = float_list(&prop.value) {
+                    patch.volumes = Some(volumes);
+                }
+            }
+            pw::spa::sys::SPA_PROP_softVolumes => {
+                if let Some(volumes) = float_list(&prop.value) {
+                    patch.soft_volumes = Some(volumes);
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(patch)
+}
+
+fn float_list(value: &pw::spa::pod::Value) -> Option<Vec<f32>> {
+    use pw::spa::pod::{Value, ValueArray};
+    match value {
+        Value::ValueArray(ValueArray::Float(samples)) => Some(samples.clone()),
+        Value::ValueArray(ValueArray::Double(samples)) => {
+            Some(samples.iter().map(|sample| *sample as f32).collect())
+        }
+        Value::Float(sample) => Some(vec![*sample]),
+        Value::Double(sample) => Some(vec![*sample as f32]),
+        _ => None,
+    }
+}
+
+fn sync_source_mute_logs(inner: &mut LoopInner) {
+    let peers = wanted_peers(inner);
+    for id in peers {
+        let Some(node) = inner.nodes.get_mut(&id) else {
+            continue;
+        };
+        let Some(level) = node.level.as_ref() else {
+            continue;
+        };
+        let now = level.is_muted();
+        let was = node.logged_muted;
+        if let Some(line) = omamix_core::db::source_mute_log(id, was, now) {
+            eprintln!("{line}");
+        }
+        if was != Some(now) {
+            node.logged_muted = Some(now);
+        }
+    }
+}
+
+fn poll_source_props(inner: &mut LoopInner) {
+    let peers = wanted_peers(inner);
+    let due: Vec<u32> = peers
+        .iter()
+        .copied()
+        .filter(|id| {
+            inner
+                .nodes
+                .get(id)
+                .is_some_and(|node| node.level.is_none() && node.props_polls < 4)
+        })
+        .collect();
+    for id in &due {
+        if let Some(node) = inner.nodes.get_mut(id) {
+            node.props_polls = node.props_polls.saturating_add(1);
+        }
+    }
+    let props_id = [pw::spa::param::ParamType::Props];
+    for id in due {
+        let Some(binding) = inner.bindings.iter().find(|binding| binding.id == id) else {
+            continue;
+        };
+        let ProxyKeep::Node(node) = &binding._proxy else {
+            continue;
+        };
+        node.subscribe_params(&props_id);
+        node.enum_params(0, Some(pw::spa::param::ParamType::Props), 0, u32::MAX);
+    }
+}
+
+fn muted_strips(inner: &LoopInner) -> Vec<(u64, bool)> {
+    let mut acc: HashMap<u64, (u32, u32, u32)> = HashMap::new();
+    for peer in wanted_peers(inner) {
+        let Some(strip) = strip_for_peer(inner, peer) else {
+            continue;
+        };
+        let entry = acc.entry(strip.id.0).or_insert((0, 0, 0));
+        entry.0 += 1;
+        if let Some(level) = inner.nodes.get(&peer).and_then(|node| node.level.as_ref()) {
+            entry.1 += 1;
+            if level.is_muted() {
+                entry.2 += 1;
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (id, (peers, known, muted)) in acc {
+        out.push((id, peers > 0 && known == peers && muted == peers));
+    }
+    out
 }
 
 fn wanted_peers(inner: &LoopInner) -> Vec<u32> {
@@ -3231,6 +3487,9 @@ mod owned_id_tests {
                 ..NodeIdentity::default()
             },
             bound,
+            level: None,
+            logged_muted: None,
+            props_polls: 0,
         }
     }
 
@@ -3330,5 +3589,101 @@ mod lookahead_token_tests {
         assert!(bypass_limiter_block(&mut chain, false));
         assert!(chain.blocks().iter().all(|block| !block.bypassed()));
         assert_eq!(chain.latency_samples(48_000, 256), 240);
+    }
+}
+
+#[cfg(test)]
+mod source_prop_tests {
+    use super::*;
+
+    fn props_pod(
+        mute: Option<bool>,
+        volumes: Option<&[f32]>,
+        soft_mute: Option<bool>,
+        soft_volumes: Option<&[f32]>,
+    ) -> Vec<u8> {
+        use pw::spa::pod::serialize::PodSerializer;
+        use pw::spa::pod::{Object, Property, PropertyFlags, Value, ValueArray};
+
+        let mut properties = Vec::new();
+        if let Some(mute) = mute {
+            properties.push(Property {
+                key: pw::spa::sys::SPA_PROP_mute,
+                flags: PropertyFlags::empty(),
+                value: Value::Bool(mute),
+            });
+        }
+        if let Some(volumes) = volumes {
+            properties.push(Property {
+                key: pw::spa::sys::SPA_PROP_channelVolumes,
+                flags: PropertyFlags::empty(),
+                value: Value::ValueArray(ValueArray::Float(volumes.to_vec())),
+            });
+        }
+        if let Some(mute) = soft_mute {
+            properties.push(Property {
+                key: pw::spa::sys::SPA_PROP_softMute,
+                flags: PropertyFlags::empty(),
+                value: Value::Bool(mute),
+            });
+        }
+        if let Some(volumes) = soft_volumes {
+            properties.push(Property {
+                key: pw::spa::sys::SPA_PROP_softVolumes,
+                flags: PropertyFlags::empty(),
+                value: Value::ValueArray(ValueArray::Float(volumes.to_vec())),
+            });
+        }
+        let object = Value::Object(Object {
+            type_: pw::spa::sys::SPA_TYPE_OBJECT_Props,
+            id: pw::spa::sys::SPA_PARAM_Props,
+            properties,
+        });
+        PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &object)
+            .expect("props pod")
+            .0
+            .into_inner()
+    }
+
+    fn level_from(bytes: &[u8]) -> SourceLevel {
+        let patch = parse_props_patch(bytes).expect("props");
+        let mut level = SourceLevel::default();
+        level.apply(&patch);
+        level
+    }
+
+    fn pod_bytes(bytes: &[u8]) -> Vec<u8> {
+        let pod = pw::spa::pod::Pod::from_bytes(bytes).expect("pod view");
+        pod.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn props_pod_reads_any_channel_count_without_writing() {
+        let unity = pod_bytes(&props_pod(
+            Some(false),
+            Some(&[1.0, 1.0]),
+            Some(false),
+            Some(&[1.0, 1.0]),
+        ));
+        assert!(!level_from(&unity).is_muted());
+        let zeros = props_pod(
+            Some(false),
+            Some(&[0.0, 0.0]),
+            Some(false),
+            Some(&[1.0, 1.0]),
+        );
+        assert!(level_from(&zeros).is_muted());
+        let mono = props_pod(Some(false), Some(&[0.0]), None, None);
+        assert!(level_from(&mono).is_muted());
+        let wide = props_pod(Some(false), Some(&[0.0, 0.0, 0.4, 0.0]), None, None);
+        assert!(!level_from(&wide).is_muted());
+        let flagged = props_pod(Some(true), Some(&[1.0, 1.0, 1.0]), Some(false), None);
+        assert!(level_from(&flagged).is_muted());
+        let empty = props_pod(Some(false), Some(&[]), Some(false), Some(&[0.0, 0.0]));
+        assert!(!level_from(&empty).is_muted());
+        let soft_only = props_pod(None, None, Some(false), Some(&[0.0, 0.0, 0.0]));
+        assert!(level_from(&soft_only).is_muted());
+        let soft_flag = props_pod(Some(false), Some(&[1.0]), Some(true), Some(&[1.0]));
+        assert!(level_from(&soft_flag).is_muted());
     }
 }

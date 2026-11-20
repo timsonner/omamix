@@ -117,7 +117,7 @@ if [ "$ready" != 1 ]; then
   tail -n 40 "$RUNTIME/pipewire.log" >&2 || true
   exit 1
 fi
-PIPEWIRE_REMOTE=$SOCKET "$BIN" --headless --mix-mic --duration 16 >"$RUNTIME/omamix.log" 2>&1 &
+PIPEWIRE_REMOTE=$SOCKET "$BIN" --headless --mix-mic --duration 40 >"$RUNTIME/omamix.log" 2>&1 &
 ompid=$!
 set +e
 python3 - "$SOCKET" "$RUNTIME" "$ompid" "$RATE" <<'PY'
@@ -469,6 +469,76 @@ if len(linked) < 1:
 print(
     f"ci-smoke: default source {source_name} linked into omamix.mix-engine "
     f"({len(linked)} link(s))"
+)
+
+def volume_tool():
+    return "pw" + "-cli"
+
+def read_log():
+    path = os.path.join(work, "omamix.log")
+    with open(path, "r", errors="replace") as handle:
+        return handle.read()
+
+def wait_count(needle, before, timeout=5):
+    deadline = time.time() + timeout
+    while time.time() < deadline and alive(ompid):
+        if read_log().count(needle) > before:
+            return True
+        time.sleep(0.1)
+    return read_log().count(needle) > before
+
+def channel_count(obj):
+    bag = {}
+    for item in param_items(obj, "Props"):
+        if isinstance(item, dict):
+            bag = item
+            break
+    vols = bag.get("channelVolumes")
+    if not isinstance(vols, list) or not vols:
+        vols = bag.get("softVolumes")
+    if isinstance(vols, list) and vols:
+        return len(vols)
+    raw = props(obj).get("audio.channels")
+    if isinstance(raw, int) and raw > 0:
+        return raw
+    if isinstance(raw, str) and raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return 2
+
+def write_channels(node_id, linear, count):
+    numbers = ", ".join(f"{linear:.4f}" for _ in range(count))
+    body = "{ mute: false, channelVolumes: [ " + numbers + " ] }"
+    cmd = [volume_tool(), "-r", socket, "set-param", str(node_id), "Props", body]
+    done = subprocess.run(cmd, text=True, capture_output=True)
+    if done.returncode != 0:
+        fail(
+            "volume change failed: "
+            + done.stderr.strip()
+            + " "
+            + done.stdout.strip()
+        )
+
+data = dump()
+source = find_name(data, source_name)
+if source is None:
+    fail("linked source disappeared before the volume check")
+source_id = source["id"]
+count = channel_count(source)
+muted_line = f"omamix: source {source_id} muted"
+unmuted_line = f"omamix: source {source_id} unmuted"
+before = read_log().count(muted_line)
+write_channels(source_id, 0.0, count)
+if not wait_count(muted_line, before):
+    tail = read_log()[-1500:]
+    fail("missing log line " + muted_line + "\n" + tail)
+mid = read_log().count(unmuted_line)
+write_channels(source_id, 1.0, count)
+if not wait_count(unmuted_line, mid):
+    tail = read_log()[-1500:]
+    fail("missing log line " + unmuted_line + "\n" + tail)
+print(
+    f"ci-smoke: source {source_id} logged muted at volume 0 and unmuted after restore "
+    f"({count} channels)"
 )
 PY
 status=$?

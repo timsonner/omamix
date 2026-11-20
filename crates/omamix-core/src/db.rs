@@ -90,6 +90,60 @@ pub fn db_to_cubic(db: f32) -> f32 {
     linear_to_cubic(db_to_linear(db))
 }
 
+/// Linear amplitude of -90 dB. A channel at or below this is silent.
+pub fn source_mute_floor() -> f32 {
+    db_to_linear(-90.0)
+}
+
+/// True when `mute` is set, or every channel volume is at or below -90 dB.
+///
+/// An empty `channel_volumes` slice is not muted unless `mute` is true.
+/// One channel above the floor keeps the source audible. The comparison is
+/// `<=` [`source_mute_floor`], so a channel sitting on -90 dB still counts.
+pub fn source_is_muted(mute: bool, channel_volumes: &[f32]) -> bool {
+    if mute {
+        return true;
+    }
+    if channel_volumes.is_empty() {
+        return false;
+    }
+    let floor = source_mute_floor();
+    channel_volumes.iter().all(|volume| *volume <= floor)
+}
+
+/// Mute state for a source node Props param.
+///
+/// `channel_volumes` `Some` is the channel list, including an empty list.
+/// `None` means that field was absent, and `soft_volumes` is used instead
+/// when it was present. `soft_mute` is combined with `mute`. The decision
+/// itself is [`source_is_muted`].
+pub fn source_feed_muted(
+    mute: bool,
+    channel_volumes: Option<&[f32]>,
+    soft_mute: bool,
+    soft_volumes: Option<&[f32]>,
+) -> bool {
+    let volumes = match (channel_volumes, soft_volumes) {
+        (Some(volumes), _) => volumes,
+        (None, Some(volumes)) => volumes,
+        (None, None) => &[],
+    };
+    source_is_muted(mute || soft_mute, volumes)
+}
+
+/// One log line when a feeding source's muted state changes.
+///
+/// The first unmuted reading is not a transition. A later return to audible
+/// is `omamix: source <id> unmuted`.
+pub fn source_mute_log(id: u32, was: Option<bool>, now: bool) -> Option<String> {
+    match (was, now) {
+        (Some(prev), next) if prev == next => None,
+        (_, true) => Some(format!("omamix: source {id} muted")),
+        (Some(true), false) => Some(format!("omamix: source {id} unmuted")),
+        _ => None,
+    }
+}
+
 /// Short label for a fader readout. −0.0 is `0.0 dB`. NaN is mute.
 pub fn format_db(db: f32) -> String {
     if db.is_nan() || (db.is_infinite() && db.is_sign_negative()) {
@@ -191,5 +245,116 @@ mod tests {
             sanitize_db(f32::NEG_INFINITY, -24.0, MAX_BOOST_DB, BelowMin::Clamp),
             f32::NEG_INFINITY
         );
+    }
+
+    #[test]
+    fn mute_flag_true_is_muted() {
+        assert!(source_is_muted(true, &[1.0, 0.8]));
+        assert!(source_is_muted(true, &[]));
+        assert!(source_is_muted(true, &[0.0]));
+        assert!(!source_is_muted(false, &[1.0, 0.8]));
+    }
+
+    #[test]
+    fn all_zero_volumes_are_muted() {
+        assert!(source_is_muted(false, &[0.0, 0.0]));
+        assert!(source_is_muted(false, &[0.0, 0.0, 0.0, 0.0, 0.0]));
+        assert!(!source_is_muted(false, &[0.0, 1.0]));
+    }
+
+    #[test]
+    fn one_nonzero_channel_is_not_muted() {
+        assert!(!source_is_muted(false, &[0.0, 1.0]));
+        assert!(!source_is_muted(false, &[1.0, 0.0, 0.0]));
+        assert!(source_is_muted(false, &[0.0, 0.0]));
+    }
+
+    #[test]
+    fn mono_zero_is_muted_and_mono_unity_is_not() {
+        assert!(source_is_muted(false, &[0.0]));
+        assert!(!source_is_muted(false, &[1.0]));
+        assert!(source_is_muted(false, &[source_mute_floor()]));
+    }
+
+    #[test]
+    fn three_or_more_channels_follow_every_channel() {
+        assert!(source_is_muted(false, &[0.0, 0.0, 0.0]));
+        assert!(source_is_muted(false, &[0.0, 0.0, 0.0, 0.0]));
+        assert!(!source_is_muted(false, &[0.0, 0.2, 0.0]));
+        assert!(!source_is_muted(false, &[0.0, 0.0, 0.0, 0.5]));
+    }
+
+    #[test]
+    fn empty_volume_list_with_mute_false_is_not_muted() {
+        assert!(!source_is_muted(false, &[]));
+        assert!(source_is_muted(true, &[]));
+    }
+
+    #[test]
+    fn volumes_at_or_below_minus_90_db_are_muted() {
+        let floor = source_mute_floor();
+        assert!((floor - db_to_linear(-90.0)).abs() < 1e-12);
+        assert!(floor > 0.0);
+        assert!(source_is_muted(false, &[floor]));
+        assert!(source_is_muted(false, &[floor, 0.0, floor]));
+        assert!(source_is_muted(false, &[floor / 2.0]));
+        let above = db_to_linear(-89.0);
+        assert!(above > floor);
+        assert!(!source_is_muted(false, &[above]));
+        assert!(!source_is_muted(false, &[floor, above]));
+        assert!(!source_is_muted(false, &[f32::NAN]));
+        assert!(!source_is_muted(false, &[f32::INFINITY]));
+    }
+
+    #[test]
+    fn soft_fields_fill_gaps_and_do_not_replace_a_seen_channel_list() {
+        assert!(source_feed_muted(false, None, true, None));
+        assert!(!source_feed_muted(false, None, false, None));
+        assert!(source_feed_muted(
+            false,
+            None,
+            false,
+            Some(&[0.0, 0.0, 0.0])
+        ));
+        assert!(!source_feed_muted(false, None, false, Some(&[0.0, 1.0])));
+        assert!(!source_feed_muted(
+            false,
+            Some(&[]),
+            false,
+            Some(&[0.0, 0.0])
+        ));
+        assert!(source_feed_muted(true, Some(&[]), false, Some(&[1.0, 1.0])));
+        assert!(source_feed_muted(
+            false,
+            Some(&[0.0, 0.0]),
+            false,
+            Some(&[1.0, 1.0])
+        ));
+        assert!(!source_feed_muted(
+            false,
+            Some(&[1.0, 1.0]),
+            false,
+            Some(&[0.0, 0.0])
+        ));
+        assert!(source_feed_muted(false, Some(&[1.0]), true, Some(&[1.0])));
+    }
+
+    #[test]
+    fn source_mute_log_lines_follow_transitions() {
+        assert_eq!(source_mute_log(4, None, false), None);
+        assert_eq!(
+            source_mute_log(4, None, true).as_deref(),
+            Some("omamix: source 4 muted")
+        );
+        assert_eq!(
+            source_mute_log(9, Some(false), true).as_deref(),
+            Some("omamix: source 9 muted")
+        );
+        assert_eq!(
+            source_mute_log(9, Some(true), false).as_deref(),
+            Some("omamix: source 9 unmuted")
+        );
+        assert_eq!(source_mute_log(9, Some(true), true), None);
+        assert_eq!(source_mute_log(9, Some(false), false), None);
     }
 }
